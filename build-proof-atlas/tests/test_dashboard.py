@@ -77,6 +77,17 @@ class DashboardCompletion(unittest.TestCase):
             path.write_text(json.dumps(record), encoding="utf8")
             self.assertNotIn("Machine verified on GitHub", dashboard(**options))
 
+            # Receipts without a default-value list render as before; with one, both views carry it.
+            self.assertNotIn("Lean default values", (root/"dist"/atlas.reviews.review_url("t")).read_text(encoding="utf-8"))
+            audit["defaults"] = [{"constant": "gap", "file": "T.lean", "lines": [1, 1], "construct": "HSub.hSub", "type": "ℕ"}]
+            (root / "audit.json").write_text(json.dumps(audit), encoding="utf-8")
+            dashboard()
+            reader = (root / "dist/proofs/index.html").read_text(encoding="utf-8")
+            self.assertIn('"defaults": [{"constant": "gap", "file": "T.lean", "lines": [1, 1], "construct": "HSub.hSub", '
+                          '"type": "ℕ", "meaning": "a − b = 0 when b > a"}]', reader)
+            review = (root/"dist"/atlas.reviews.review_url("t")).read_text(encoding="utf-8")
+            self.assertIn("<code>HSub.hSub</code> on ℕ in <code>gap</code> (T.lean L1) · a − b = 0 when b &gt; a", review)
+
             project["proof_work"] = {"mode": "claim", "claim": "t"}
             self.assertNotIn(complete, dashboard())
 

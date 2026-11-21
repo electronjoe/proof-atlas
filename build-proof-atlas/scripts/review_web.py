@@ -76,6 +76,14 @@ def render(data,secret=None,notice=""):
            '?view=lean">Lean source and verification evidence</a></p>')
     if data["sources"]:
         body+='<details><summary>Inspect the exact Lean statement and definitions</summary>'+sources(data["sources"])+'</details>'
+    if data.get("defaults"):
+        # Lean makes every function total; the comparison should account for each use.
+        body+=('<section id="defaults"><h2>Lean default values in these definitions</h2><p>Lean gives these operations a value '
+               'even where the mathematics leaves them undefined. The comparison should say, for each, why the default cannot '
+               'arise under the hypotheses, or what it means if it does.</p><ul>'+
+               "".join(f'<li><code>{esc(d["construct"])}</code>{" on "+esc(d["type"]) if d.get("type") else ""} in '
+                       f'<code>{esc(d["constant"])}</code> ({esc(d["file"])}{" L"+str(d["lines"][0]) if d.get("lines") else ""})'
+                       f' · {esc(d["meaning"])}</li>' for d in data["defaults"])+'</ul></section>')
     body+=para(data["issue"])+para(data["resolution"])
     body+='<p><strong>Next action · '+esc(data["actor"])+'</strong><br>'+esc(data["next"])+'</p>'
     if secret:
@@ -114,7 +122,7 @@ def queue(entries):
 
 
 def serve(root,open_browser=True,port=0):
-    from atlas import atomic, build_local, manuscript_claims
+    from atlas import atomic, build_local, checked_defaults, manuscript_claims
     root=root.resolve()
     key=digest(str(root))
     session=Path(tempfile.gettempdir())/("proof-atlas-review-"+key+".json")
@@ -157,7 +165,9 @@ def serve(root,open_browser=True,port=0):
                         return self.reply(queue([get_packet(root,c) for c in ids.values()]))
                     if path in ids:
                         notice="Saved locally." if urlsplit(self.path).query=="saved" else ""
-                        return self.reply(render(get_packet(root,ids[path]),secret,notice))
+                        data=get_packet(root,ids[path])
+                        data["defaults"]=checked_defaults(root,ids[path])
+                        return self.reply(render(data,secret,notice))
                 except (ValueError,KeyError,OSError) as error:
                     return self.send_error(409,str(error))
             super().do_GET()

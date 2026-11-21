@@ -151,9 +151,39 @@ partial def proofAtlasCanon : Lean.Expr → Lean.Expr
   | .proj s i e => .proj s i (proofAtlasCanon e)
   | e => e
 
+partial def proofAtlasNumeral : Lean.Expr → Bool
+  | .mdata _ e => proofAtlasNumeral e
+  | .lit (.natVal n) => n != 0
+  | e => e.isAppOfArity ``OfNat.ofNat 3 && proofAtlasNumeral e.appFn!.appArg!
+
+-- Applications of a default-value constant, with the type for ℕ subtraction, division and inverse.
+partial def proofAtlasDefaults (heads : Lean.NameSet) (e : Lean.Expr) (acc : Array (Lean.Name × Option Lean.Expr)) :
+    Array (Lean.Name × Option Lean.Expr) :=
+  match e with
+  | .app .. =>
+    let f := e.getAppFn
+    let args := e.getAppArgs
+    let acc := args.foldl (fun acc a => proofAtlasDefaults heads a acc) (if f.isConst then acc else proofAtlasDefaults heads f acc)
+    match f with
+    | .const n _ =>
+      if !heads.contains n then acc
+      else if n == ``HSub.hSub then
+        if args[0]?.any (·.consumeMData.isConstOf ``Nat) then acc.push (n, args[0]?) else acc
+      else if n == ``HDiv.hDiv || n == ``Inv.inv then
+        -- A nonzero numeral denominator, as in `1/2`, cannot take the default.
+        if (if n == ``HDiv.hDiv then args[5]? else args[2]?).any proofAtlasNumeral then acc else acc.push (n, args[0]?)
+      else acc.push (n, none)
+    | _ => acc
+  | .const n _ => if heads.contains n && n != ``HSub.hSub then acc.push (n, none) else acc
+  | .lam _ t b _ | .forallE _ t b _ => proofAtlasDefaults heads b (proofAtlasDefaults heads t acc)
+  | .letE _ t v b _ => proofAtlasDefaults heads b (proofAtlasDefaults heads v (proofAtlasDefaults heads t acc))
+  | .mdata _ e | .proj _ _ e => proofAtlasDefaults heads e acc
+  | _ => acc
+
 #eval show Lean.CoreM Unit from do
   let env ← Lean.getEnv
   let local_ : Lean.NameSet := (__LOCAL__ : List String).foldl (fun s m => s.insert m.toName) {}
+  let heads : Lean.NameSet := (__DEFAULTS__ : List String).foldl (fun s m => s.insert m.toName) {}
   let mut todo := #[(__ROOT__ : String).toName]
   let mut seen : Lean.NameSet := {}
   while !todo.isEmpty do
@@ -174,20 +204,56 @@ partial def proofAtlasCanon : Lean.Expr → Lean.Expr
     let range ← Lean.findDeclarationRanges? n
     let text := s!"{kind} {ci.levelParams} : {proofAtlasCanon ci.type}" ++
       (value.map (s!" := {proofAtlasCanon ·}")).getD ""
+    let mut uses : Array Lean.Json := #[]
+    for (c, t) in proofAtlasDefaults heads ci.type ((value.map (proofAtlasDefaults heads · #[])).getD #[]) do
+      let mut ty := []
+      if let some t := t then
+        let s ← if t.hasLooseBVars then pure "a bound type" else toString <$> (Lean.Meta.ppExpr t).run'
+        ty := [("type", Lean.Json.str s)]
+      uses := uses.push (Lean.Json.mkObj ([("construct", Lean.Json.str (toString c))] ++ ty))
     IO.println <| "PROOF-ATLAS-CONSTANT " ++ (Lean.Json.mkObj [("name", toString n),
-      ("module", Lean.toJson (mod.map toString)), ("canonical", text),
+      ("module", Lean.toJson (mod.map toString)), ("canonical", text), ("defaults", Lean.Json.arr uses),
       ("lines", Lean.toJson (range.map fun r => #[r.range.pos.line, r.range.endPos.line]))]).compress
 '''
 
+# Lean makes every function total. Each of these returns a default value (usually 0) where the
+# mathematical object is undefined, so a statement built on one can be true and mean nothing.
+DEFAULT_VALUES = {
+    "HDiv.hDiv": "x / 0 = 0", "Inv.inv": "0⁻¹ = 0",
+    "HSub.hSub": "a − b = 0 when b > a", "Nat.sub": "a − b = 0 when b > a", "Nat.pred": "pred 0 = 0",
+    "Real.log": "log 0 = 0, log x = log |x|", "Real.logb": "logb b 0 = 0, logb b x = logb b |x|, 0 when log b = 0",
+    "Real.sqrt": "√x = 0 for x < 0",
+    "InfSet.sInf": "sInf ∅ = 0 in ℝ and ℕ; 0 in ℝ when unbounded below",
+    "SupSet.sSup": "sSup ∅ = 0 in ℝ; 0 when unbounded above",
+    "iInf": "as sInf of the range: 0 in ℝ when empty or unbounded below",
+    "iSup": "as sSup of the range: 0 in ℝ when empty or unbounded above",
+    # Recent Mathlib names it Filter.limUnder; older pins, limUnder.
+    "Filter.limUnder": "an arbitrary value when the limit does not exist",
+    "limUnder": "an arbitrary value when the limit does not exist", "tsum": "0 when not summable",
+    "MeasureTheory.integral": "0 when not integrable", "intervalIntegral": "0 when not integrable on the interval",
+    "deriv": "0 when not differentiable", "derivWithin": "0 when not differentiable within the set",
+    "fderiv": "0 when not differentiable",
+}
+
+
+def default_meaning(use):
+    if use["construct"] == "HDiv.hDiv" and use.get("type") in ("ℕ", "ℤ", "Nat", "Int"):
+        return "x / 0 = 0, and division rounds down"
+    return DEFAULT_VALUES.get(use["construct"], "")
+
 
 def statement_record(lake, root, env, contract, expected):
-    """Hash the expected proposition and every definition of this package it unfolds to."""
+    """Hash the expected proposition and every definition of this package it unfolds to.
+
+    Also returns the default-value uses in those definitions and statements. They are
+    outside the digest: they follow from the hashed constants."""
     modules = {}
     for path in inputs(root):
         if path.endswith(".lean"):
             modules[path[:-5].replace("/", ".")] = path
     program = ("import Lean\n" + (root/contract).read_text(encoding="utf-8-sig") + "\n" +
-               STATEMENT_QUERY.replace("__LOCAL__", json.dumps(sorted(modules))).replace("__ROOT__", json.dumps(expected)))
+               STATEMENT_QUERY.replace("__LOCAL__", json.dumps(sorted(modules))).replace("__ROOT__", json.dumps(expected))
+               .replace("__DEFAULTS__", json.dumps(sorted(DEFAULT_VALUES))))
     result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
                             cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     output = result.stdout.decode("utf-8-sig", errors="replace")
@@ -199,7 +265,11 @@ def statement_record(lake, root, env, contract, expected):
                              sha256=hashlib.sha256(row["canonical"].encode()).hexdigest()) for row in rows),
                        key=lambda c: c["name"])
     digest = hashlib.sha256("".join(f'{c["name"]} {c["sha256"]}\n' for c in constants).encode()).hexdigest()
-    return dict(expected=expected, sha256=digest, constants=constants)
+    found = {(row["name"], use["construct"], use.get("type", "")): row for row in rows for use in row["defaults"]}
+    defaults = [dict(constant=name, file=modules.get(row["module"], contract), lines=row["lines"],
+                     construct=construct, **({"type": ty} if ty else {}))
+                for (name, construct, ty), row in sorted(found.items(), key=lambda item: item[0])]
+    return dict(expected=expected, sha256=digest, constants=constants), defaults
 
 
 def inputs(root):
@@ -272,7 +342,8 @@ def audit(args):
               "and its definitions are independent of the proof modules. Older atlases keep working; "
               "see 'Separate statements from proofs' in SKILL.md to migrate.", file=sys.stderr)
     # A custom source layout can hide local definitions from the fingerprint.
-    statement = statement_record(lake, root, env, contract_path, args.expected) if scoped or statements else None
+    statement, defaults = (statement_record(lake, root, env, contract_path, args.expected)
+                           if scoped or statements else (None, None))
     if scoped is None:
         final = inputs(root)
     else:
@@ -287,7 +358,7 @@ def audit(args):
                 expected=args.expected, toolchain=pin, axioms=axioms,
                 targets=args.target, input_scope="module-closure" if scoped is not None else "full-package",
                 checked_inputs=initial, statements=statements, lean_output=output.strip(),
-                **({"statement": statement} if statement else {}))
+                **({"statement": statement, "defaults": defaults} if statement else {}))
 
 
 if __name__ == "__main__":

@@ -121,6 +121,18 @@ function proofView(c,view) {
       }
       pane.append(el("h3","Subproofs"),list);
     }
+    if(c.defaults?.length){
+      // Lean makes every function total; the comparison should account for each use.
+      pane.append(el("h3","Lean default values in these definitions"),el("p","Lean gives these operations a value even where the mathematics leaves them undefined. The comparison should say, for each, why the default cannot arise under the hypotheses, or what it means if it does.","muted"));
+      const list=el("ul");
+      for(const d of c.defaults){
+        const item=el("li");
+        item.append(el("code",d.construct),document.createTextNode((d.type?" on "+d.type:"")+" in "),el("code",d.constant),
+          document.createTextNode(" ("+d.file+(d.lines?" L"+d.lines[0]:"")+") · "+d.meaning));
+        list.append(item);
+      }
+      pane.append(list);
+    }
     for(const source of c.sources){pane.append(el("h3",source.path),el("pre",source.text));}
   }
 }
