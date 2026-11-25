@@ -1,10 +1,12 @@
 # Proof Atlas Skill Revision Plan: Addressing AI-Lean Verification Risks in Engineering & Applied Theory
 
 **Authors / Reviewers:** Scott Moeller & Bhaskar Krishnamachari  
-**Date:** November 22, 2026 *(Progress updated November 26, 2026)*  
-**Original RFC Baseline:** `proof-atlas` `main` (`build-proof-atlas` v0.10.0, PRs #1, #2, #3, #6) + Open PRs [#4](https://github.com/ANRGUSC/proof-atlas/pull/4) and [#5](https://github.com/ANRGUSC/proof-atlas/pull/5)  
+**Date:** November 22, 2026 *(Revised November 26, 2026: 15-category longitudinal census, `TINA` architecture synthesis, and multi-resolution workflow)*  
+**Original RFC Baseline:** `proof-atlas` `main` (`build-proof-atlas` v0.10.0, PRs #1, #2, #3, #6) + PRs [#4](https://github.com/ANRGUSC/proof-atlas/pull/4) and [#5](https://github.com/ANRGUSC/proof-atlas/pull/5)  
 **Current Integration Branch (`skill-v2`):** Based on `upstream/main` (`ed1f562`, PRs #1–#8 merged) + integrated open PRs [#9](https://github.com/ANRGUSC/proof-atlas/pull/9) (`phase-2a-semantic-auditing`) and [#10](https://github.com/ANRGUSC/proof-atlas/pull/10) (`phase-2b-static-hygiene`)  
-**Companion Evidence Base:** `survey-lean-proofs-eng-arxiv` (`proof-methods.md` 12-mode taxonomy + Nov 1–19, 2026 empirical survey of 3,160 arXiv preprints across `cs.DC`, `cs.NI`, `cs.IT`, `eess.SY`, `cs.CR`, `cs.RO`)
+**Companion Evidence Base:**
+1. [`survey-lean-proofs-eng-arxiv`](https://github.com/electronjoe/survey-lean-proofs-eng-arxiv) (*How Are Engineering Papers Adopting Lean?*, Moeller & Krishnamachari, Nov 25, 2026: 12-mode failure taxonomy in `docs/proof-methods.md` + 15-category longitudinal census of **12,613** arXiv preprints across Nov 2025, May 2026, and Nov 2026 $\rightarrow$ **82** confirmed Lean papers, **27** Layer-A semantic audits, **23** offline clean-room Docker builds, and authoring-paradigm best practices).
+2. [`ANRGUSC/TINA`](https://github.com/ANRGUSC/TINA) (`papers/arxiv-v3/lean`, package `TinaV2`, moved from `papers/arxiv-v2/lean` on Nov 18, 2026: **34** verified claims / **162** `Expr`-audited step and main lemmas in **9,227** non-empty LoC, evaluated side-by-side against the surveyed `P4` cohort).
 
 ---
 
@@ -12,264 +14,265 @@
 
 | Milestone | Scope | Upstream PR(s) | Status (as of Nov 26, 2026) |
 | :--- | :--- | :--- | :--- |
-| **RFC Sign-Off** | Phased revision plan & baseline design decisions | [#7](https://github.com/ANRGUSC/proof-atlas/pull/7) | **Merged** (`upstream/main`) |
+| **RFC Sign-Off** | Phased revision plan & baseline design decisions | [#7](https://github.com/ANRGUSC/proof-atlas/pull/7) | **Merged** (`upstream/main`) · *Rev 2 updated on `skill-v2`* |
 | **Phase 0** | Hypothesis witnesses (`--witness`), default-value scan (`defaults`), engineering totalizations (`ENNReal`, `Matrix.inv`, `condExp`, `invFun`), non-degenerate witness guidance, witness preferences & per-finding default assessments | [#4](https://github.com/ANRGUSC/proof-atlas/pull/4), [#5](https://github.com/ANRGUSC/proof-atlas/pull/5) | **Merged** (`upstream/main`) |
 | **Phase 1** | Pre-proof Gate 1 spec-lock (`audit_lean.py --statement-only`), pre-closure correspondence & review carryover, author choice on pre-proof ambiguities | [#8](https://github.com/ANRGUSC/proof-atlas/pull/8) | **Merged** (`upstream/main`) |
 | **Phase 2a** | Clause-enumerated blind comparison (`C1, C2, …`), skeptical-referee subagent guidance, `weaker conclusion` kind (cannot match), `noncomputable` + `pp.notation false` + `external_packages` + `axiom_profile` metadata, Mathlib-first & bridging-lemma rule | [#9](https://github.com/ANRGUSC/proof-atlas/pull/9) | **Open upstream · Integrated on `skill-v2`** |
 | **Phase 2b** | Pre-build static hygiene scanner blocking metaprogramming/escape hatches (`unsafe`, `@[implemented_by]`/`@[extern]`/`@[csimp]`, `#eval`, `run_cmd`, `elab`/`macro`) and custom notation in `Statements/` | [#10](https://github.com/ANRGUSC/proof-atlas/pull/10) | **Open upstream · Integrated on `skill-v2`** |
-| **Pilot Validation** | Dogfood Phases 0–2 (`skill-v2`) on `markov-block-hierarchy-proof-atlas` + compact surveyed `eess.SY`/`cs.IT` paper | — | **Next** |
-| **Phase 4** | Headline-vs.-supporting claim rollup + `atlas.py manifest` LaTeX/MD scope generator | — | **Not started** (P1/P2) |
-| **Phase 3** | Kernel-extracted claim DAG edges (`used_local_theorems`), `lamport` provenance (`basis`), size metrics & distillation pass | — | **Not started** (P2) |
-| **Phase 5** | Opt-in `"paranoid"` multi-kernel / `Comparator` / `lean4checker` GitHub CI tier | — | **Not started** (P2) |
+| **Phase 2c** *(New)* | Multi-resolution workflow (`quick` hands-off vs. `thorough`), separable conditional proofs + generated `Assembly.lean` (`Conditional` badge), narrow `Prelude.lean` + `Routine/` + ~8-cycle stall breaker, kernel `.thmInfo` check | — | **Next (High P1)** |
+| **Phase 4** | Headline-vs.-supporting claim rollup, explicit shortcoming & **Refinement Backlog** disclosure, and `atlas.py manifest` LaTeX/MD scope generator | — | **Next (High P1)** |
+| **Pilot Validation** | Dogfood Phases 0–2c & 4 (`skill-v2` in both `quick` and `thorough` modes) on `markov-block-hierarchy-proof-atlas` + compact surveyed `eess.SY`/`cs.IT` paper | — | **After Phases 2c & 4** |
+| **Phase 3a / 3b** | **3a:** Kernel-extracted claim DAG edges (`used_local_theorems`), TINA "two homes" provenance (`paper` vs. `supplied` / `supplement.md`), size metrics & distillation pass.<br>**3b:** Opt-in TINA 1:1 step-lemma mirroring (`step_map` + compiled `Expr` `auditUses`) | — | **Not started** (P2) |
+| **Phase 5** | Opt-in `"paranoid"` multi-kernel / mechanical `Challenge.lean` `Comparator` / `lean4checker` CI tier + full CI check parity | — | **Not started** (P2) |
 | **Phase 6** | Batched package build & verification (`audit_batch`) in `verify_ci.py` | — | **Not started** (P2) |
 
 ---
 
 ## Purpose of This Document
 
-This document synthesizes:
-1. **Community postmortems and best-practice proposals** for AI-assisted Lean 4 formalizations (`proof-methods.md`: 12 failure modes across semantic, adversarial/kernel, and structural layers; 4 authoring paradigms; 5 verification gates), and
-2. **Real-world empirical findings** from our three-week arXiv engineering pilot (`3,160` preprints screened $\rightarrow$ `20` confirmed Lean-contributing papers, `11` in `engineering_math_proof`, and `8` deep theorem-by-theorem Layer-A audits),
+This document synthesizes three sources of evidence:
+1. **Community postmortems and best-practice proposals** for AI-assisted Lean 4 formalizations (`proof-methods.md`: 12 failure modes across semantic, adversarial/kernel, and structural layers; 4 authoring paradigms; 5 verification gates),
+2. **Longitudinal empirical findings** from [`survey-lean-proofs-eng-arxiv`](https://github.com/electronjoe/survey-lean-proofs-eng-arxiv) (`12,613` unique preprints screened across 15 engineering and applied-theory arXiv categories over Nov 2025, May 2026, and Nov 2026 $\rightarrow$ `82` confirmed Lean papers, `27` theorem-by-theorem Layer-A semantic audits, and `23` offline clean-room Docker builds), and
+3. **Production lessons from [`ANRGUSC/TINA`](https://github.com/ANRGUSC/TINA)** (`papers/arxiv-v3/lean`, `TinaV2`), which formalized 34 mathematical claims with 1:1 `Expr`-verified step correspondence in just 9,227 LoC—alongside co-author design feedback on **iterative, multi-resolution adoption**,
 
-and translates them into a **phased revision plan for `build-proof-atlas`**. It is structured as a design RFC so we can review trade-offs, push back on unnecessary complexity, and agree on phase ordering before changing skill instructions or scripts.
+and translates them into a **phased revision plan for `build-proof-atlas`**.
 
 *(Note: This planning document lives in `docs/` rather than `build-proof-atlas/` so it does not inflate the context window of coding agents that install the portable skill directory.)*
 
 ---
 
-## 1. Strategic Positioning: Why Proof Atlas Matters in the 2026 Landscape
+## 1. Strategic Positioning: Empirical Reality, TINA Lessons & Multi-Resolution Design
 
-Recent high-profile failures of bulk AI-generated Lean releases—most notably natural-language-to-Lean proof drift in *Navier–Stokes Lost in Translation* (Bastounis et al., arXiv:2610.08144), headline-to-certificate scope erasure across `openai/math`, emergent notation-hijacking in 100-agent proving swarms (Paglieri et al., arXiv:2609.04170), Lean C++ kernel soundness Bug #14576, and 13M–50M+ LoC machine proofs incurring severe conceptual debt (Cohn, Sep 2026)—have shown that **a compiling `lake build` does not guarantee that a paper's claims are true, faithful, or intelligible**.
+### 1.1 What the 12,613-Paper Longitudinal Census Shows
 
-At the same time, our empirical survey of 3,160 November 2026 engineering and applied-theory preprints reveals how researchers in control (`eess.SY`), information and coding theory (`cs.IT`), distributed systems (`cs.DC`), and cryptography (`cs.CR`) are *actually* working:
+High-profile failures of bulk AI-generated Lean releases—natural-language-to-Lean proof drift in *Navier–Stokes Lost in Translation* (Bastounis et al., arXiv:2610.08144), headline-to-certificate scope erasure across `openai/math`, emergent notation-hijacking in 100-agent proving swarms (Paglieri et al., arXiv:2609.04170), Lean C++ kernel soundness Bug #14576, and 13M–50M+ LoC machine proofs incurring severe conceptual debt (Cohn, Sep 2026)—have demonstrated that **a compiling `lake build` does not guarantee that a paper's claims are true, faithful, or intelligible**.
 
-| Empirical Dimension (Nov 1–19, 2026 arXiv Pilot) | Observed Distribution | Strategic Takeaway for Proof Atlas |
+Our expanded 15-category longitudinal census in [`survey-lean-proofs-eng-arxiv`](https://github.com/electronjoe/survey-lean-proofs-eng-arxiv) (covering 100% of `eess.*` plus `cs.DC`, `cs.NI`, `cs.IT`, `cs.CR`, `cs.RO`, `cs.SY`, `math.OC`, and related applied-theory venues across three matched 19-day windows) establishes how engineering and applied-theory authors actually use Lean 4:
+
+| Empirical Dimension (`survey-lean-proofs-eng-arxiv`) | Observed Longitudinal / Census Result | Strategic Takeaway for Proof Atlas |
 | :--- | :--- | :--- |
-| **Lean vs. Traditional Formal Tools** | **20** Lean papers (0.63%) vs. **12** non-Lean FV tools combined (0.38%); **6/6** formal papers in `cs.IT` use Lean | Lean is rapidly becoming the default formal tool for *engineering mathematics*, distinct from TLA+/Coq/PRISM in software/protocol FV. |
-| **Authoring Paradigm** | **`P1` Paper-First Post-Hoc: 80% (16/20)** · `P4` Spec-Lock (`comparator`): 10% (2/20) · `P0` Opaque: 10% (2/20) · **`P2` Lean-First: 0%** · **`P3` Blueprint Sync (`LeanArchitect`/`Verso`): 0%** | Requiring engineering authors to abandon standard LaTeX drafting for `Verso` or `@[blueprint]` (`P3`) misses 80–90% of real users; pure Lean-first (`P2`) mirrors machine bloat into prose. |
-| **AI Prover Involvement** | **80% (16/20)** explicitly disclose AI agents (`Claude Opus 5.5`, `ChatGPT-6 Astra`, `GPT-6.1 Sol`, `Codex`, `Harmonic`); **0%** claim human-only | Proof Atlas must assume the prover is an autonomous LLM optimizing for tactic closure, not a human Mathlib contributor. |
-| **Codebase Scale (`Mode #10`)** | Bimodal across 13 cloned repos: **5 compact** (`528–2,191` LoC) vs. **8 massive AI repos** (`29,967–929,448` LoC; `1.85M` LoC total) | Tooling, CI workflows, and reader views must survive 50k–250k+ LoC proof packages without timing out or drowning human reviewers. |
-| **Reproducible CI (`Mode #12`)** | **0 / 13** cloned paper repos configured GitHub Actions CI (`ci=[]`); 3/20 papers gave no repo URL; 2 lacked `lakefile`/`lean-toolchain` | Proof Atlas's `verify-lean.yml` + public verification receipts already put it ahead of 100% of surveyed repositories on process provenance. |
+| **Adoption Trajectory** | Initial-submission Lean papers surged **`0/3,164` (0.00%) $\rightarrow$ `7/4,146` (0.17%) $\rightarrow$ `68/5,303` (1.28%)** (`7.6×` in 6 months; **`82` total** / `20.59×` YoY with retroactive revisions); strict engineering algorithmic proofs jumped **`6.77×`** (`0 $\rightarrow$ 3 $\rightarrow$ 26`), while non-Lean FV stayed flat (`1.23% $\rightarrow$ 1.04%`). | Engineering math formalization in Lean is scaling exponentially, distinct from traditional TLA+/Coq/PRISM protocol verification. |
+| **Authoring Paradigms (`v_latest = 82` / T2 `v1 = 68`)** | **`P1` Post-Hoc: 70.6% (`57/82`)** · **`P0` Opaque: 17.6% (`16/82`)** · **`P4` Pinned Spec: 10.3% (`7/82`)** · **`P3` Sync Blueprint: 1.5% (`1/82`; `0/31` eng.)** · **`P2` Lean-First: 0.0% in T2 (`1/82` total)** | Mandating `Verso`/`LeanArchitect` (`P3`) upfront misses ~99% of engineering authors; raw `P2` failed (`Partial/Weakened` + broken build); `P0` is `0/16` Gold. |
+| **`P4` vs. Author-Led `P1` vs. Bulk `P1`** | **`P4`:** `7/7` (**100%**) Static Gold, `0/7` soundness/opacity flags, `4/4` Layer-A High/Mostly Faithful (`3/4` witnesses), *LongTails* (`2611.13872`) faithful at scale.<br>**`P1`:** Only `54.4%` (`31/57`) Gold & `17/21` clean-room build pass—yet **`0/21` author-owned `P1` repos had material undisclosed drift**, whereas bulk autonomous `P1` (*Paper2Lean*, `2611.26272`) suffered **Material Undisclosed Drift** (`hB_lipschitz`, `hweak`, `FiniteDimensional`, `AntitoneOn`). Top `P1` repos (`2611.18455`, `2611.15201`) independently added `statement-lock.json` or `comparator`. | The survey supports a **two-tier best-practice model**: a low-friction **"Hardened `P1`"** entry ramp for fast author adoption, upgrading cleanly into **full `P4` (`Spec-Lock → AI-Solve → Distill`)**—while strictly forbidding un-audited bulk `P1` drift. |
+| **AI Provers & Codebase Bloat (`Mode #10`)** | **80.9%** explicitly disclose AI provers; median paper-owned LoC grew **`46.2×`** (`749 $\rightarrow$ 34,579` LoC; **`8.14M` LoC** across 51 repos). Even among `P4` adopters, **`5/7` tripped bloat (`>20k` LoC; median `81,481` LoC, up to `697,377` LoC)** because teams skipped the *Distill* pass. | `Spec-Lock` alone does not prevent unreadable machine sprawl; structural anti-bloat (`Prelude.lean` + `Routine/` + distillation) and scalable CI are essential. |
+| **Clean-Room Builds & CI (`Mode #12`)** | Offline Docker clean-room builds on compact repos (`<15k` LoC) passed **`18/23` (78.3%)** (`11/11` Gold axiom-clean), yet almost zero surveyed repos configure GitHub Actions `lake build` CI. | Proof Atlas's pinned Lake layout + `verify-lean.yml` + public receipts directly solve the 21.7% packaging failure rate and universal CI gap. |
+| **Operational FV Scope Carve-Out** | Across an 8-paper audit of operational software/hardware/protocol verification (`cs.DB`, `cs.CR`, `cs.PL`), **`0/8` adopted `P2`–`P4`**. | Proof Atlas should explicitly bound its scope to **mathematical and algorithmic claims in manuscripts**, steering operational system verification toward refinement/state-machine frameworks. |
 
-### Core Thesis: "`P1` Input Ergonomics, `P4` Spec-Lock & Audit Guarantees"
+### 1.2 Core Thesis: Multi-Resolution Iterative Refinement on a Zero-Regret `P4` Foundation
 
-Proof Atlas should **not** force authors into Lean-first prose (`P2`) or literate LaTeX macros (`P3`). Its sweet spot is accepting an ordinary LaTeX/arXiv manuscript (`P1` ergonomics) while enforcing a **`P4` (`Spec-Lock → AI-Solve → Distill & Audit`)** workflow underneath: pinning independent statements before tactic search, auditing semantic fidelity with blind cross-checks and domain-aware static analysis, verifying proofs in isolated CI, and exporting honest scope records back to both web readers and the manuscript itself.
+As co-author Bhaskar Krishnamachari observes:
+> *"There is some balance to be struck between being thorough and being realistic. Many users want a hands-off quick version, then can come back and tackle slow work over time. Each time the badges reflect what has or has not been done. So we want this kind of iterative refinement / multi-resolution approach."*
 
----
+If a "quick" formalization dumps definitions and proofs into tangled files without statement locks or clause checks (raw `P1`), two bad things happen: (1) silent statement drift (*Paper2Lean*) can award green checkmarks to mutated theorems, and (2) upgrading to `P4` best practices later requires rewriting the repository from scratch.
 
-## 2. Risk Synthesis: Literature Taxonomy vs. Real Engineering Papers
+Proof Atlas solves this by exposing **dual caller profiles—`quick` (Hands-Off Triage / Hardened-`P1` speed) and `thorough` (Full `P4 + TINA` rigor, default)**—organized as **breadth-first passes over a shared, non-negotiable structural floor**:
 
-Not all 12 failure modes from `proof-methods.md` manifest equally in engineering research. Our Phase 2 adversarial Layer-A audit of all 8 locally cloned `engineering_math_proof` repositories (`2611.18220` SysID, `2611.10902` EV charging, `2611.11713` Belief Propagation, `2611.08172` AG codes, `2611.14475` Explicit RIP, `2611.05136` Lattice AFT, `2611.04876` Matrix Refreshing, `2611.23762` qLDPC CCZ) separates theoretical hazards from recurring real-world gaps:
+1. **Zero-Regret Structural Floor (enforced in BOTH `quick` and `thorough` — costs seconds, prevents rewrites):**
+   - `Statements/` (`Prop` definitions, zero `sorry`) strictly isolated from `Proofs/` (`--statements Statements`),
+   - Narrow `Prelude.lean` Mathlib imports (~4–5s per file check instead of ~48s `import Mathlib`) + isolated `Routine/` plumbing library,
+   - Pre-build static escape-hatch and `Statements/` custom-notation ban (`scan_lean_hygiene`),
+   - Pre-proof `audit_lean.py --statement-only` (`statement.sha256`, `defaults` junk-value scan, `noncomputable` & `pp.notation false` capture) + kernel `#print axioms` and `.thmInfo` verification,
+   - Blind clause-enumerated `correspondence.md` check on every closed/conditional claim so silent drift is **never** awarded a badge.
+   - *Why zero rework is needed later:* Because `statement.sha256` strips proof bodies and `Proofs/` are separable per claim, later proving missing witnesses, closing conditional prerequisites, distilling bloated proofs, or adding 1:1 step verification **never invalidates unchanged `Statements/`, `comparisons.json`, or `reviews.json` approvals**.
 
-### Layer A — Semantic & Statement-Level Fidelity ("What Was Actually Proved?")
+2. **How `quick` Saves Hours Without Hiding Shortcomings:**
 
-1. **Mode #1 — Statement, Hypothesis & Conjunct Drift:**
-   - *Literature risk:* Type (i) autoformalization silently strengthens hypotheses (e.g., 5 derivatives instead of 4 in Navier–Stokes Lemma 8.6) or weakens bounds (extra constant dependence $A_R$ in Lemma 10.5).
-   - *Survey reality:* Independent engineering authors avoided blatant hypothesis cheating (`7/8 minor_disclosed`, `1/8 minor_undisclosed`), **but** our audit caught a subtle **undisclosed conjunct drop inside a flagship `P4` `comparator` repo (`2611.04876`)**: `Compiler.Direct.directPrivacyClaim` omitted the standalone evaluation-correctness equality conjunct ("correctly evaluates every NAND circuit") and binary-rate conversion from the audited public challenge statement, even though exact correctness was proved internally in `Proofs/`. *Lesson: freezing `Statements/` is necessary but insufficient unless every paper clause is systematically accounted for.*
-2. **Mode #2 — The Universal Engineering Scope Boundary & Scope-Note Erasure:**
-   - *Survey reality (`8/8` papers!):* **Every single audited engineering paper** exhibited a sharp boundary between *mathematical core* (formalized) and *algorithmic/computational claims* (omitted or idealized):
-     - `2611.14475` (Explicit RIP): proves matrices exist with $k = m^{2/3-o(1)}$, but marks `KM.choleskyMatrix` `noncomputable` and omits the polynomial-time complexity proof for "explicit".
-     - `2611.10902` (EV charging, `eess.SY`): proves Theorems 1–3, strong duality, and $K=2$ exact-oracle optimality, omitting $K=1$, $K>2$, iterative bisection tolerances $\varepsilon,\delta$, and $O(n \log n \log(L/\varepsilon))$ runtime.
-     - `2611.08172` (AG codes, `cs.IT`): proves $\mathbb{F}_{729}$ tower theorems (`noncomputable`), omitting §11 ($q \ge 512$, checked by rational scripts), Schur fullness, and closed genus formula.
-     - `2611.05136` (Lattice AFT): proves Theorem 9.9 in a custom counted-op `work : ℕ` model (`Classical.choose` tables), omitting Turing-machine simulation and outer LWE/PRF/ReLU reductions.
-     - `2611.11713` (Belief Propagation, `cs.IT`): proves Theorems A–C in Lean while checking the 18-vertex discriminant via external Python rational interval arithmetic.
-     - `2611.23762` (qLDPC CCZ): formalizes 3 algebraic helper lemmas of a companion note and 0 theorems of the main paper.
-   - *Abstract-vs.-README erasure:* Even when repo READMEs candidly listed exclusions (`2611.10902`, `2611.08172`), paper abstracts or Footnote 1 summaries frequently omitted those qualifiers.
-3. **Mode #3 — Custom Definitions & Mathlib Anchoring:**
-   - *Survey reality:* `0/8` malicious definition smuggling, but `4/8` relied heavily on custom domain structures (`1,291–6,431` definitions). The strongest repos (`2611.14475`, `2611.11713`, `2611.10902`, `2611.04876`, `2611.05136`) stayed trustworthy by proving **formal bridging/characterization lemmas** connecting custom wrappers to Mathlib primitives (`ripConstant_isLeast`, `fullRowRank_iff_linearIndependent`, `Vc_isGreatest`, `totalVariation_eq_half_l1`).
-4. **Mode #4 — Totalized Default ("Junk") Values & Vacuous Hypotheses:**
-   - *Survey reality:* `5/8` engineering repos lacked explicit non-vacuity witnesses (`example : ∃ ...`). In engineering domains (`cs.IT`, `eess.SY`), beyond `x / 0 = 0` and `ℕ` subtraction, critical traps include **`ENNReal.toReal` (`⊤.toReal = 0`**, which makes unbounded `∫⁻` expectations look bounded!), **singular matrix inversion (`A⁻¹ = 0`)**, divergent `tsum = 0`, and `sSup ∅ = 0`.
-
-### Layer B — Adversarial & Kernel-Level Integrity ("Was It Legitimately Proved?")
-
-5. **Mode #5 — Notation Hijacking & Specification Tampering:** Redefining `∧`, `≤`, or local notation, or mutating statement files so the proof closes trivially (DeepMind swarm study, arXiv:2609.04170).
-6. **Mode #6 — Axiom Smuggling, Transitive `sorryAx`, and `native_decide`:** Custom `axiom` declarations (`2611.02057` used 7 external graph/topology axioms across 8 theorems) or `native_decide` (`Lean.ofReduceBool` / `Lean.trustCompiler`, seen in `2611.04561`), which bypasses kernel reduction and blocks external checkers.
-7. **Mode #7 — Metaprogramming Bypasses & Compile-Time Side Effects:** Arbitrary host I/O during `lake build` (`#eval IO.FS...`, `run_cmd`) or environment manipulation (`Lean.addDecl`, `@[implemented_by]`, `@[csimp]`, `unsafe`).
-8. **Mode #8 — Kernel Soundness Bugs & Single-Checker Monoculture:** C++ kernel bugs reachable via metaprogramming (July 2026 Collatz exploit via Bug #14576 + 6 bugs found by Selsam), mitigated in `2611.14475`, `2611.04876`, and `2611.04561` via `comparator` + `nanoda` / `lake check --paranoid` (Lean v4.35.0+ multi-kernel checking).
-9. **Mode #9 — Foundational Drift (CIC Universes vs. ZFC):** Primarily relevant to set-theoretic/independence results; low risk for engineering math over `ℝ`, `ℂ`, `ℕ`, `MeasureTheory`, and finite types, provided universe polymorphism isn't abused.
-
-### Layer C — Structural, Scale & Provenance Gaps ("Is It Usable, Maintainable Science?")
-
-10. **Mode #10 — Proof Bloat & Type (i) Internal Drift:** 30k–929k LoC AI proofs obscure *why* a theorem holds and routinely prove main statements via routes disconnected from the paper's intermediate lemmas (`2611.05136` explicitly disclaimed internal correspondence; `2611.11713` documented alternate bounds).
-11. **Mode #11 — Repo-Scale Verification Bottlenecks:** Rebuilding or running `comparator` sequentially per claim times out on 100k+ LoC repositories with dozens of claims.
-12. **Mode #12 — Process Opacity & Mixed Verification Tiers:** Unpinned toolchains, missing CI, and mixing unformalized claims, partial helper lemmas, and fully verified main theorems without tier clarity.
-
----
-
-## 3. Baseline Audit: What Proof Atlas Already Covers vs. Open Gaps
-
-Recent PRs (#1, #2, #3, #6 on `main`, plus open PRs #4 and #5) have already closed several major vulnerabilities. The table below maps all 12 modes against the current codebase to isolate **net-new gaps**:
-
-| Risk Mode | Already on `main` (`v0.10.0`) | In Open PRs ([#4](https://github.com/ANRGUSC/proof-atlas/pull/4), [#5](https://github.com/ANRGUSC/proof-atlas/pull/5)) | Remaining Gap in `build-proof-atlas` | Proposed Phase |
+| Dimension | `quick` (Hands-Off Triage Pass) | `thorough` (Full `P4 + Distill`, Default) | Opt-In `deep` Extensions (Phases 3b & 5) | Badge / Artifact Disclosure When Deferred |
 | :--- | :--- | :--- | :--- | :--- |
-| **#1 Statement & Conjunct Drift** | PR #1: Blind two-sided readings (`--side paper` / `--side lean`), `comparisons.json` bound to `statement.sha256`, optional human approval. PR #6: `cases[].kind` difference counts. | — | 1. **`atlas.py compare` / `review` requires `status == "closed"`**, blocking pre-proof Gate 1 checks.<br>2. Holistic reading prompts can miss dropped conjuncts (`2611.04876` bug). | **Phases 1 & 2** |
-| **#2 Scope Downgrade & Erasure** | Per-claim badges (`Subproofs checked`, `Lean proves more`, `Author’s scope note`), `manuscript-edits.json`, exact-corollary preference in `SKILL.md`. | — | 1. `KINDS` lacks `omitted conclusion` / `weaker conclusion`; `noncomputable` vs. prose "explicit/algorithm" is unflagged.<br>2. No headline-vs.-lemma rollup or ready-to-paste LaTeX scope paragraph to prevent abstract/footnote erasure. | **Phases 2 & 4** |
-| **#3 Definition Smuggling** | `STATEMENT_QUERY` walks & hashes all local package constants reachable from `expected` (equivalent to *Lean Atlas* / `Compass` $R \cup A$ pruning!) and displays their source lines in review. | — | 1. No Mathlib-first or bridging-lemma rule in `SKILL.md`.<br>2. Non-Mathlib external git packages in `lake-manifest.json` aren't highlighted in receipts. | **Phase 2** |
-| **#4 Junk Values & Vacuity** | — | **PR #4:** `--witness` derives & checks `∃ x…, H₁ ∧ … ∧ Hₖ` (including guarded clauses).<br>**PR #5:** `defaults` scans 17 totalized ops (`/`, `⁻¹`, `ℕ -`, `log`, `sqrt`, `sInf`/`sSup`, `limUnder`, `tsum`, `integral`, `deriv`). | 1. Missing **`ENNReal.toReal` (`⊤ ↦ 0`)** & **singular `Matrix.inv` (`A⁻¹ ↦ 0`)**—high-frequency traps in `cs.IT` / `eess.SY`.<br>2. Trivial/empty witness inhabitants (`∅`, `0`) pass `--witness` without testing the non-degenerate regime. | **Phase 0** |
-| **#5 Notation & Spec Tampering** | PR #2: `audit_lean.py --statements Statements` enforces that `Statements/` cannot import `Proofs/` and checks pre/post input SHA-256 hashes. | — | Custom `notation`/`macro`/`scoped notation` inside `Statements/` can make raw source lines in `exact_sources` look standard while elaborating differently; kernel-unfolded (`pp.notation false`) types aren't shown. | **Phase 2** |
-| **#6 Axioms, `sorryAx` & `native_decide`** | `audit_lean.py` runs `#print axioms` and rejects anything outside `{propext, Classical.choice, Quot.sound}` (catching `sorryAx`, custom `axiom`, and honest `Lean.ofReduceBool` / `native_decide`). | PR #4 also checks `#print axioms` on `--witness`. | Constructive (0-axiom) vs. classical axiom profiles aren't surfaced in badges/receipts. *(Non-Lean computational scripts stay explicitly outside Lean scope rather than being verified by Proof Atlas.)* | **Phase 2** |
-| **#7 Metaprog & Host Side Effects** | `module_inputs` rejects `lakefile.lean` (requiring declarative `lakefile.toml`), custom `srcDir`, and `LEAN_PATH`. PR #3 discloses honest-agent trust model. | — | No static scan for `unsafe`, `@[implemented_by]`, `@[extern]`, `@[csimp]`, `#eval`, `run_cmd`, or custom elaborators in `Statements/` or `Proofs/`. | **Phase 2** |
-| **#8 Kernel Bugs & Monoculture** | PR #3 explicitly recommends Lean FRO `Comparator` when proofs are untrusted. | — | No turnkey opt-in `Comparator` / `lean4checker` / `lake check --paranoid` (multi-kernel) step in `verify-lean.yml` despite already having the `Statements/` vs. `Proofs/` split! | **Phase 5** |
-| **#9 Foundational Drift** | Toolchain & manifest git SHA pinned in every receipt. | — | Minor note in `correspondence.md` for set-theoretic/logic claims suffices. | **Phase 2** |
-| **#10 Proof Bloat & Type (i) Drift** | PR #3 labels Plain English & Lamport views *"Explanation, not machine-checked"* and notes Lean's proof may take a different route. | — | 1. Dependency graph & Lamport view don't indicate whether a paper prerequisite is *actually used* in the Lean proof term.<br>2. No post-closure distillation pass or proof-bloat metrics in receipts. | **Phase 3** |
-| **#11 Verification Bottlenecks** | Scoped `module-closure` targets via `lake query +M:transImports`; selective Mathlib cache fetch (`--mathlib-module`). | — | `verify_ci.py` loops over closed claims and re-runs `audit()` (`lake --no-cache build`) sequentially per claim—bottlenecking 30–80 claim / 100k+ LoC repos. | **Phase 6** |
-| **#12 Process Opacity** | Edition SHA-256 binding, `verify-lean.yml`, public `lean-verification.json`, explicit badge legend on homepage and `README.md`. | — | Paper PDF / arXiv abstract can still drift from Atlas reality unless the skill generates a synchronized manuscript verification statement. | **Phase 4** |
+| **Ambiguities in Paper** | Commits to best-supported reading as a `chosen reading` / `added hypothesis` / `restriction` difference and keeps going | Interactive choice (`work through now` vs. `save & hold dependents`); unattended holds dependents | Same as `thorough` + co-author freeze sign-off | Prominent **`Needs author confirmation`** badge + top-of-manifest caveat |
+| **Hard / Stalling Proofs** | **~8-build-cycle circuit breaker**: logs obstacle & proves downstream claims **conditionally** (`(hX : X.Statement) → Y.Statement`) | Deep decomposed subproof search across all prerequisites until unconditional closure | Same as `thorough` | **`Conditional (assumes Lemma X)`** badge (never labeled unconditional `Lean checked`) |
+| **Non-Vacuity Witnesses** | Defaults `witness_search = "skip"` (reusing only trivial/already-present witnesses) | `available` (or `pursue`): constructs non-degenerate `Examples/` witnesses | Full model-tier witness suite | **`No checked example shows the hypotheses can hold`** badge + backlog item |
+| **Default-Value Flags** | Flagged in scan; unresolved traps marked `needs attention` without blocking | Every finding justified by hypothesis/lemma or resolved before sign-off | Same as `thorough` | **`Unresolved default-value flag (K)`** indicator on review/manifest |
+| **Bridging & Distillation** | Deferred; raw tactic proofs encapsulated inside `Proofs/` | Mathlib bridging lemmas in `Statements/` + post-closure `Routine/` distillation & exact paper corollary | **TINA 1:1 step-lemma mirroring** (`step_map` + `Expr` `auditUses`) | **`Exploratory proof (undistilled)`** vs. **`Distilled`** vs. **`Step-verified (paper / supplied)`** |
+| **Remote Verification** | Optional local-only or standard GitHub CI | Standard GitHub Actions `verify-lean.yml` (`Machine verified on GitHub`) | **`paranoid` CI**: generated `Challenge.lean` + `Comparator` + multi-kernel (`v4.35.0+`) | **`Local Lean check`** vs. **`✓ Machine verified on GitHub`** vs. **`✓ Multi-kernel / Comparator`** |
 
 ---
 
-## 4. Proposed Phased Revision Plan
+## 2. Risk Synthesis: Literature Taxonomy, Survey Audits & the `TINA` Benchmark
 
-Each phase is scoped to be an independent, backward-compatible PR (preserving older atlases with graceful build warnings, following the exact pattern established in PRs #2, #4, #5, and #6).
+### 2.1 Lessons From the 12 Failure Modes Across 27 Layer-A Audits
+
+1. **Mode #1 — Statement, Hypothesis & Conjunct Drift (Layer A):**
+   - *Bulk `P1` vs. Author-Owned Repos:* Autonomous bulk `P1` pipeline *Paper2Lean* (`2611.26272`) introduced material undisclosed hypotheses (`hB_lipschitz`, `hweak`, `FiniteDimensional`, `AntitoneOn`). Author-owned engineering repos had `0/22` material undisclosed drift, **yet** flagship `P4` `comparator` repo `2611.04876` (*MatrixRefresh*) still suffered a subtle **undisclosed conjunct drop** (`Compiler.Direct.directPrivacyClaim` omitted standalone circuit-evaluation equality even though it was proved internally). *Lesson: `Statements/` isolation must be paired with clause-enumerated (`C1, C2, …`) blind auditing.*
+2. **Mode #2 — Universal Algorithmic/Modeling Scope Boundaries & Scope-Note Erasure (Layer A):**
+   - Across audited engineering papers, mathematical cores were formalized while algorithmic runtime/complexity (`2611.14475` `noncomputable` `KM.choleskyMatrix`, `2611.10902` bisection runtime, `2611.05136` Turing reductions), numerical certificate scripts (`2611.08172`, `2611.11713`), or SDE-to-law steps (`TINA` `C4.c`/`C9`) stayed outside Lean—and paper abstracts/footnotes routinely erased README caveats (`2611.10902`, `2611.08172`, `2611.23762`) or omitted Lean entirely (`TINA` `main-v3.tex`).
+3. **Mode #3 — Custom Definitions & Mathlib Anchoring (Layer A):**
+   - `0/22` malicious definition smuggling in author-led engineering repos (`4/4` clean in `P4`), with top repos proving explicit **Mathlib characterization/bridging lemmas** (`ripConstant_isLeast`, `Vc_isGreatest`, `totalVariation_eq_half_l1`, and `TINA`'s `QHilbert` / `R_eq_sigmaRegret`).
+4. **Mode #4 — Totalized Default ("Junk") Values & Vacuous Hypotheses (Layer A):**
+   - Most engineering repos lacked compiled `∃` witnesses (including `TINA` initially on `v4.33.1`, where `CanonicalField.continuous` was mathematically load-bearing for product-$\sigma$-algebra measurability!). High-frequency engineering totalization traps include `ENNReal.toReal` (`⊤ ↦ 0`), singular `Matrix.inv` (`A⁻¹ ↦ 0`), `condExp`, `sInf`/`sSup`, and Bochner integrals on null sets.
+5. **Modes #5–#9 — Adversarial, Escape-Hatch & Kernel Integrity (Layer B):**
+   - Notation hijacking (arXiv:2609.04170), custom axioms (`2611.02057`), `native_decide` (`Lean.ofReduceBool` in `2611.04561`), metaprogramming side effects (`#eval`, `run_cmd`, `unsafe`, `@[implemented_by]`), and single-kernel C++ soundness bugs (Bug #14576) motivate static source scanning locally plus opt-in `Comparator` and Lean `v4.35.0+` `lake check --paranoid` multi-kernel replay in CI.
+6. **Modes #10–#12 — Proof Bloat, CI Bottlenecks & Tier Opacity (Layer C):**
+   - Unrefactored AI proofs (`30k–929k` LoC; `5/7` `P4` repos `>20k` LoC) obscure whether intermediate paper lemmas are even used, slow per-claim CI rebuilds, and blur verified headline theorems with unformalized claims or unproved manuscript remarks.
+
+### 2.2 What `ANRGUSC/TINA` (`TinaV2`) Did Better—And What We Should Merge
+
+Evaluating [`ANRGUSC/TINA`](https://github.com/ANRGUSC/TINA) (`papers/arxiv-v3/lean`) against the 7 surveyed `P4` repositories reveals five high-leverage techniques that are **strictly net-positive** for Proof Atlas (without migrating Proof Atlas's JSON project files to TINA's SQLite schema):
+
+1. **Separable Conditional Proofs (`(hX : X.Statement) → Y.Statement`) + Generated `Assembly.lean`:** Each claim's proof imports `Statements/` and `Routine/`, taking upstream paper claims as explicit statement hypotheses rather than importing upstream proof files; `Assembly.lean` composes proved claims and records remaining unproved assumptions (`assumes`). This unlocks **parallel multi-agent proving**, ~5s single-file rebuilds, and honest **`Conditional (assumes X)`** badges during `quick` runs.
+2. **Narrow `Prelude.lean` + `Routine/` Glue Separation + ~8-Cycle Stall Breaker:** Avoiding `import Mathlib` cut TINA's per-file checks from ~48s to ~5.2s, while isolating implicit regularity/measure/algebraic plumbing in `Routine/` (forbidden from importing `Statements/` or `Proofs/`) kept **34 verified claims to 9,227 non-empty LoC** (`8.8×` smaller than the `P4` median of `81,481` LoC).
+3. **"Two Homes" Provenance (`paper` vs. `supplied` / `supplement.md`):** TINA cleanly separates claims whose Lean proofs follow the paper's proof (`verified`, 17 claims) from unproved remarks or skipped proof steps where Lean supplies a written argument (`verified_supplied`, 17 claims, exported to `supplement.md`)—never conflating the two.
+4. **Compiled-`Expr` Step Auditing (`auditUses`) & `.thmInfo` Verification:** TINA inspects post-elaboration `Lean.Environment` constants (walking through `_proof_1`/`match_1` auxiliaries while stopping at named step lemmas and `.Statement` constants) to verify 1:1 step dependency alignment and confirm `.thmInfo` (`wasOriginallyTheorem`). Offering `auditUses` as an opt-in **Phase 3b** tier brings Bastounis Type (ii) step-verification into Proof Atlas without slowing `quick` exploration.
+5. **Cautionary Lessons from TINA's Audit:** TINA's `verify_release.py` initially omitted `ledger.run_check(db)` (creating a live CI bypass on frozen hashes), shipped `0` non-vacuity witnesses on `v4.33.1`, and had `0` Lean mentions inside `main-v3.tex`. Proof Atlas closes all three via Gate-1 `--witness`, Phase 4 `atlas.py manifest`, and Phase 5 full-invariant CI parity + mechanical `Challenge.lean` generation.
+
+---
+
+## 3. Baseline Audit: Current `skill-v2` Coverage vs. Remaining Gaps
+
+| Risk Mode / Goal | Implemented on `skill-v2` (PRs #1–#10) | Remaining Gap to Close | Target Phase |
+| :--- | :--- | :--- | :--- |
+| **Multi-Resolution Ergonomics** | Paper-wide vs. single-claim `proof_work`, witness preferences (`available`/`skip`/`pursue`). | No caller-selectable `quick` (hands-off triage) vs. `thorough` mode, no breadth-first pass ordering, no `Conditional` proof assembly, and no consolidated **Refinement Backlog**. | **Phases 2c & 4** |
+| **#1 Statement & Conjunct Drift** | Gate 1 `--statement-only` (#8), clause-enumerated (`C1, C2, …`) skeptical-referee blind diff (#9), `statement.sha256` carryover. | In unattended `quick` runs, Phase 1's strict hold on ambiguous statements can block downstream claims instead of proceeding under an explicitly flagged `chosen reading` + `Needs author confirmation` caveat. | **Phase 2c** |
+| **#2 Scope Erasure & Two Homes** | `weaker conclusion` kind (blocks `match` / closure), `noncomputable` detection (#9), `manuscript-edits.json`. | 1. No headline-vs.-supporting breakdown or `atlas.py manifest` (`VERIFICATION.md` + LaTeX snippet) itemizing scope caveats & `quick`-mode shortcomings.<br>2. No TINA-style `paper` vs. `supplied` (`supplement.md`) distinction for unproved manuscript claims. | **Phases 4 & 3a** |
+| **#3 Definition Smuggling** | Reachable constant walk & source display, Mathlib-first & bridging-lemma rule, `external_packages` flags (#9). | In `quick` mode, deferred bridging lemmas should be tracked as a visible refinement item rather than silently forgotten. | **Phases 2c & 4** |
+| **#4 Junk Values & Vacuity** | `--witness` + non-degenerate rule (#4), 20+ totalized ops incl. `ENNReal.toReal`, `Matrix.inv`, `condExp` + `default_assessments` (#5). | Surface unresolved `needs attention` default flags alongside `No checked witness` in manifest/refinement summaries. | **Phase 4** |
+| **#5–#7 Static & Axiom Hygiene** | `--statements` isolation (#2), `#print axioms` + `axiom_profile` (#9), static escape-hatch & `Statements/` notation ban (#10). | 1. Add `.thmInfo` (`wasOriginallyTheorem`) check in `audit_lean.py`.<br>2. Guarantee 100% check parity in `verify_ci.py` (avoiding TINA's `verify_release.py` omission). | **Phases 2c & 5** |
+| **#8 Kernel Monoculture** | Honest-agent trust disclosure (#3), isolated `Statements/` `Prop` definitions (#2). | No mechanical `Challenge.lean`/`Solution.lean` generator or opt-in `Comparator` / `lean4checker` / `lake check --paranoid` (`v4.35.0+`) CI tier. | **Phase 5** |
+| **#10 Proof Bloat & Step Drift** | *"Explanation, not machine-checked"* labels (#3). | 1. Missing `Prelude.lean` + `Routine/` + ~8-cycle breaker guidance.<br>2. No kernel-extracted claim DAG edges, distillation pass, or opt-in TINA 1:1 step-lemma `Expr` auditing (`auditUses`). | **Phases 2c, 3a & 3b** |
+| **#11 Verification Bottlenecks** | Scoped `transImports` targets, selective `--mathlib-module` cache fetch. | Sequential per-claim `lake --no-cache build` in `verify_ci.py` bottlenecks 30–80 claim repos (and `import Mathlib` slows local checks ~10× without `Prelude.lean`). | **Phases 2c & 6** |
+| **#12 Process Opacity** | Edition SHA-256 binding, `verify-lean.yml`, `lean-verification.json`, badge legend. | Synchronize manuscript verification paragraph & multi-resolution badge disclosures via `atlas.py manifest`. | **Phase 4** |
+
+---
+
+## 4. Phased Revision Plan (Updated Roadmap)
+
+Each phase remains an independent, backward-compatible PR preserving older atlases with graceful warnings.
 
 ```mermaid
 flowchart LR
-    G0["Edition Pin & Inventory<br/>(import_arxiv.py)"] --> G1["Gate 1: Pre-Proof Spec Lock<br/>Statements/ + defaults + witness<br/>[Phases 0 & 1]"]
-    G1 --> G2["Gate 2: Scoped Proof Search<br/>Proofs/ + Static Hygiene<br/>[Phase 2]"]
-    G2 --> G3["Gate 3: Closure & Batched CI<br/>Receipt + Opt-In Comparator/Paranoid<br/>[Phases 5 & 6]"]
-    G3 --> G4["Gate 4: Distillation & Clause Audit<br/>Lean DAG + Blind Clause Check<br/>[Phases 2 & 3]"]
-    G4 --> G5["Gate 5: Public Atlas & Paper Manifest<br/>Badges + LaTeX Scope Snippet<br/>[Phase 4]"]
+    G0["Edition Pin & Scope Check (import_arxiv.py)"] --> G1["Gate 1: Spec Lock (Statements/, defaults, witness) [Phases 0-1]"]
+    G1 --> G2["Gate 2: Multi-Res Proof Pass (Prelude/Routine, Hygiene, Conditional Assembly) [Phases 2a-2c]"]
+    G2 --> G3["Gate 3: Closure & CI (Assembly, verify_ci, Opt-In Comparator) [Phases 2c, 5, 6]"]
+    G3 --> G4["Gate 4: Distillation, DAG & Step Sync (Two Homes, Expr DAG, 1:1 Audit) [Phases 3a-3b]"]
+    G4 --> G5["Gate 5: Public Atlas, Backlog & Manifest (Badges, VERIFICATION.md, LaTeX) [Phase 4]"]
 ```
 
 ---
 
-### Phase 0: Land PRs #4 & #5 + Engineering Totalization & Non-Degenerate Witness Follow-Up
+### Phases 0, 1, 2a & 2b: Completed Foundation *(Merged on `main` or Integrated on `skill-v2`)*
 
-- **Goal:** Establish comprehensive `Mode #4` (junk-value and vacuity) protection tailored to engineering mathematics (`cs.IT`, `eess.SY`, `math.OC`, `eess.SP`).
-- **Context:** PR [#4](https://github.com/ANRGUSC/proof-atlas/pull/4) (`--witness`) and PR [#5](https://github.com/ANRGUSC/proof-atlas/pull/5) (`defaults`) are both clean against `main`, though merging the first will create a small, mechanical merge conflict in `build-proof-atlas/SKILL.md` and `statement_record()` in `build-proof-atlas/scripts/audit_lean.py` for the second.
-- **Proposed Additions (Phase 0b follow-up PR after #4 and #5 merge):**
-  1. **Engineering-math totalization additions to `DEFAULT_VALUES` (`audit_lean.py`):**
-     - `ENNReal.toReal` (*"`⊤.toReal = 0` — an infinite expectation, divergence, or `∫⁻` integral maps silently to `0`"*): critical for information theory and stochastic control (`2611.18220`).
-     - `ENNReal.ofReal` (*"`ofReal x = 0` when `x ≤ 0`"*).
-     - `Ring.inverse` / matrix `Inv.inv` annotations (*"singular matrix `A⁻¹` evaluates to a default (`0`) without invertibility"*): critical for control, estimation, and coding theory.
-     - `ProbabilityTheory.condExp` (*"`0` when not integrable or on non-σ-finite measures"*) and `Nat.find` / `Function.invFun`.
-  2. **Non-Degenerate Witness Guidance (`SKILL.md`, `correspondence.md`, `review-inputs`):**
-     - Update **Show the hypotheses can hold** in `SKILL.md` to require that `--witness` instantiate a **non-degenerate case** when the paper's regime is nontrivial (e.g., nonempty index set/graph, positive dimension/block length, nonzero channel/signal) rather than satisfying universal binders purely via `Empty`, `∅`, or `0`.
-     - Include the witness declaration's source snippet in `atlas.py review-inputs PROJECT CLAIM --side lean` so the blind Lean reader (and human reviewer) can verify that the witness is non-trivial.
-- **Backward Compatibility:** Non-blocking warnings only, identical to PRs #4 and #5.
+- **Phase 0 (Merged — PRs [#4](https://github.com/ANRGUSC/proof-atlas/pull/4), [#5](https://github.com/ANRGUSC/proof-atlas/pull/5)):** `--witness` existential & guarded-clause checking with non-degenerate guidance and `witness_search` preferences (`available` / `skip` / `pursue`); `defaults` totalization scan including engineering-math traps (`ENNReal.toReal`, `ENNReal.ofReal`, `Ring.inverse` / `Inv.inv`, `condExp`, `Nat.find`, `Function.invFun`) and per-finding `default_assessments`.
+- **Phase 1 (Merged — PR [#8](https://github.com/ANRGUSC/proof-atlas/pull/8)):** Pre-proof Gate 1 `audit_lean.py --statement-only`, pre-closure `review-inputs`/`compare`/`review.html` support (`Statement drafted (proof in progress)`), interactive vs. deferred author ambiguity handling, and zero-rework `statement.sha256` approval carryover.
+- **Phase 2a (Integrated on `skill-v2` — PR [#9](https://github.com/ANRGUSC/proof-atlas/pull/9)):** Clause-enumerated (`C1, C2, …`) blind readings in separate skeptical-referee contexts; `weaker conclusion` difference kind (cannot record `match` or close parent claim while mathematical/algorithmic clauses remain open); `noncomputable`, `pp.notation false`, `external_packages`, and `axiom_profile` metadata; Mathlib-first & bridging-lemma guidance.
+- **Phase 2b (Integrated on `skill-v2` — PR [#10](https://github.com/ANRGUSC/proof-atlas/pull/10)):** Comment/string-stripped `scan_lean_hygiene` blocking `unsafe`, `@[implemented_by]`, `@[extern]`, `@[csimp]`, `#eval`, `run_cmd`, `elab`/`macro` across audited Lean files and custom `notation`/`infix`/`prefix`/`postfix` inside `Statements/`.
 
 ---
 
-### Phase 1: True Pre-Proof Spec-Lock (`Gate 1` — Statement-Only Audit & Early Correspondence)
+### Phase 2c *(New)*: Multi-Resolution Workflow (`quick` vs. `thorough`), Separable Conditional Proofs (`Assembly.lean`) & Fast-Build Discipline
 
-- **Goal:** Unlock true `Paradigm 4` (`Spec-Lock → AI-Solve`) inside Proof Atlas so statements can be fingerprinted, scanned for default-value traps, blind-compared against the paper, and optionally author-approved **before** spending hours of AI compute proving the wrong statement.
-- **Current Bottleneck:** `SKILL.md` (line 18) and `references/correspondence.md` (line 3) instruct the agent to run the independent correspondence workflow *"at statement preparation and again on checked evidence"*, **but** `atlas.py` (`current_audit`) and `author_review.py` (`get_packet`, `save_comparison`) currently hard-require `work[cid]["status"] == "closed"`. On a multi-hour theorem, the agent cannot run `atlas.py review-inputs`, `atlas.py compare`, or present the statement in `review.html` until the entire proof is finished.
+- **Goal:** Deliver Bhaskar's hands-off quick-start → iterative-refinement workflow on top of TINA's fast, parallelizable, `sorry`-free conditional proof architecture—while guaranteeing **zero silent drift** and **zero structural rework** when upgrading later.
 - **Proposed Changes:**
-  1. **`audit_lean.py --statement-only`:** Check `Statements/` independence (`check_statements`), compute `statement` (`STATEMENT_QUERY`) and `defaults` (and check `--witness` if already supplied), and emit a statement receipt *without* requiring a proof `<declaration>` or building `Proofs/`.
-  2. **Pre-Closure Comparison & Review (`author_review.py`, `atlas.py`, `review_web.py`, `SKILL.md`):**
-     - Make `Gate 1` (`--statement-only` + blind `correspondence.md`) a **required agent step** for every inventoried paper claim (public `Statements/` targets, not internal `Proofs/` helpers) before launching proof search, while keeping human author approval optional and non-blocking.
-     - Allow `drafted` / `attempted` claims that attach a statement receipt (`statement.sha256`) to run `review-inputs`, `compare`, and appear in the local review queue labeled clearly as **Statement drafted (proof in progress)**.
-     - **Let the author choose when to resolve an ambiguity.** If Gate 1 returns `difference` or `unsure` with `actor: "Author"`, record the specific mathematical question in the review queue. During an interactive session, show the paper passage and the Lean statement side by side and ask, “Would you like to work through this now, or save the question and continue with independent claims?” If the author chooses to work through it now, pause and help resolve the question before resuming proof search. If the author defers it or is away, keep the affected claim and any claims that depend on the answer on hold, and continue with independent work. Return to deferred questions before the final summary and list any that still need an answer.
-     - **Zero-rework payoff:** Because `STATEMENT_QUERY` intentionally strips theorem proof bodies from `statement.sha256`, any blind comparison (`comparisons.json`) or human statement approval (`reviews.json`) recorded at `Gate 1` **remains valid and carries over automatically** when the proof closes at `Gate 3`, *provided `Statements/` was not altered during proof search*. If the prover *did* alter `Statements/`, `statement.sha256` changes and automatically triggers re-comparison—catching Type (i) drift red-handed.
-- **Effort / Risk:** Low–Medium (~80–120 LoC in `audit_lean.py` + `author_review.py`). Fully backward-compatible.
+  1. **Dual Caller Profiles (`quick` vs. `thorough`) & Breadth-First Pass Ordering (`SKILL.md`, `atlas.py`, `author_review.py`, `author-guide.md`):**
+     - Extend `proof_work` in `project.json` with an optional `profile` (`"thorough"` default; `"quick"` when the caller asks for a quick, fast, triage, or hands-off pass) and include an explicit scope note in `SKILL.md` carving out operational system/protocol verification (`0/8` `P2`–`P4` fit in `survey-lean-proofs-eng-arxiv`).
+     - **Shared Non-Negotiable Floor (both profiles):** `Statements/` isolation, `Prelude.lean`/`Routine/` layout, `scan_lean_hygiene`, `#print axioms` + `.thmInfo`, Gate 1 `audit_lean.py --statement-only` across all in-scope claims first (breadth-first Pass 1), and clause-enumerated blind `correspondence.md` comparison on every closed or conditionally proved claim (so *Paper2Lean*-style silent drift is impossible even in `quick` mode).
+     - **What `quick` changes to maximize hands-off throughput:**
+       - *Breadth-first execution:* Draft & Gate-1 lock all `Statements/` first $\rightarrow$ sweep tractable proofs with a **~8-build-cycle stall circuit breaker** per claim/subproof $\rightarrow$ prove downstream headline claims *conditionally* when prerequisites stall $\rightarrow$ run blind clause comparisons on proved/conditional claims and emit explicit shortcoming badges + Refinement Backlog.
+       - *Unattended ambiguity policy:* When `profile == "quick"` encounters a mathematical ambiguity in a paper statement (which `thorough` puts on hold for the author), the agent selects the best-supported mathematical reading, records it explicitly as a `chosen reading` (or `added hypothesis` / `restriction`) row in `comparisons.json` with `needs_author_confirmation: true`, and proceeds so downstream claims are not blocked—displaying a prominent **`Needs author confirmation`** badge on the claim and any dependents using it.
+       - *Deferred extras (explicitly badged, zero rework later):* Defaults `witness_search` to `"skip"` (`No checked example...`), leaves unresolved default-value questions marked `needs attention` (`Unresolved default-value flag`), and defers Mathlib bridging lemmas and `Proofs/` refactoring (`Exploratory proof (undistilled)`).
+     - **Clean Iterative Upgrade Path:** Users can return at any time and ask to upgrade the whole paper or a single theorem (*e.g., "Switch to thorough mode"*, *"Confirm readings and close conditional lemmas for Theorem 8"*, *"Prove missing witnesses"*, *"Distill bloated proofs"*). Because `Statements/` is already isolated and hashed via `statement.sha256`, proof-only upgrades (`Conditional → Lean checked`, `Exploratory → Distilled`) preserve existing comparisons and approvals automatically.
+  2. **Separable Per-Claim Conditional Proofs & Mechanical `Assembly.lean` (Merged from `TINA`):**
+     - Standardize per-claim proof modules (`Proofs/<Claim>.lean`) to import `Statements` and `Routine` (never sibling proof files, unless explicitly declared) and take upstream paper prerequisites as `(hX : Statements.X)` hypotheses rather than waiting on `Proofs/<X>.lean` or inserting `sorry`.
+     - Add `atlas.py assemble PROJECT` / `audit_lean.py --assumes <expected_prop>...` + generated `Assembly.lean`:
+       - Composes all proved claims in topological order; any upstream claim not yet proved remains an explicit `Statements.X` binder on `Assembly.<Claim>` and is recorded in the receipt and `work[cid].assumes`.
+       - Award **`Conditional (assumes Lemma X)`** when `assumes` is non-empty (distinct from **`Lean checked`**, which requires `assumes == []`), and automatically upgrade downstream claims to unconditional **`Lean checked`** once prerequisites close and `Assembly.lean` re-audits cleanly.
+  3. **TINA Build-Speed & Anti-Bloat Conventions + Kernel `.thmInfo` Check (`SKILL.md`, `audit_lean.py`):**
+     - Instruct agents in `SKILL.md` **never to `import Mathlib` whole** (~48s/check penalty); maintain a narrow `Prelude.lean` import list (~4–5s/check) and place implicit regularity, measurability, integrability, and algebraic glue in `Routine/` (which `check_statements` / hygiene rules keep disjoint from `Statements/` and `Proofs/`).
+     - Adopt TINA's **~8-build-cycle stall rule**: after ~8 failed tactic cycles on one obligation, stop spinning, record the exact mathematical obstacle in the checkpoint, and either isolate a named sublemma, switch to a conditional proof (`quick` mode), or surface a paper finding.
+     - In `audit_lean.py`, verify via `Lean.Environment.find?` that the audited proof declaration is a kernel `.thmInfo` (`wasOriginallyTheorem`), matching TINA's `AUDIT_LEAN`.
 
 ---
 
-### Phase 2: Clause-Complete Semantic Auditing, Strict Scope Tracking & Static Hygiene (`Layer A` + `Layer B` Fast Checks)
+### Phase 3: Proof-Graph Grounding, "Two Homes" Provenance & Opt-In 1:1 Step Auditing (`Layer C` — Mode #10)
 
-- **Goal:** Prevent silent conjunct drops (`2611.04876`), strictly track and highlight unproven algorithmic/runtime obligations (`8/8` engineering papers), harden custom-definition review, and add fast static metaprogramming/notation hygiene in `audit_lean.py` (`Modes #1–#3, #5–#7`).
+- **Goal:** Make Type (i) vs. Type (ii) proof correspondence transparent, curb AI proof bloat via structured distillation, and offer TINA's gold-standard 1:1 `Expr`-verified step mirroring as an opt-in tier.
 - **Proposed Changes:**
-  1. **Clause-Enumerated Blind Comparison & Separate Auditor Context (`references/correspondence.md`):**
-     - Require the blind `--side paper` reader to output an explicit **numbered inventory of paper obligations** (each quantifier, hypothesis, and conclusion conjunct `C1, C2, ...`) *before* seeing Lean. During comparison, every `Ci` must map to a named clause in the Lean reading or become its own `cases` row—eliminating holistic-summary blind spots like `2611.04876`'s missing compiler-correctness conjunct.
-     - Explicitly instruct multi-agent hosts to run the comparison coordinator in a **fresh subagent context** prompted as a skeptical referee (ProofBridge / DeepMind red-team separation) rather than reusing the prover's context.
-  2. **Engineering Scope Kinds, Open Algorithmic Obligations & `noncomputable` Detection (`author_review.py`, `audit_lean.py`, `atlas.py`, `correspondence.md`):**
-     - Expand `author_review.KINDS` (`agrees`, `added hypothesis`, `restriction`, `chosen reading`, `other form`, `stronger`) to add **`weaker conclusion`** (covering coarser constants like `2611.08172`/`2611.11713`, omitted conjuncts like `2611.04876`/`2611.23762`, and omitted runtime/tolerance bounds like `2611.10902`/`2611.14475`).
-     - **Strict closure policy for unproven clauses:** Both missing mathematical conjuncts and unproven algorithmic/runtime/explicitness clauses must be recorded explicitly as open obligations in the status database (`work[cid].subproofs` / comparison differences), highlighted visibly in Proof Atlas, and **leave the parent claim open** (e.g., `Subproofs checked` rather than `"closed"`) unless actually proved.
-     - In `STATEMENT_QUERY`, record whether each package constant in `statement.constants` is marked `noncomputable` (`Lean.isNoncomputable env n`). Update `correspondence.md` so that if a paper claim says *"explicit"*, *"algorithm"*, *"computable"*, or states a runtime bound while the Lean definition is `noncomputable`, the comparison must surface that gap explicitly (`2611.14475`, `2611.08172`).
-  3. **Mathlib-First Rule, Bridging Lemmas & Notation-Unfolded Signatures (`SKILL.md`, `audit_lean.py`):**
-     - Add a **Mathlib-First & Bridging-Lemma Rule** to `SKILL.md`: use upstream Mathlib structures wherever practical; when domain ergonomics justify a custom definition (e.g., `IsIdentifiable`, `ripConstant`, `FiniteDist`), prove a short equivalence or characterization lemma in `Statements/` connecting it to standard primitives where one exists.
-     - Record external dependencies from `lake-manifest.json` in the audit receipt, flagging any non-Mathlib third-party git repository in the Lean view and review page so reviewers notice external theories (e.g., `riemann-roch-function-fields` in `2611.08172` or `TauCeti` in `2611.11713`).
-     - Have `STATEMENT_QUERY` also emit Lean's pretty-printed signature with custom notation disabled (`set_option pp.notation false`) alongside raw file lines in `exact_sources` as defense-in-depth for human and LLM readers.
-  4. **Static Metaprogramming, Custom-Notation & Escape-Hatch Scanner (`audit_lean.py`, `SKILL.md`):** *(Pulled forward from Phase 5 because it touches the same `audit_lean.py` pipeline with minimal extra scope.)*
-     - Scan all `checked_inputs` `.lean` files (after comment/string stripping) for high-risk directives:
-       - **Hard error in `Statements/`:** `unsafe`, `@[implemented_by]`, `@[extern]`, `@[csimp]`, `#eval`, `run_cmd`, `elab`, `elab_rules`, `macro`, `macro_rules`, and custom `notation`, `local notation`, `scoped notation`, `infix`, `prefix`, `postfix` (upstream Mathlib notation imported by `Statements/` continues to work normally).
-       - **Hard error or explicit flag in `Proofs/`:** `unsafe`, `@[implemented_by]`, `@[extern]`, `@[csimp]`, `#eval`, `run_cmd`, custom `elab`/`macro` environment mutations.
-     - Record exact axiom profile in badges/receipts (`constructive / 0 axioms` vs. `standard classical axioms`). Keep `native_decide` (`Lean.ofReduceBool`) rejected by default; guide agents in `SKILL.md` toward kernel-checked `decide` / `bv_decide` / `norm_num` first.
+  - **Phase 3a (Standard `thorough` Tier — Claim-DAG Grounding, Two Homes & Distillation):**
+    1. **Kernel-Extracted Claim Dependency Verification (`audit_lean.py`, `atlas.py`, `graph.js`):** Walk the proof declaration's transitive local constant closure in `Lean.Environment` (`used_local_theorems` / `.Statement` constants) and cross-reference against `reader.json` `dependencies` to distinguish **Used in both paper & Lean proof**, **Paper-only dependency (Lean proved independently)**, and **Lean-only prerequisite**.
+    2. **TINA's "Two Homes" Provenance (`paper` vs. `supplied` / `supplement.md`):**
+       - Add `basis` (`"paper"`, `"lean"`, `"aligned"`, or `"supplied"`) on structured proofs / claims. When the manuscript states a remark, proposition, or skipped step *without proof* and Lean supplies the argument, track its written steps in a generated `supplement.md` (or companion view) and badge the claim **`Lean checked (proof supplied outside manuscript)`** so readers and co-authors never mistake a Lean-supplied derivation for text present in the PDF.
+    3. **Proof Size Metrics & Post-Closure Distillation Pass (`audit_lean.py`, `SKILL.md`, `atlas.py`):**
+       - Record `reachable_local_defs`, `reachable_local_theorems`, and `checked_lean_loc` in receipts; surface **`Exploratory proof (undistilled)`** until distilled (or when `quick` mode skips distillation).
+       - Add a **Post-Closure Distillation Step** in `SKILL.md`: factor implicit plumbing into `Routine/`, delete dead scratch declarations, derive an exact paper-statement corollary if an internal lemma was stronger, and mark `distilled: true`.
+  - **Phase 3b (Opt-In Deep Tier — TINA `1:1` Step-Lemma Mirroring & `auditUses`):**
+    - For flagship theorems or co-authored manuscripts seeking Bastounis Type (ii) proof-body verification, allow structured Lamport steps (`s1, s2, …`, each marked `origin: "paper"` [verified as a verbatim TeX substring] or `"supplied"`) to bind 1:1 to named Lean step lemmas (`step_map`) with declared `step_deps`.
+    - Add `--step-map` in `audit_lean.py` implementing TINA's `auditUses` `Expr` walker (looking through compiler-generated `_proof_1`/`match_1` auxiliaries while stopping at sibling step lemmas and `.Statement` constants, and forbidding direct calls to another claim's `main` theorem), awarding **`Step-verified (paper)`** or **`Step-verified (with supplied steps)`**.
 
 ---
 
-### Phase 3: Proof-Graph Grounding & Post-Closure Distillation (`Layer C` — Mode #10)
+### Phase 4: Anti-Scope-Erasure, Shortcoming Disclosure & Paper-Side Verification Manifest (`Layer A/C` — Modes #2 & #12)
 
-- **Goal:** Make Type (i) vs. Type (ii) proof correspondence transparent to readers and curb multi-hundred-thousand-line AI proof debt without sacrificing discovery speed.
-- **Current Gap:** In `reader.json`, dependency arrows (`Lemma 7 → Theorem 8`) come from manuscript `\ref` citations, while `Plain English` and `Lamport proof` views have no explicit provenance tag indicating whether they follow the *manuscript's* proof or *Lean's* proof. In bloated AI repos (`2611.05136`, `2611.11713`), Lean often proves a theorem via a completely different route without using the Lean formalization of the paper's intermediate lemma.
+- **Goal:** Prevent scope qualifiers and `quick`-mode shortcuts from vanishing between Proof Atlas and the manuscript (`2611.10902`, `2611.08172`, `2611.23762`, and `TINA` `main-v3.tex`), while giving returning authors a clean **Refinement Backlog**.
 - **Proposed Changes:**
-  1. **Kernel-Extracted Claim Dependency Verification (`audit_lean.py`, `atlas.py`, `graph.js`):**
-     - During `audit_lean.py`, walk the proof declaration's transitive local constant closure (`env.find?`) and list all local package `thmInfo` constants used (`used_local_theorems`, or check against other audited `declaration` names in `project.json`).
-     - In `atlas.py`, cross-reference `reader.json` `dependencies` against `used_local_theorems`: distinguish **Used in both paper & Lean proof**, **Paper-only dependency (Lean proved independently)**, and **Lean-only prerequisite** in the Dependency Graph / Lean tab.
-  2. **Structured-Proof Provenance & Distillation Pass (`SKILL.md`, `atlas.py`):**
-     - Add a one-field `basis` (`"paper"`, `"lean"`, or `"aligned"`) on `lamport` / `sketch` entries so readers know whether the structured steps explain the paper's argument or the formal proof's architecture.
-     - Record lightweight size metrics in each closure receipt (`reachable_local_defs`, `reachable_local_theorems`, `checked_lean_loc`).
-     - Add a **Post-Closure Distillation Step** in `SKILL.md`: once an exploratory proof compiles, remove dead scratch declarations, factor repeated tactic blocks into named helper lemmas, and derive an exact paper-statement corollary before running final closure—treating the raw AI tactic search as a draft rather than the finished artifact (Cohn's principle).
+  1. **Headline vs. Supporting Result Breakdown & Multi-Resolution Counts (`atlas.py`, `explorer.html`, `progress.html`):**
+     - Distinguish primary/headline claims (defaulting to `theorem` / `corollary` / `proposition` or explicit `headline: true`, matching TINA's `v_headline`) from supporting `lemma` / `remark` / `example` and separate `conjecture` rows.
+     - Report exact counts across resolution states: `Unconditionally closed` vs. `Conditional (assumes unproved claim)` vs. `Subproofs checked (open weaker/algorithmic obligation)` vs. `Open`, alongside witness, confirmation, and CI counts.
+  2. **Explicit Shortcoming Banner & Machine-Readable Refinement Backlog (`atlas.py`, `progress.html`, `manuscript_edits.py`):**
+     - Whenever any claim carries deferred work (especially after a `quick` hands-off run), render a prominent **"Open Shortcomings & Refinement Backlog"** section on `progress.html` and in `atlas.py review-work PROJECT` itemizing prioritized next steps:
+       1. `Needs author confirmation` (`chosen reading` / `added hypothesis` / `restriction` recorded unattended),
+       2. `Conditional` claims waiting on unproved prerequisite statements,
+       3. Open `weaker conclusion` / `noncomputable` algorithmic or runtime clauses,
+       4. Missing `--witness` examples and unresolved `needs attention` default-value flags,
+       5. Deferred Mathlib bridging lemmas and undistilled exploratory proofs.
+  3. **`atlas.py manifest PROJECT` — Ready-to-Paste LaTeX & Markdown Verification Summary:**
+     - Deterministically generate `dist/VERIFICATION.md` and a concise LaTeX `\paragraph{Formal Verification and Scope.}` snippet summarizing:
+       - Exact headline and supporting counts by verification state (`Lean checked`, `Conditional`, `Subproofs checked`, `Lean-supplied proof`, `Open`),
+       - Every active non-`agrees` scope boundary from `comparisons.json` (`restriction`, `added hypothesis`, `chosen reading` awaiting confirmation, `weaker conclusion`, `noncomputable` idealizations) **plus any deferred `quick`-mode checks** (missing witnesses, unresolved default flags, local-only vs. GitHub/multi-kernel CI),
+       - Pinned `lean-toolchain`, Mathlib commit SHA, axiom profiles, `Statements/` digest, and Proof Atlas verification URL.
+     - Update `SKILL.md` so that if the manuscript's abstract/introduction/footnote overstates Lean coverage—or omits Lean scope caveats—the agent proposes a synchronized `manuscript-edits.json` item using this manifest.
 
 ---
 
-### Phase 4: Anti-Scope-Erasure & Paper-Side Verification Manifest (`Layer A/C` — Modes #2 & #12)
+### Phase 5: Mechanical `Comparator` Harness, Opt-In Multi-Kernel CI & Full CI Invariant Parity (`Layer B` — Mode #8)
 
-- **Goal:** Prevent scope qualifiers from vanishing between the Proof Atlas website and the arXiv PDF (`2611.10902` Footnote 1, `2611.08172` abstract, `2611.23762` headline mismatch), while keeping Proof Atlas strictly focused on Lean formalization + prose (no non-Lean script verification or reproducibility scope creep).
+- **Goal:** Provide an opt-in adversarial/multi-kernel CI tier (`Comparator` / `lean4checker` / `lake check --paranoid`) and guarantee 100% invariant parity between local checks and GitHub CI.
 - **Proposed Changes:**
-  1. **Headline vs. Supporting Result Breakdown (`atlas.py`, `explorer.html`):**
-     - Allow `project.json` (or `reader.json`) to mark primary/headline claims (defaulting to `theorem` / `corollary` vs. supporting `lemma` / `proposition` + separate `conjecture`), and surface that breakdown on the Folio overview and dashboard (*e.g., "3/3 Theorems and 7/7 Lemmas closed; 1 open conjecture"* vs. *"0/4 Theorems closed; 3/12 supporting Lemmas closed"*).
-     - Highlight claims that remain open due to unproven algorithmic/runtime or other omitted obligations (from Phase 2) separately from completely untouched claims so readers immediately see what is Lean-proved vs. still open.
-  2. **`atlas.py manifest PROJECT` — Ready-to-Paste LaTeX & Markdown Verification Summary:**
-     - Add a deterministic subcommand that generates both `dist/VERIFICATION.md` and a concise LaTeX `\paragraph{Formal Verification and Scope.}` snippet summarizing:
-       - Exact counts of closed vs. open/unformalized claims by kind,
-       - Every active non-`agrees` scope boundary from `comparisons.json` (`restriction`, `added hypothesis`, `weaker conclusion`, `noncomputable` idealizations) and open algorithmic/runtime obligations,
-       - Pinned `lean-toolchain`, Mathlib commit SHA, axioms used, `Statements/` digest, and GitHub verification URL.
-     - Update `SKILL.md` so that if the imported manuscript's abstract/introduction/footnote already contains a Lean verification claim whose scope disagrees with the Atlas inventory, the agent proposes a `manuscript-edits.json` item using this generated manifest.
-
----
-
-### Phase 5: Opt-In Multi-Kernel / `Comparator` CI (`Layer B` — Mode #8)
-
-- **Goal:** Provide an opt-in cryptographic/adversarial CI tier (`Comparator` / `lean4checker` / `lake check --paranoid`) on GitHub without slowing everyday iteration. *(Fast static escape-hatch and notation hygiene runs locally in `audit_lean.py` starting in Phase 2.)*
-- **Proposed Changes:**
-  - Because PR #2 *already* isolates `Statements/` from `Proofs/`, Proof Atlas is one step away from native `Comparator` / external-kernel replay.
-  - Add an optional `hosting.lean_ci_level` (`"standard"` default vs. `"paranoid"`) across `hosting.py`, `verify_ci.py`, and `references/verify-lean.yml`:
-    - **`standard` (current):** Rebuilds and runs `audit_lean.py` on GitHub Actions (`Machine verified on GitHub`).
-    - **`paranoid` (opt-in for flagship releases):** Runs in a network-disabled container step after Mathlib cache fetch, replays exported declarations through `lean4checker --fresh` and/or `Comparator` (and `lake check --paranoid` multi-kernel checking when the pinned toolchain is Lean $\ge$ v4.35.0, matching `2611.14475` and `2611.04876`), and records `kernels_checked` in `lean-verification.json`.
+  1. **Full CI Check Parity (`verify_ci.py`):** Explicitly enforce every local `audit_lean.py` invariant in CI—`Statements/` isolation, `scan_lean_hygiene`, `.thmInfo`, `Assembly` assumption tracking, `statement.sha256` bindings, and witness re-checks—closing the exact CI bypass found in TINA's `verify_release.py` (`ledger.run_check` omission).
+  2. **Mechanical `Challenge.lean` + `Solution.lean` Generator & `paranoid` CI Tier (`hosting.py`, `verify_ci.py`, `references/verify-lean.yml`):**
+     - Because `Statements/` uses pure `Prop` definitions (zero `sorry`), auto-generate a hash-locked `Challenge.lean` (importing *only* `Statements` with `:= by sorry` target stubs) and `Solution.lean` (importing `Assembly` / `Proofs`).
+     - Support `hosting.lean_ci_level` (`"standard"` default vs. `"paranoid"`): in `"paranoid"` mode, run in a network-disabled container after cache fetch, replay via `Comparator` and/or `lean4checker --fresh` (plus `lake check --paranoid` multi-kernel checking across `nanoda`/`lean4lean`/`con-leche` on Lean $\ge$ v4.35.0, matching `2611.14475` and `2611.04876`), and record `kernels_checked` in `lean-verification.json`.
 
 ---
 
 ### Phase 6: Batched Verification for Large AI Repositories (`Layer C` — Mode #11)
 
-- **Goal:** Ensure `verify_ci.py` and local re-audits scale cleanly to 50k–250k+ LoC repositories with 30–80 closed claims (`2611.08172`, `2611.02057`, `2611.04876`) well inside GitHub Actions' 150-minute job window.
-- **Current Bottleneck:** `verify_ci.py` (lines 52–60) iterates over every closed claim in a package and invokes `audit()` individually, triggering a separate `lake --no-cache build` subprocess and separate Lean environment startups per claim.
+- **Goal:** Scale `verify_ci.py` and local re-audits cleanly to 50k–250k+ LoC repositories with 30–80 claims inside GitHub Actions' job window.
 - **Proposed Changes:**
-  - Add a **batched package verification path** (`audit_batch` in `audit_lean.py`, used by `verify_ci.py`):
-    1. Verify `module_inputs` and pre-build SHA-256 input closures for every closed claim up front,
-    2. Run **one** `lake --no-cache build <union-of-targets>` per Lean package,
-    3. Execute per-contract type/witness/axiom/statement checks against the freshly built `.olean` artifacts, and
-    4. Re-verify post-check input closures and emit identical per-claim records in `lean-verification.json`.
-- **Impact:** Eliminates redundant Lake graph walks and compilation across shared prerequisites, cutting multi-claim CI latency dramatically with zero reduction in audit rigor.
+  - Add `audit_batch` in `audit_lean.py` (used by `verify_ci.py` alongside `Assembly.lean`): verify `module_inputs`, `scan_lean_hygiene`, and pre-build SHA-256 input closures for all claims up front $\rightarrow$ run **one** `lake --no-cache build <union-of-targets>` per package $\rightarrow$ run per-claim `.thmInfo`/type/witness/axiom/statement/step checks against freshly built `.olean`s $\rightarrow$ re-verify post-check hashes and emit identical per-claim records in `lean-verification.json`.
 
 ---
 
 ## 5. Summary Prioritization & Effort Matrix
 
-| Phase | Focus | Primary Layers / Modes | Touches | Est. Scope | Recommended Priority | Status |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Phase 0** | Merge PRs #4 & #5 + `ENNReal.toReal`/`Matrix.inv` defaults + non-degenerate witness rule | Layer A (`Mode #4`) | `audit_lean.py`, `SKILL.md`, `correspondence.md`, `atlas.py` | Small | **Immediate (P0)** | **Merged** ([#4](https://github.com/ANRGUSC/proof-atlas/pull/4), [#5](https://github.com/ANRGUSC/proof-atlas/pull/5)) |
-| **Phase 1** | Pre-proof `Gate 1` (`--statement-only` + pre-closure `compare` & `review`, author chooses when to resolve ambiguities) | Layer A (`Mode #1`), `P1 → P4` | `audit_lean.py`, `author_review.py`, `atlas.py`, `review_web.py`, `SKILL.md` | Medium | **High (P1)** | **Merged** ([#8](https://github.com/ANRGUSC/proof-atlas/pull/8)) |
-| **Phase 2** | Clause-enumerated blind diff, `weaker conclusion` kind + open algorithmic obligations, `noncomputable` & external-pkg flags, `pp.notation false`, Mathlib bridging rule, static escape-hatch & custom-notation ban | Layer A (`Modes #1, #2, #3`), Layer B (`Modes #5, #6, #7`) | `correspondence.md`, `SKILL.md`, `author_review.py`, `audit_lean.py`, `atlas.py` | Medium | **High (P1)** | **Open upstream · on `skill-v2`** ([#9](https://github.com/ANRGUSC/proof-atlas/pull/9), [#10](https://github.com/ANRGUSC/proof-atlas/pull/10)) |
-| **Phase 4** | Headline-vs.-lemma rollup + `atlas.py manifest` LaTeX/MD scope generator (Lean + prose only) | Layer A/C (`Modes #2, #12`) | `atlas.py`, `explorer.html`, `SKILL.md` | Small–Med | **High (P1/P2)** | **Not started** |
-| **Phase 3** | Kernel-extracted claim DAG edges + `lamport` provenance + distillation pass | Layer C (`Mode #10`), Type (i)/(ii) | `audit_lean.py`, `atlas.py`, `graph.js`, `SKILL.md` | Medium | **Medium (P2)** | **Not started** |
-| **Phase 5** | Opt-in `paranoid` (`Comparator`/multi-kernel) GitHub CI tier | Layer B (`Mode #8`) | `hosting.py`, `verify_ci.py`, `verify-lean.yml` | Med–Large | **Medium (P2)** | **Not started** |
-| **Phase 6** | Batched package build & verification in `verify_ci.py` | Layer C (`Mode #11`) | `audit_lean.py`, `verify_ci.py` | Small–Med | **Medium (P2 — before first >50k LoC atlas)** | **Not started** |
+| Phase | Focus | Primary Layers / Modes | Touches | Est. Scope | Priority | Status |
+| :--- | :--- | :--- | :--- | :---: | :---: | :--- |
+| **Phase 0** | `--witness` + `defaults` (`ENNReal.toReal`, `Matrix.inv`, `condExp`) + non-degenerate witness rule | Layer A (`Mode #4`) | `audit_lean.py`, `SKILL.md`, `correspondence.md`, `atlas.py` | Small | **P0** | **Merged** ([#4](https://github.com/ANRGUSC/proof-atlas/pull/4), [#5](https://github.com/ANRGUSC/proof-atlas/pull/5)) |
+| **Phase 1** | Pre-proof `Gate 1` (`--statement-only`, early `compare` & `review`, interactive/hold ambiguity rule) | Layer A (`Mode #1`), `P1 → P4` | `audit_lean.py`, `author_review.py`, `atlas.py`, `review_web.py`, `SKILL.md` | Medium | **P1** | **Merged** ([#8](https://github.com/ANRGUSC/proof-atlas/pull/8)) |
+| **Phase 2a/2b** | Clause-enumerated blind diff, `weaker conclusion`, `noncomputable`/`pp.notation false`, bridging rule, static escape-hatch & custom-notation ban | Layer A (`#1–#3`), Layer B (`#5–#7`) | `correspondence.md`, `SKILL.md`, `author_review.py`, `audit_lean.py`, `atlas.py` | Medium | **P1** | **On `skill-v2`** ([#9](https://github.com/ANRGUSC/proof-atlas/pull/9), [#10](https://github.com/ANRGUSC/proof-atlas/pull/10)) |
+| **Phase 2c** | Multi-resolution (`quick` vs. `thorough`), conditional proofs + `Assembly.lean` (`Conditional` badge), `Prelude`/`Routine` + 8-cycle breaker, `.thmInfo` | Ergonomics + Layers A/B/C (`#1, #6, #10, #11`) | `SKILL.md`, `audit_lean.py`, `atlas.py`, `author_review.py`, `author-guide.md` | Medium | **High (P1)** | **Next** |
+| **Phase 4** | Headline rollup, explicit shortcoming & **Refinement Backlog** UI/CLI, `atlas.py manifest` LaTeX/MD generator | Layer A/C (`Modes #2, #12`) | `atlas.py`, `explorer.html`, `manuscript_edits.py`, `SKILL.md` | Medium | **High (P1)** | **Next** |
+| **Phase 3a/3b** | **3a:** Kernel claim-DAG edges, TINA `paper` vs. `supplied` (`supplement.md`), metrics & distillation.<br>**3b:** Opt-in TINA 1:1 `step_map` + `Expr` `auditUses` | Layer C (`Mode #10`), Type (i)/(ii) | `audit_lean.py`, `atlas.py`, `graph.js`, `SKILL.md` | Med–Large | **Medium (P2)** | **Not started** |
+| **Phase 5** | Full CI check parity + mechanical `Challenge.lean` `Comparator` & multi-kernel `paranoid` CI tier | Layer B (`Mode #8`) | `hosting.py`, `verify_ci.py`, `audit_lean.py`, `verify-lean.yml` | Med–Large | **Medium (P2)** | **Not started** |
+| **Phase 6** | Batched package build & verification (`audit_batch`) in `verify_ci.py` | Layer C (`Mode #11`) | `audit_lean.py`, `verify_ci.py` | Small–Med | **Medium (P2)** | **Not started** |
 
 ---
 
-## 6. Baseline Design Decisions (For Co-Author Sign-Off)
+## 6. Baseline Design Decisions (Co-Author Sign-Off Record)
 
-The six design choices from the initial draft have been resolved as the proposed baseline below (open to pushback during PR #7 review):
-
-1. **Gate 1 pre-proof workflow and author choice (Phase 1)**
-   `SKILL.md` will require the agent to run `audit_lean.py --statement-only` and the blind `correspondence.md` check on every inventoried paper claim (`Statements/` target) **before** proof search. Human approval remains optional. For a difference or uncertainty assigned to the author, offer the choice described in Phase 1: resolve the question together now, or keep it in the review queue and continue with independent claims. Use the latter as the unattended default. Resume affected work once the question is resolved, and revisit outstanding questions before the final summary.
-2. **Taxonomy of Difference `KINDS` & Unproven Algorithmic Clauses (Phase 2) — Add `weaker conclusion`, Keep Unproven Clauses Open:**  
-   Add **`weaker conclusion`** to `author_review.KINDS` so weaker bounds or omitted clauses are classified honestly instead of mislabeled as `restriction`. Both missing mathematical conjuncts and unproven algorithmic/runtime clauses stay explicitly tracked in the status database, highlighted in Proof Atlas, and **leave the parent claim open** (`Subproofs checked`, not `"closed"`) unless proved.
-3. **Notation & Metaprogramming Restrictions in `Statements/` (Phase 2) — Hard-Ban Custom Notation + Always Show `pp.notation false`:**  
-   `audit_lean.py` will hard-error on metaprogramming/escape hatches (`unsafe`, `@[implemented_by]`, `@[extern]`, `@[csimp]`, `#eval`, `run_cmd`, `elab`, `macro`) **and** custom `notation`/`infix`/`prefix`/`postfix` inside `Statements/` (upstream Mathlib notation continues to work), while still rendering Lean's `pp.notation false` unfolded expression as defense-in-depth.
-4. **Non-Lean Computational Evidence (Phase 4) — Out of Scope:**  
-   Proof Atlas stays focused strictly on Lean formalization + prose (no `"Computed script"` checkpoint attachment or script reproducibility/verification pipeline) to avoid scope creep.
-5. **Positioning Relative to `LeanArchitect` / `Verso` Blueprints (`Paradigm 3`) — Strict Zero-LaTeX-Lock-In:**  
-   Keep the LaTeX manuscript untouched by design (no required `\inputleannode` or `@[blueprint]` tags, and no `leanblueprint` importer unless explicitly requested later); verify actual Lean theorem-to-theorem usage directly from the kernel in Phase 3.
-6. **Phase Ordering & Pilot Validation — Pull Static Hygiene into Phase 2, Dogfood Before Phases 3/5/6:**  
-   Execute in order **Phase 0 $\rightarrow$ Phase 1 $\rightarrow$ Phase 2 (including static escape-hatch/notation scanner) $\rightarrow$ Phase 4 $\rightarrow$ Phases 3 / 5 / 6**, dogfooding Phases 0–2 on `markov-block-hierarchy-proof-atlas` plus a compact surveyed `eess.SY`/`cs.IT` paper before rolling out Phases 3, 5, and 6.
+1. **Gate 1 Pre-Proof Workflow & Interactive Author Choice (Phase 1):**  
+   `SKILL.md` requires `audit_lean.py --statement-only` on every inventoried paper claim (`Statements/` target) before proof search, keeping human approval optional. In `thorough` mode, if Gate 1 surfaces an author-owned ambiguity, interactive sessions offer *"Work through this now, or save and continue with independent claims?"* while unattended `thorough` runs hold the claim and its dependents.
+2. **Taxonomy of Difference `KINDS` & Unproven Algorithmic Clauses (Phase 2a):**  
+   `weaker conclusion` in `author_review.KINDS` classifies coarser bounds, omitted conjuncts, and unproved algorithmic/runtime/`noncomputable` clauses honestly, blocks `result == "match"`, and leaves the parent claim open (`Subproofs checked`, not `closed`) until proved.
+3. **Notation & Metaprogramming Restrictions in `Statements/` (Phase 2b):**  
+   `audit_lean.py` statically blocks metaprogramming/escape hatches (`unsafe`, `@[implemented_by]`, `@[extern]`, `@[csimp]`, `#eval`, `run_cmd`, `elab`, `macro`) across audited files and custom `notation`/`infix`/`prefix`/`postfix` inside `Statements/`, while rendering `pp.notation false` signatures as defense-in-depth.
+4. **Domain & Computational Scope Boundaries (Phases 2c & 4):**  
+   Proof Atlas stays strictly focused on **mathematical and algorithmic claims in manuscripts** (Lean + prose): non-Lean numerical scripts stay outside Lean verification scope (disclosed in `atlas.py manifest`), and **operational system/protocol/hardware verification** (`0/8` `P2`–`P4` adoption in `survey-lean-proofs-eng-arxiv`) is explicitly carved out in favor of refinement/state-machine frameworks.
+5. **Strict Zero-LaTeX-Lock-In Relative to `LeanArchitect` / `Verso` (`Paradigm 3`):**  
+   Keep the LaTeX manuscript untouched by invasive blueprint macros (`\inputleannode`, `@[blueprint]`); extract Lean-to-Lean theorem and step dependencies directly from the compiled `Lean.Environment` in Phases 3a/3b.
+6. **Multi-Resolution Entry Modes (`quick` vs. `thorough`) on a Zero-Regret Structural Floor (Phase 2c & Phase 4):**  
+   Expose `quick` (Hands-Off Triage) and `thorough` (Full `P4 + Distill`, default) profiles organized as breadth-first passes. **Never relax structural or soundness invariants in `quick` mode**: `Statements/` isolation, `Prelude.lean`/`Routine/`, static & axiom/`.thmInfo` hygiene, `--statement-only` + `defaults` scan, and blind clause comparison on closed/conditional claims always run, preventing silent drift and guaranteeing zero-rewrite upgrades. Deferred `quick` items (`witness_search = "skip"`, unresolved `needs attention` defaults, conditional prerequisites, missing bridging lemmas, undistilled proofs) are **explicitly badged on every claim, itemized in a Refinement Backlog, and disclosed in `VERIFICATION.md` and `atlas.py manifest` LaTeX snippets**.
+7. **Unattended Ambiguity Policy in `quick` Mode (Phase 2c):**  
+   Unlike `thorough` mode's hold-on-ambiguity default, unattended `quick` runs commit to the best-supported mathematical reading, record an explicit `chosen reading` (or `added hypothesis` / `restriction`) row in `comparisons.json`, and attach a prominent **`Needs author confirmation`** badge/caveat so one ambiguous definition or lemma never stalls a fast whole-paper triage pass.
+8. **Net-Positive `TINA` Architecture Merge — Retaining JSON Storage (Phases 2c, 3a/3b, 5):**  
+   Adopt five proven `TinaV2` mechanisms inside Proof Atlas's existing JSON project/receipt architecture (avoiding a disruptive migration to SQLite `schema.sql`/`data.sql`): (i) separable per-claim conditional proofs (`(hX : Statements.X)`) + generated `Assembly.lean` and **`Conditional (assumes X)`** badge; (ii) narrow `Prelude.lean` + `Routine/` glue isolation + ~8-build-cycle stall circuit breaker; (iii) "two homes" provenance (`paper` vs. `supplied` / `supplement.md`) for unproved manuscript remarks/steps; (iv) kernel `.thmInfo` check + mechanical `Challenge.lean`/`Solution.lean` `Comparator` generation + full CI check parity in `verify_ci.py`; and (v) opt-in **Phase 3b** 1:1 step-lemma mirroring (`step_map` + compiled `Expr` `auditUses`).
+9. **Updated Execution Ordering:**  
+   Execute **Phases 0, 1, 2a, 2b (done on `skill-v2`) $\rightarrow$ Phase 2c (multi-resolution + conditional assembly + `Prelude`/`Routine`) $\rightarrow$ Phase 4 (shortcoming/backlog UI + `atlas.py manifest`) $\rightarrow$ Pilot Validation (dogfooding both `quick` and `thorough` passes) $\rightarrow$ Phases 3a/3b, 5, and 6**.
