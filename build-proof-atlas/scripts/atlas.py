@@ -16,6 +16,8 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 NO_EXAMPLE = "No checked example shows the hypotheses can hold"
+HEADLINE_KINDS = frozenset({"theorem", "corollary", "proposition"})
+MANIFEST_EDIT_KEY = "manifest-verification-scope"
 
 
 def esc(value):
@@ -296,14 +298,1057 @@ def witness_plan(project, work, witness):
     return plan
 
 
+def claim_tier(claim, note=None, work=None):
+    """Classify a manuscript claim as headline, supporting, or conjecture."""
+    if claim["kind"].casefold() == "conjecture":
+        return "conjecture"
+    explicit = None
+    if isinstance(work, dict) and "headline" in work:
+        explicit = work["headline"]
+    elif isinstance(note, dict) and "headline" in note:
+        explicit = note["headline"]
+    if explicit is not None:
+        if type(explicit) is not bool:
+            raise ValueError(f"{claim['id']}: headline must be a boolean")
+        return "headline" if explicit else "supporting"
+    return "headline" if claim["kind"].casefold() in HEADLINE_KINDS else "supporting"
+
+
+def claim_resolution(checked, is_conditional, disputed, has_parts):
+    """Return the multi-resolution verification state of a claim."""
+    if checked and not disputed:
+        return "unconditionally_closed"
+    if is_conditional and not disputed:
+        return "conditional"
+    if has_parts:
+        return "subproofs_checked"
+    return "open"
+
+
+def unresolved_defaults(rd):
+    """Default-value findings that are marked 'needs attention' or not yet assessed."""
+    assessments = rd["view"].get("analysis", {}).get("default_assessments", {})
+    items = []
+    for finding in rd.get("defaults", []):
+        assessment = assessments.get(finding["id"], {})
+        status = assessment.get("status", "not assessed")
+        if status != "justified":
+            items.append(dict(
+                id=finding["id"],
+                constant=finding["constant"],
+                construct=finding["construct"],
+                type=finding.get("type", ""),
+                file=finding.get("file", ""),
+                lines=finding.get("lines"),
+                meaning=finding.get("meaning", ""),
+                status=status,
+                explanation=assessment.get("explanation", ""),
+            ))
+    return items
+
+
+def _deferred_bridging_lemmas(cid, work):
+    raw = work.get("deferred_bridging_lemmas")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"{cid}: deferred_bridging_lemmas must be a list")
+    items = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            items.append(item.strip())
+        elif isinstance(item, dict):
+            text = (item.get("title") or item.get("name") or item.get("description") or "").strip()
+            if text:
+                items.append(text)
+            else:
+                raise ValueError(f"{cid}: deferred_bridging_lemmas entries must be non-empty")
+        else:
+            raise ValueError(f"{cid}: deferred_bridging_lemmas entries must be strings or objects")
+    return items
+
+
+def _is_undistilled(cid, work, profile, checked, is_conditional):
+    if "distilled" in work and type(work["distilled"]) is not bool:
+        raise ValueError(f"{cid}: distilled must be a boolean")
+    if not (checked or is_conditional):
+        return False
+    if work.get("distilled") is False:
+        return True
+    return profile == "quick" and work.get("distilled") is not True
+
+
+def _empty_bucket():
+    return dict(
+        total=0,
+        unconditionally_closed=0,
+        conditional=0,
+        subproofs_checked=0,
+        open=0,
+        with_witness=0,
+        needs_confirmation=0,
+        needs_confirmation_direct=0,
+        machine_verified=0,
+        author_reviewed=0,
+        supplied_proof=0,
+    )
+
+
+def summarize_records(records):
+    """Compute multi-resolution counts for headline, supporting, all results, and conjectures."""
+    buckets = {
+        "headline": _empty_bucket(),
+        "supporting": _empty_bucket(),
+        "all_results": _empty_bucket(),
+        "conjectures": _empty_bucket(),
+    }
+    for rec in records:
+        tier = rec["tier"]
+        res = rec["resolution"]
+        rd = rec["rd"]
+        has_witness = bool(rec["entry"].get("hypotheses"))
+        direct_confirm = bool(rd.get("needs_author_confirmation"))
+        any_confirm = direct_confirm or bool(rd.get("needs_author_confirmation_via"))
+        machine_ok = bool(rec["machine_verified"])
+        approved = bool(rd.get("approved"))
+        supplied = bool(res == "unconditionally_closed" and rec["entry"].get("basis") == "supplied")
+        targets = (buckets["conjectures"],) if tier == "conjecture" else (buckets[tier], buckets["all_results"])
+        for b in targets:
+            b["total"] += 1
+            b[res] += 1
+            if has_witness:
+                b["with_witness"] += 1
+            if any_confirm:
+                b["needs_confirmation"] += 1
+            if direct_confirm:
+                b["needs_confirmation_direct"] += 1
+            if machine_ok:
+                b["machine_verified"] += 1
+            if approved:
+                b["author_reviewed"] += 1
+            if supplied:
+                b["supplied_proof"] += 1
+    return buckets
+
+
+def build_refinement_backlog(project, records):
+    """Build the prioritized P1-P5 Open Shortcomings & Refinement Backlog."""
+    profile = proof_work_profile(project)
+    dependents_of = {}
+    for rec in records:
+        for via in rec["rd"].get("needs_author_confirmation_via", []):
+            dependents_of.setdefault(via["id"], []).append(dict(
+                id=rec["claim"]["id"],
+                reference=rec["entry"]["reference"],
+            ))
+
+    p1, p2, p3, p4, p5 = [], [], [], [], []
+    for rec in records:
+        cid = rec["claim"]["id"]
+        ref = rec["entry"]["reference"]
+        tier = rec["tier"]
+        rd = rec["rd"]
+        w = rec["work"]
+        analysis = rd["view"].get("analysis", {})
+        cases = analysis.get("cases", [])
+
+        # Priority 1: Needs author confirmation (unattended chosen reading / added hypothesis / restriction).
+        if rd.get("needs_author_confirmation"):
+            confirm_cases = [
+                dict(case=row["case"], kind=row.get("kind", ""), why=row["why"])
+                for row in cases
+                if row.get("needs_author_confirmation") or row.get("kind") in reviews.CONFIRMATION_KINDS
+            ]
+            p1.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                cases=confirm_cases,
+                dependents=dependents_of.get(cid, []),
+                action="Confirm the unattended reading(s) in author review or report a difference.",
+            ))
+
+        # Priority 2: Conditional claims waiting on unproved prerequisites.
+        if rec["is_conditional"]:
+            p2.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                assumes=rec["assumed_items"],
+                action="Prove the assumed prerequisite(s) and re-run atlas.py assemble --audit.",
+            ))
+
+        # Priority 3: Open weaker conclusion and/or unapproved noncomputable obligations.
+        weaker = [
+            dict(case=row["case"], paper=row["paper"], lean=row["lean"], why=row["why"])
+            for row in cases if row.get("kind") == "weaker conclusion"
+        ]
+        noncomp = list(rd.get("noncomputable_constants") or [])
+        include_noncomp = bool(noncomp and (weaker or not rd.get("approved")))
+        open_subs = [part["title"] for part in rec["entry"].get("subproofs", []) if part.get("status") != "checked"]
+        if weaker or include_noncomp:
+            if weaker and include_noncomp:
+                action = "Prove the omitted weaker-conclusion clause(s) and verify whether noncomputable definitions affect algorithmic/explicitness claims."
+            elif weaker:
+                action = "Prove the omitted weaker-conclusion clause(s) and close the remaining open subproof(s)."
+            else:
+                action = "Verify whether noncomputable definitions affect any algorithmic or explicitness claim and record author review."
+            p3.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                weaker_conclusions=weaker,
+                noncomputable_constants=noncomp if include_noncomp else [],
+                open_subproofs=open_subs if weaker else [],
+                action=action,
+            ))
+
+        # Priority 4: Missing --witness examples and unresolved default-value flags.
+        missing_witness = bool(
+            tier != "conjecture"
+            and (rec["checked"] or rec["is_conditional"] or rd.get("statement_checked"))
+            and not rec["entry"].get("hypotheses")
+        )
+        unres_defaults = rec["unresolved_defaults"]
+        if missing_witness or unres_defaults:
+            parts = []
+            if missing_witness:
+                parts.append("add a non-degenerate --witness example")
+            if unres_defaults:
+                parts.append(f"resolve {len(unres_defaults)} default-value flag(s)")
+            p4.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                missing_witness=missing_witness,
+                witness_plan=rec["witness_plan"] if missing_witness else None,
+                unresolved_defaults=unres_defaults,
+                action=" and ".join(parts).capitalize() + ".",
+            ))
+
+        # Priority 5: Deferred Mathlib bridging lemmas and undistilled exploratory proofs.
+        bridging = rec["deferred_bridging_lemmas"]
+        undistilled = rec["undistilled"]
+        if bridging or undistilled:
+            parts = []
+            if bridging:
+                parts.append(f"prove {len(bridging)} deferred Mathlib bridging lemma(s)")
+            if undistilled:
+                parts.append("distill exploratory proof into Routine/ and mark distilled: true")
+            p5.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                deferred_bridging_lemmas=bridging,
+                undistilled=undistilled,
+                action=" and ".join(parts).capitalize() + ".",
+            ))
+
+    groups = [
+        dict(priority=1, key="needs_author_confirmation", title="Needs author confirmation", items=p1),
+        dict(priority=2, key="conditional_claims", title="Conditional claims waiting on unproved prerequisites", items=p2),
+        dict(priority=3, key="weaker_or_noncomputable", title="Open weaker-conclusion and noncomputable obligations", items=p3),
+        dict(priority=4, key="witnesses_and_defaults", title="Missing hypothesis witnesses and unresolved default-value flags", items=p4),
+        dict(priority=5, key="bridging_and_distillation", title="Deferred Mathlib bridging lemmas and undistilled proofs", items=p5),
+    ]
+    return dict(
+        profile=profile,
+        total_items=sum(len(g["items"]) for g in groups),
+        priorities=groups,
+    )
+
+
+def render_summary_table(summary, *, compact=False):
+    """Render the headline vs. supporting vs. conjectures multi-resolution table."""
+    def row(label, b, extra_cls=""):
+        cls = f' class="{extra_cls}"' if extra_cls else ""
+        return (
+            f"<tr{cls}><th scope=\"row\">{esc(label)}</th>"
+            f"<td>{b['total']}</td>"
+            f"<td>{b['unconditionally_closed']}</td>"
+            f"<td>{b['conditional']}</td>"
+            f"<td>{b['subproofs_checked']}</td>"
+            f"<td>{b['open']}</td>"
+            f"<td>{b['with_witness']}/{b['total']}</td>"
+            f"<td>{b['needs_confirmation']}</td>"
+            f"<td>{b['machine_verified']}/{b['total']}</td>"
+            f"<td>{b['author_reviewed']}/{b['total']}</td></tr>"
+        )
+
+    rows = [
+        row("Headline results", summary["headline"]),
+        row("Supporting results", summary["supporting"]),
+        row("All stated results", summary["all_results"], "summary-total"),
+    ]
+    if summary["conjectures"]["total"]:
+        rows.append(row("Conjectures (separate)", summary["conjectures"], "summary-conjecture"))
+    caption = ("Verification breakdown by claim tier" if not compact
+               else "Headline vs. supporting verification summary")
+    return (
+        '<div class="summary-table">'
+        f'<table><caption>{esc(caption)}</caption>'
+        '<thead><tr><th>Category</th><th>Total</th><th>Unconditionally closed</th>'
+        '<th>Conditional</th><th>Subproofs checked</th><th>Open</th>'
+        '<th>Witness</th><th>Needs confirmation</th><th>CI verified</th><th>Author reviewed</th></tr></thead>'
+        '<tbody>' + "".join(rows) + '</tbody></table></div>'
+    )
+
+
+def render_backlog_section(backlog):
+    """Render the prioritized Open Shortcomings & Refinement Backlog for progress.html."""
+    if not backlog["total_items"]:
+        return ""
+    intro = (
+        "This atlas currently uses the <strong>quick</strong> triage profile; every deferred check is itemized below "
+        "and can be refined iteratively without redoing <code>Statements/</code>."
+        if backlog["profile"] == "quick" else
+        "Open shortcomings and deferred refinement obligations are ordered by priority below."
+    )
+    blocks = []
+    for group in backlog["priorities"]:
+        if not group["items"]:
+            continue
+        items_html = []
+        for item in group["items"]:
+            cid = item["claim"]
+            url = claim_url(cid)
+            rurl = reviews.review_url(cid)
+            head = f'<a href="{url}?view=lean"><strong>{esc(item["reference"])}</strong></a> (<a href="{rurl}">Review</a>)'
+            details = []
+            if group["key"] == "needs_author_confirmation":
+                if item["cases"]:
+                    details.append("; ".join(f'{c["kind"]}: {c["case"]}' for c in item["cases"]))
+                if item["dependents"]:
+                    details.append("affects dependents: " + ", ".join(d["reference"] for d in item["dependents"]))
+            elif group["key"] == "conditional_claims":
+                deps = ", ".join(a["reference"] for a in item["assumes"])
+                details.append(f"assumes unproved prerequisite(s): {deps}")
+            elif group["key"] == "weaker_or_noncomputable":
+                if item["weaker_conclusions"]:
+                    details.append("weaker conclusion: " + "; ".join(w["case"] for w in item["weaker_conclusions"]))
+                if item["noncomputable_constants"]:
+                    details.append("noncomputable: " + ", ".join(item["noncomputable_constants"]))
+                if item["open_subproofs"]:
+                    details.append("open subproofs: " + ", ".join(item["open_subproofs"]))
+            elif group["key"] == "witnesses_and_defaults":
+                if item["missing_witness"]:
+                    plan = item["witness_plan"] or {}
+                    extra = f' ({plan.get("mode", "available")}: {plan.get("action", "")})' if plan else ""
+                    if plan.get("missing_result"):
+                        extra += f' — needs: {plan["missing_result"]}'
+                    details.append(NO_EXAMPLE + extra)
+                if item["unresolved_defaults"]:
+                    flags = ", ".join(f'{d["construct"]} in {d["constant"]} [{d["status"]}]' for d in item["unresolved_defaults"])
+                    details.append(f'unresolved default-value flag(s) ({len(item["unresolved_defaults"])}): {flags}')
+            elif group["key"] == "bridging_and_distillation":
+                if item["deferred_bridging_lemmas"]:
+                    details.append("deferred bridging lemma(s): " + "; ".join(item["deferred_bridging_lemmas"]))
+                if item["undistilled"]:
+                    details.append("Exploratory proof (undistilled)")
+            detail_text = " · ".join(details)
+            items_html.append(
+                f'<li>{head}' + (f' — {esc(detail_text)}' if detail_text else '')
+                + f'<br><span class="backlog-action">{esc(item["action"])}</span></li>'
+            )
+        blocks.append(
+            f'<div class="backlog-group" data-priority="{group["priority"]}">'
+            f'<h3>P{group["priority"]} · {esc(group["title"])} ({len(group["items"])})</h3>'
+            f'<ul>{"".join(items_html)}</ul></div>'
+        )
+    return (
+        '<section id="refinement-backlog" class="shortcoming-banner">'
+        f'<h2>Open Shortcomings &amp; Refinement Backlog ({backlog["total_items"]})</h2>'
+        f'<p>{intro}</p>'
+        + "".join(blocks)
+        + '</section>'
+    )
+
+
+def _collect_claim_states(root, project, claims, *, ci=None):
+    """Collect read-only claim states, resolutions, and propagated confirmations."""
+    by_id = {c["id"]: c for c in claims}
+    work = project.get("work", {})
+    materials = json.loads(local(root, project["reader"]).read_text(encoding="utf-8-sig")) if project.get("reader") else {}
+    notes = materials.get("claims", {})
+    edges = materials.get("dependencies", [])
+    comparisons = reviews.read(root / "comparisons.json", {})
+    profile = proof_work_profile(project)
+
+    prereqs_by_cid = {c["id"]: set() for c in claims}
+    for edge in edges:
+        if edge["claim"] in prereqs_by_cid and edge["prerequisite"] in by_id:
+            prereqs_by_cid[edge["claim"]].add(edge["prerequisite"])
+
+    records = []
+    for c in claims:
+        cid = c["id"]
+        w = work.get(cid, {})
+        m = notes.get(cid, {})
+        tier = claim_tier(c, m, w)
+        entry = {**c, **m, **w}
+        entry.setdefault("reference", c["kind"].title())
+        entry["tier"] = tier
+        entry["headline"] = tier == "headline"
+
+        audit = None
+        receipt_bytes = None
+        checked = False
+        is_conditional = False
+        statement_checked = False
+        changed = False
+        assumed_items = []
+        status = w.get("status", "open")
+
+        if status in ("closed", "conditional") or w.get("statement_check"):
+            try:
+                audit, checked = current_statement_audit(root, cid, w)
+                statement_checked = True
+                if status == "conditional":
+                    is_conditional = True
+                    assumed_items = _resolve_assumes_items(audit.get("assumes", []), w.get("assumes", []), by_id, work, notes)
+                    for item in assumed_items:
+                        if item["id"] in by_id:
+                            prereqs_by_cid[cid].add(item["id"])
+                if status in ("closed", "conditional") and w.get("closure", {}).get("audit"):
+                    receipt_bytes = local(root, w["closure"]["audit"]).read_bytes()
+            except (ValueError, OSError):
+                if w.get("checked_inputs"):
+                    changed = any(
+                        not local(root, path).is_file() or hashlib.sha256(local(root, path).read_bytes()).hexdigest() != digest
+                        for path, digest in w.get("checked_inputs", {}).items()
+                    )
+        for dep in w.get("assumes", []):
+            if dep in by_id:
+                prereqs_by_cid[cid].add(dep)
+
+        entry["hypotheses"] = (audit or {}).get("hypotheses")
+        subproofs = []
+        for part in w.get("subproofs", []):
+            state = part["status"]
+            if state == "checked" and changed:
+                state = "awaiting recheck"
+            subproofs.append(dict(part, status=state))
+        entry["subproofs"] = subproofs
+        has_parts = any(part["status"] == "checked" for part in subproofs)
+
+        rd = reviews.packet(
+            root, project, c, w, audit, comparisons.get(cid), reviews.history(root, cid),
+            checked, statement_checked,
+            conditional=is_conditional,
+            assumes=[item["reference"] for item in assumed_items] if is_conditional else (),
+        )
+        rd["witness"] = reviews.witness_source(root, w, audit) if audit else None
+        machine_verified = False
+        if checked and project.get("hosting", {}).get("lean_ci") == "enabled" and ci and receipt_bytes is not None:
+            record = ci.get("claims", {}).get(cid)
+            if (record and record.get("audit_sha256") == hashlib.sha256(receipt_bytes).hexdigest()
+                    and all(record.get(k) == audit.get(k) for k in ("expected", "declaration", "toolchain"))
+                    and (not audit.get("statement") or record.get("statement_sha256") == audit["statement"]["sha256"])
+                    and (not audit.get("hypotheses") or record.get("hypotheses") == audit["hypotheses"]["proposition"])
+                    and set(record.get("axioms", [])) == set(audit.get("axioms", []))):
+                machine_verified = True
+
+        res = claim_resolution(checked, is_conditional, rd["disputed"], has_parts)
+        entry["resolution"] = res
+        records.append(dict(
+            claim=c,
+            entry=entry,
+            work=w,
+            note=m,
+            rd=rd,
+            audit=audit,
+            tier=tier,
+            resolution=res,
+            checked=checked,
+            is_conditional=is_conditional,
+            has_parts=has_parts,
+            changed=changed,
+            assumed_items=assumed_items,
+            unresolved_defaults=unresolved_defaults(rd),
+            deferred_bridging_lemmas=_deferred_bridging_lemmas(cid, w),
+            undistilled=_is_undistilled(cid, w, profile, checked, is_conditional),
+            witness_plan=witness_plan(project, w, rd["witness"]) if tier != "conjecture" else None,
+            machine_verified=machine_verified,
+        ))
+
+    direct_confirm = {rec["claim"]["id"] for rec in records if rec["rd"].get("needs_author_confirmation")}
+    order_ids = [rec["claim"]["id"] for rec in records]
+    for rec in records:
+        cid = rec["claim"]["id"]
+        visited = set()
+        stack = list(prereqs_by_cid.get(cid, ()))
+        while stack:
+            cur = stack.pop()
+            if cur in visited or cur == cid:
+                continue
+            visited.add(cur)
+            stack.extend(prereqs_by_cid.get(cur, ()))
+        via_ids = [u for u in order_ids if u in visited and u in direct_confirm]
+        rec["rd"]["needs_author_confirmation_via"] = [
+            dict(id=u, reference=_claim_ref_label(u, by_id, notes), review_url=reviews.review_url(u))
+            for u in via_ids
+        ]
+    return records
+
+
+def _latex_escape(text):
+    """Escape plain text for safe inclusion inside LaTeX prose or \\texttt{}."""
+    replacements = {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }
+    return "".join(replacements.get(ch, ch) for ch in str(text))
+
+
+def _collect_pinned_metadata(root, project, records, ci):
+    """Collect pinned toolchain, Mathlib SHA, external packages, axioms, statement digests, and URLs."""
+    from audit_lean import axiom_profile as format_axiom_profile, external_packages as read_external_packages
+
+    toolchains = set()
+    pkg_dirs = set()
+    ext_by_key = {}
+    axioms_union = set()
+    axiom_profiles = set()
+    statement_digests = []
+    stmt_files = {}
+
+    for rec in records:
+        w = rec["work"]
+        audit = rec["audit"]
+        for holder in (w.get("closure"), w.get("statement_check"), w.get("assembly")):
+            if isinstance(holder, dict) and holder.get("package"):
+                pkg_dirs.add(holder["package"])
+        if not audit:
+            continue
+        if audit.get("toolchain"):
+            toolchains.add(audit["toolchain"])
+        for pkg in audit.get("external_packages") or []:
+            key = (pkg.get("name", ""), pkg.get("rev", ""))
+            ext_by_key.setdefault(key, dict(pkg))
+        if "axioms" in audit:
+            axioms_union.update(audit["axioms"])
+            axiom_profiles.add(rec["rd"].get("axiom_profile") or format_axiom_profile(audit["axioms"]))
+        stmt = audit.get("statement") or {}
+        if stmt.get("sha256"):
+            statement_digests.append(dict(
+                claim=rec["claim"]["id"],
+                reference=rec["entry"]["reference"],
+                expected=stmt.get("expected") or audit.get("expected") or "",
+                sha256=stmt["sha256"],
+            ))
+        pkg_prefix = ((w.get("closure") or w.get("statement_check") or {}).get("package") or "")
+        for rel, h in (audit.get("checked_inputs") or {}).items():
+            if rel == "Statements.lean" or rel.startswith("Statements/"):
+                full_rel = (Path(pkg_prefix) / rel).as_posix() if pkg_prefix else rel
+                stmt_files[full_rel] = h
+
+    for pkg in sorted(pkg_dirs):
+        try:
+            pkg_root = local(root, pkg)
+        except ValueError:
+            continue
+        tc_path = pkg_root / "lean-toolchain"
+        if tc_path.is_file():
+            tc = tc_path.read_text(encoding="utf-8-sig").strip()
+            if tc:
+                toolchains.add(tc)
+        manifest_path = pkg_root / "lake-manifest.json"
+        if manifest_path.is_file():
+            try:
+                for entry in read_external_packages(pkg_root):
+                    key = (entry.get("name", ""), entry.get("rev", ""))
+                    ext_by_key.setdefault(key, entry)
+            except (OSError, ValueError):
+                pass
+
+    ext_list = sorted(ext_by_key.values(), key=lambda p: (p.get("name", "").casefold(), p.get("rev", "")))
+    mathlib = next((p for p in ext_list if p.get("name", "").casefold() == "mathlib"), None)
+    third_party = [p for p in ext_list if p.get("third_party")]
+
+    agg_digest = None
+    if statement_digests:
+        payload = "".join(f"{item['claim']} {item['expected']} {item['sha256']}\n" for item in statement_digests)
+        agg_digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    elif stmt_files:
+        payload = "".join(f"{k} {v}\n" for k, v in sorted(stmt_files.items()))
+        agg_digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    hosting = project.get("hosting") or {}
+    site_url = hosting.get("site") or ""
+    repo_url = hosting.get("repository") or ""
+    atlas_url = site_url or repo_url
+    ci_commit = ci["commit"] if ci else ""
+    ci_run_url = (f"{repo_url}/actions/runs/{ci['run_id']}/attempts/{ci['attempt']}"
+                  if ci and repo_url else "")
+
+    return dict(
+        toolchains=sorted(toolchains),
+        mathlib=mathlib,
+        external_packages=ext_list,
+        third_party_packages=third_party,
+        axioms=sorted(axioms_union),
+        axiom_profiles=sorted(axiom_profiles),
+        aggregate_axiom_profile=format_axiom_profile(sorted(axioms_union)) if axiom_profiles else "Not yet audited",
+        statement_digests=statement_digests,
+        statements_files_digests=dict(sorted(stmt_files.items())),
+        aggregate_statement_digest=agg_digest,
+        atlas_url=atlas_url,
+        site_url=site_url,
+        repository_url=repo_url,
+        hosting_decision=hosting.get("decision", "pending"),
+        lean_ci=hosting.get("lean_ci", "not configured"),
+        ci_commit=ci_commit,
+        ci_run_url=ci_run_url,
+    )
+
+
+def _collect_scope_caveats(records):
+    """Collect every active non-agrees comparison case, conditional assumption, noncomputable def, and scope note."""
+    caveats = []
+    for rec in records:
+        cid = rec["claim"]["id"]
+        ref = rec["entry"]["reference"]
+        tier = rec["tier"]
+        rd = rec["rd"]
+        analysis = rd["view"].get("analysis", {})
+        for row in analysis.get("cases", []):
+            kind = row.get("kind")
+            if kind and kind != "agrees":
+                caveats.append(dict(
+                    claim=cid,
+                    reference=ref,
+                    tier=tier,
+                    kind=kind,
+                    case=row["case"],
+                    paper=row["paper"],
+                    lean=row["lean"],
+                    why=row["why"],
+                    needs_author_confirmation=bool(
+                        row.get("needs_author_confirmation")
+                        or (rd.get("needs_author_confirmation") and kind in reviews.CONFIRMATION_KINDS)
+                    ),
+                ))
+        if rec["is_conditional"]:
+            caveats.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                kind="conditional",
+                assumes=rec["assumed_items"],
+            ))
+        if rd.get("noncomputable_constants"):
+            caveats.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                kind="noncomputable",
+                constants=list(rd["noncomputable_constants"]),
+            ))
+        if rd.get("author_scope"):
+            caveats.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                kind="author_scope",
+                note=rd["author_scope"],
+            ))
+        if rd.get("stronger_result"):
+            caveats.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                kind="stronger_result",
+                note=rd["stronger_result"],
+            ))
+    return caveats
+
+
+def _render_manifest_latex(project, summary, caveats, backlog, pinned):
+    """Deterministically generate a paste-ready LaTeX verification scope paragraph."""
+    h = summary["headline"]
+    s = summary["supporting"]
+    a = summary["all_results"]
+    conj = summary["conjectures"]
+    profile = proof_work_profile(project)
+
+    def state_phrase(b, noun):
+        parts = [f"{b['unconditionally_closed']}/{b['total']} {noun} unconditionally closed"]
+        if b["conditional"]:
+            parts.append(f"{b['conditional']} conditional")
+        if b["subproofs_checked"]:
+            parts.append(f"{b['subproofs_checked']} with subproofs checked")
+        if b["supplied_proof"]:
+            parts.append(f"{b['supplied_proof']} with Lean-supplied proofs")
+        if b["open"]:
+            parts.append(f"{b['open']} open")
+        return ", ".join(parts)
+
+    sentences = []
+    tier_clauses = []
+    if h["total"]:
+        tier_clauses.append(state_phrase(h, "headline results"))
+    if s["total"]:
+        tier_clauses.append(state_phrase(s, "supporting results"))
+    if not tier_clauses:
+        tier_clauses.append("no stated results inventoried yet")
+    coverage = (
+        f"We formalized results from this manuscript in Lean~4 using Proof Atlas"
+        f"{' (currently in \\texttt{quick} triage profile)' if profile == 'quick' else ''}: "
+        + "; and ".join(tier_clauses)
+    )
+    if conj["total"]:
+        coverage += f" ({conj['total']} conjecture{'s' if conj['total'] != 1 else ''} tracked separately)"
+    coverage += "."
+    sentences.append(coverage)
+
+    # Verification tier (CI vs local-only).
+    if a["machine_verified"]:
+        ci_note = (
+            f"Of {a['unconditionally_closed']} unconditionally closed results, "
+            f"{a['machine_verified']} {'was' if a['machine_verified'] == 1 else 'were'} "
+            f"independently rebuilt in GitHub Actions CI"
+        )
+        if pinned["ci_commit"]:
+            ci_note += f" at commit \\texttt{{{_latex_escape(pinned['ci_commit'][:12])}}}"
+        ci_note += "."
+        sentences.append(ci_note)
+    elif a["unconditionally_closed"] or a["conditional"]:
+        sentences.append("Current Lean checks were audited locally (no GitHub Actions CI verification receipt is attached to this revision).")
+
+    # Active scope caveats.
+    caveat_bits = []
+    for cav in caveats:
+        ref = _latex_escape(cav["reference"])
+        kind = cav["kind"]
+        if kind == "conditional":
+            deps = ", ".join(_latex_escape(d["reference"]) for d in cav["assumes"])
+            caveat_bits.append(f"{ref} (conditional on {deps})")
+        elif kind == "noncomputable":
+            names = ", ".join(f"\\texttt{{{_latex_escape(n)}}}" for n in cav["constants"])
+            caveat_bits.append(f"{ref} (noncomputable: {names})")
+        elif kind == "author_scope":
+            caveat_bits.append(f"{ref} (author scope note: {_latex_escape(cav['note'])})")
+        elif kind == "stronger_result":
+            caveat_bits.append(f"{ref} (Lean proves stronger result: {_latex_escape(cav['note'])})")
+        else:
+            confirm_tag = "; awaits author confirmation" if cav.get("needs_author_confirmation") else ""
+            caveat_bits.append(f"{ref} ({_latex_escape(kind)} on {_latex_escape(cav['case'])}{confirm_tag})")
+    if caveat_bits:
+        sentences.append("Active formalization scope caveats: " + "; ".join(caveat_bits) + ".")
+    else:
+        sentences.append("No non-agreeing formalization scope caveats are recorded across compared statements.")
+
+    # Deferred / refinement checks (witnesses, unresolved defaults, bridging, distillation).
+    deferred_bits = []
+    by_key = {g["key"]: g["items"] for g in backlog["priorities"]}
+    if by_key["needs_author_confirmation"]:
+        refs = ", ".join(_latex_escape(i["reference"]) for i in by_key["needs_author_confirmation"])
+        deferred_bits.append(f"unattended readings awaiting author confirmation ({refs})")
+    missing_w = [i for i in by_key["witnesses_and_defaults"] if i["missing_witness"]]
+    if missing_w:
+        refs = ", ".join(_latex_escape(i["reference"]) for i in missing_w)
+        deferred_bits.append(f"missing non-vacuity hypothesis witnesses ({refs})")
+    unres_d = [i for i in by_key["witnesses_and_defaults"] if i["unresolved_defaults"]]
+    if unres_d:
+        total_flags = sum(len(i["unresolved_defaults"]) for i in unres_d)
+        refs = ", ".join(_latex_escape(i["reference"]) for i in unres_d)
+        deferred_bits.append(f"{total_flags} unresolved Lean default-value flag{'s' if total_flags != 1 else ''} ({refs})")
+    bridging = [i for i in by_key["bridging_and_distillation"] if i["deferred_bridging_lemmas"]]
+    if bridging:
+        refs = ", ".join(_latex_escape(i["reference"]) for i in bridging)
+        deferred_bits.append(f"deferred Mathlib bridging lemmas ({refs})")
+    undist = [i for i in by_key["bridging_and_distillation"] if i["undistilled"]]
+    if undist:
+        refs = ", ".join(_latex_escape(i["reference"]) for i in undist)
+        deferred_bits.append(f"undistilled exploratory proofs ({refs})")
+    if deferred_bits:
+        sentences.append("Deferred checks and open refinement items: " + "; ".join(deferred_bits) + ".")
+    elif a["with_witness"] and a["total"]:
+        sentences.append(f"Non-vacuity hypothesis witnesses are checked for {a['with_witness']}/{a['total']} stated results.")
+
+    # Pinned environment, digests, and atlas URL.
+    env_bits = []
+    if pinned["toolchains"]:
+        env_bits.append("Lean toolchain " + ", ".join(f"\\texttt{{{_latex_escape(t)}}}" for t in pinned["toolchains"]))
+    if pinned["mathlib"]:
+        env_bits.append(f"Mathlib commit \\texttt{{{_latex_escape(pinned['mathlib']['rev'][:12])}}}")
+    if pinned["third_party_packages"]:
+        tp = ", ".join(f"\\texttt{{{_latex_escape(p['name'])}}} (\\texttt{{{_latex_escape(p['rev'][:12])}}})"
+                       for p in pinned["third_party_packages"])
+        env_bits.append(f"third-party packages {tp}")
+    env_bits.append(f"axiom profile: {_latex_escape(pinned['aggregate_axiom_profile'])}")
+    if pinned["aggregate_statement_digest"]:
+        env_bits.append(f"statement digest \\texttt{{{_latex_escape(pinned['aggregate_statement_digest'][:12])}}}")
+    provenance = "Pinned verification artifacts: " + "; ".join(env_bits) + "."
+    if pinned["atlas_url"]:
+        provenance += f" The interactive Proof Atlas and full audit logs are available at \\url{{{pinned['atlas_url']}}}."
+    else:
+        provenance += " The Proof Atlas is currently maintained locally."
+    sentences.append(provenance)
+    sentences.append("Plain-English and structured explanations, as well as any external numerical scripts, are outside Lean's kernel check.")
+    return "\\paragraph{Formal Verification and Scope.}\n" + " ".join(sentences) + "\n"
+
+
+def _render_manifest_markdown(project, records, summary, caveats, backlog, pinned, latex_snippet):
+    """Deterministically generate dist/VERIFICATION.md."""
+    profile = proof_work_profile(project)
+    lines = [
+        f"# Formal Verification Manifest — {project['title']}",
+        "",
+        f"- **Edition:** {project.get('edition', 'unspecified')}",
+    ]
+    if project.get("authors"):
+        lines.append(f"- **Authors:** {', '.join(project['authors'])}")
+    lines.append(f"- **Resolution profile:** `{profile}`")
+    if pinned["atlas_url"]:
+        lines.append(f"- **Proof Atlas URL:** {pinned['atlas_url']}")
+    else:
+        lines.append("- **Proof Atlas URL:** Local-only (not publicly hosted)")
+    if pinned["repository_url"] and pinned["repository_url"] != pinned["atlas_url"]:
+        lines.append(f"- **Repository:** {pinned['repository_url']}")
+    if pinned["ci_run_url"]:
+        lines.append(f"- **GitHub Actions CI run:** {pinned['ci_run_url']} (`{pinned['ci_commit']}`)")
+    else:
+        lines.append(f"- **Verification tier:** Local Lean audit (`lean_ci`: `{pinned['lean_ci']}`)")
+
+    show_supplied = any(b["supplied_proof"] for b in summary.values())
+    lines.extend(["", "## Verification Summary", ""])
+    if show_supplied:
+        lines.append("| Category | Total | Unconditionally closed | Conditional | Subproofs checked | Lean-supplied proof | Open | With witness | Needs confirmation | Machine verified (CI) | Author reviewed |")
+        lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    else:
+        lines.append("| Category | Total | Unconditionally closed | Conditional | Subproofs checked | Open | With witness | Needs confirmation | Machine verified (CI) | Author reviewed |")
+        lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+
+    def md_row(label, b):
+        cols = [
+            label, str(b["total"]), str(b["unconditionally_closed"]), str(b["conditional"]),
+            str(b["subproofs_checked"]),
+        ]
+        if show_supplied:
+            cols.append(str(b["supplied_proof"]))
+        cols.extend([
+            str(b["open"]), f"{b['with_witness']}/{b['total']}",
+            str(b["needs_confirmation"]), f"{b['machine_verified']}/{b['total']}",
+            f"{b['author_reviewed']}/{b['total']}",
+        ])
+        return "| " + " | ".join(cols) + " |"
+
+    lines.append(md_row("Headline results", summary["headline"]))
+    lines.append(md_row("Supporting results", summary["supporting"]))
+    lines.append(md_row("**All stated results**", summary["all_results"]))
+    if summary["conjectures"]["total"]:
+        lines.append(md_row("Conjectures (tracked separately)", summary["conjectures"]))
+
+    lines.extend(["", "## Active Scope Caveats", ""])
+    if not caveats:
+        lines.append("None recorded across currently compared claims.")
+    else:
+        for cav in caveats:
+            ref = f"**{cav['reference']}** (`{cav['claim']}`)"
+            kind = cav["kind"]
+            if kind == "conditional":
+                deps = ", ".join(f"{a['reference']} (`{a['expected']}`)" for a in cav["assumes"])
+                lines.append(f"- {ref} — **Conditional**: assumes unproved prerequisite(s): {deps}.")
+            elif kind == "noncomputable":
+                names = ", ".join(f"`{n}`" for n in cav["constants"])
+                lines.append(f"- {ref} — **`noncomputable` statement definitions**: {names}. Verify whether any explicit/algorithmic claim is affected.")
+            elif kind == "author_scope":
+                lines.append(f"- {ref} — **Author scope note**: {cav['note']}")
+            elif kind == "stronger_result":
+                lines.append(f"- {ref} — **Lean proves more**: {cav['note']}")
+            else:
+                confirm = " *(Needs author confirmation)*" if cav.get("needs_author_confirmation") else ""
+                lines.append(
+                    f"- {ref} — **`{kind}`** ({cav['case']}){confirm}: "
+                    f"Paper: {cav['paper']} | Lean: {cav['lean']} | Why: {cav['why']}"
+                )
+
+    lines.extend(["", "## Open Shortcomings & Refinement Backlog", ""])
+    if not backlog["total_items"]:
+        lines.append("No open shortcomings or deferred refinement items.")
+    else:
+        for group in backlog["priorities"]:
+            if not group["items"]:
+                continue
+            lines.append(f"### P{group['priority']}: {group['title']} ({len(group['items'])})")
+            lines.append("")
+            for item in group["items"]:
+                ref = f"**{item['reference']}** (`{item['claim']}`)"
+                details = []
+                if group["key"] == "needs_author_confirmation":
+                    if item["cases"]:
+                        details.append("; ".join(f"`{c['kind']}` on {c['case']}" for c in item["cases"]))
+                    if item["dependents"]:
+                        details.append("dependents: " + ", ".join(d["reference"] for d in item["dependents"]))
+                elif group["key"] == "conditional_claims":
+                    details.append("assumes: " + ", ".join(a["reference"] for a in item["assumes"]))
+                elif group["key"] == "weaker_or_noncomputable":
+                    if item["weaker_conclusions"]:
+                        details.append("weaker conclusion: " + "; ".join(w["case"] for w in item["weaker_conclusions"]))
+                    if item["noncomputable_constants"]:
+                        details.append("noncomputable: " + ", ".join(f"`{n}`" for n in item["noncomputable_constants"]))
+                    if item["open_subproofs"]:
+                        details.append("open subproofs: " + ", ".join(item["open_subproofs"]))
+                elif group["key"] == "witnesses_and_defaults":
+                    if item["missing_witness"]:
+                        plan = item["witness_plan"] or {}
+                        plan_str = f" (`{plan.get('mode')}`: {plan.get('action')})" if plan else ""
+                        details.append(NO_EXAMPLE + plan_str)
+                    if item["unresolved_defaults"]:
+                        flags = ", ".join(f"`{d['construct']}` in `{d['constant']}` [{d['status']}]" for d in item["unresolved_defaults"])
+                        details.append("unresolved default-value flags: " + flags)
+                elif group["key"] == "bridging_and_distillation":
+                    if item["deferred_bridging_lemmas"]:
+                        details.append("deferred bridging lemmas: " + "; ".join(item["deferred_bridging_lemmas"]))
+                    if item["undistilled"]:
+                        details.append("Exploratory proof (undistilled)")
+                suffix = f" — {'; '.join(details)}" if details else ""
+                lines.append(f"- {ref}{suffix}. *Next:* {item['action']}")
+            lines.append("")
+
+    lines.extend(["## Pinned Environment & Statement Digests", ""])
+    lines.append(f"- **Lean toolchain:** {', '.join(f'`{t}`' for t in pinned['toolchains']) or 'Not yet audited'}")
+    if pinned["mathlib"]:
+        m = pinned["mathlib"]
+        lines.append(f"- **Mathlib commit:** `{m['rev']}`" + (f" ({m['url']})" if m.get("url") else ""))
+    else:
+        lines.append("- **Mathlib commit:** Not recorded")
+    if pinned["third_party_packages"]:
+        tp = ", ".join(f"`{p['name']}` (`{p['rev']}`)" for p in pinned["third_party_packages"])
+        lines.append(f"- **Third-party external packages:** {tp}")
+    else:
+        lines.append("- **Third-party external packages:** None")
+    lines.append(f"- **Aggregate axiom profile:** {pinned['aggregate_axiom_profile']}")
+    if pinned["aggregate_statement_digest"]:
+        lines.append(f"- **Aggregate statement digest (SHA-256):** `{pinned['aggregate_statement_digest']}`")
+    if pinned["statements_files_digests"]:
+        files_str = ", ".join(f"`{k}` (`{v[:12]}`)" for k, v in pinned["statements_files_digests"].items())
+        lines.append(f"- **Pinned `Statements/` files:** {files_str}")
+
+    lines.extend([
+        "",
+        "| Claim | Tier | Resolution | Declaration | Axiom profile | Witness | Statement SHA-256 |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ])
+    state_labels = {
+        "unconditionally_closed": "Unconditionally closed",
+        "conditional": "Conditional",
+        "subproofs_checked": "Subproofs checked",
+        "open": "Open",
+    }
+    for rec in records:
+        cid = rec["claim"]["id"]
+        ref = f"{rec['entry']['reference']} (`{cid}`)"
+        decl = ((rec["audit"] or {}).get("declaration")
+                or (rec["work"].get("closure") or {}).get("declaration")
+                or (rec["work"].get("statement_check") or {}).get("expected")
+                or "—")
+        ax = rec["rd"].get("axiom_profile") or "—"
+        wit = f"`{rec['entry']['hypotheses']['declaration']}`" if rec["entry"].get("hypotheses") else ("—" if rec["tier"] == "conjecture" else "Missing")
+        sha = ((rec["audit"] or {}).get("statement") or {}).get("sha256")
+        sha_cell = f"`{sha[:12]}`" if sha else "—"
+        lines.append(
+            f"| {ref} | {rec['tier']} | {state_labels[rec['resolution']]} | `{decl}` | {ax} | {wit} | {sha_cell} |"
+            if decl != "—" else
+            f"| {ref} | {rec['tier']} | {state_labels[rec['resolution']]} | — | {ax} | {wit} | {sha_cell} |"
+        )
+
+    lines.extend([
+        "",
+        "## Paste-Ready LaTeX Snippet",
+        "",
+        "```latex",
+        latex_snippet.rstrip("\n"),
+        "```",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def manifest(root, *, ci_receipt=None, commit=None, write=True, propose_edit=False,
+             edit_location="", edit_original="", edit_reason="", edit_claim="manuscript"):
+    """Deterministically build dist/VERIFICATION.md and a paste-ready LaTeX scope snippet."""
+    project = json.loads((root / "project.json").read_text(encoding="utf-8-sig"))
+    claims = manuscript_claims(root, project)
+    by_id = {c["id"]: c for c in claims}
+    if "claim_order" in project:
+        order = project["claim_order"]
+        if len(order) != len(claims) or set(order) != set(by_id):
+            raise ValueError("claim_order must list every manuscript claim exactly once")
+        claims = [by_id[label] for label in order]
+    ci = github_verification(project, ci_receipt, commit)
+    if ci is None and ci_receipt is None:
+        receipt = root / "dist/logs/lean-verification.json"
+        if receipt.is_file():
+            try:
+                data = json.loads(receipt.read_bytes())
+                ci = github_verification(project, receipt, commit or data.get("commit"))
+            except (OSError, ValueError):
+                ci = None
+    records = _collect_claim_states(root, project, claims, ci=ci)
+    summary = summarize_records(records)
+    backlog = build_refinement_backlog(project, records)
+    caveats = _collect_scope_caveats(records)
+    pinned = _collect_pinned_metadata(root, project, records, ci)
+    latex_snippet = _render_manifest_latex(project, summary, caveats, backlog, pinned)
+    markdown = _render_manifest_markdown(project, records, summary, caveats, backlog, pinned, latex_snippet)
+    md_path = root / "dist" / "VERIFICATION.md"
+    if write:
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic(md_path, markdown.encode("utf-8"))
+    edit_result = None
+    if propose_edit:
+        reason = edit_reason or (
+            "Synchronize manuscript verification statement with Proof Atlas scope caveats, "
+            "headline/supporting counts, deferred checks, and pinned Lean digests."
+        )
+        key, entry, changed = manuscript_edits.propose(
+            root,
+            MANIFEST_EDIT_KEY,
+            claim=edit_claim,
+            edition=project.get("edition", ""),
+            location=edit_location or "Abstract / Introduction (Formal Verification and Scope)",
+            original=edit_original,
+            replacement=latex_snippet.strip(),
+            reason=reason,
+        )
+        edit_result = dict(key=key, entry=entry, updated=changed)
+    return dict(
+        markdown_path=str(md_path),
+        markdown=markdown,
+        latex=latex_snippet,
+        summary=summary,
+        caveats=caveats,
+        backlog=backlog,
+        pinned=pinned,
+        atlas_url=pinned["atlas_url"],
+        manuscript_edit=edit_result,
+    )
+
+
 def review_work(root, labels=(), *, require_ci=False, ci_receipt=None):
-    """List actionable review findings. Optional approvals are never obligations."""
+    """List actionable review findings, multi-resolution counts, and prioritized backlog."""
     import subprocess
     project = reviews.read(root/"project.json", {})
-    claims = {c["id"]: c for c in manuscript_claims(root, project)}
-    if set(labels) - claims.keys():
+    claims = manuscript_claims(root, project)
+    by_id = {c["id"]: c for c in claims}
+    if "claim_order" in project:
+        order = project["claim_order"]
+        if len(order) == len(claims) and set(order) == set(by_id):
+            claims = [by_id[label] for label in order]
+    if set(labels) - by_id.keys():
         raise ValueError("Unknown review-work claim")
-    selected = list(dict.fromkeys(labels or claims))
+    selected = list(dict.fromkeys(labels or [c["id"] for c in claims]))
+    selected_set = set(selected)
     report = {"scope": project.get("proof_work"), "profile": proof_work_profile(project),
               "agent_tasks": [], "author_questions": [],
               "conditional_claims": [],
@@ -325,11 +1370,20 @@ def review_work(root, labels=(), *, require_ci=False, ci_receipt=None):
         path = Path(ci_receipt or root/"dist/logs/lean-verification.json")
         ci = github_verification(project, path, sha) if path.is_file() else None
         report["commit"] = sha
-    for cid in selected:
-        work = project.get("work", {}).get(cid, {})
-        packet = reviews.get_packet(root,cid)
-        if claims[cid]["kind"] != "conjecture":
-            report["witness_search"][cid] = witness_plan(project, work, packet["witness"])
+    elif ci_receipt:
+        path = Path(ci_receipt)
+        if path.is_file():
+            data = json.loads(path.read_bytes())
+            ci = github_verification(project, path, data.get("commit"))
+    all_records = _collect_claim_states(root, project, claims, ci=ci)
+    by_rec = {rec["claim"]["id"]: rec for rec in all_records}
+    selected_records = [by_rec[cid] for cid in selected]
+    for rec in selected_records:
+        cid = rec["claim"]["id"]
+        work = rec["work"]
+        packet = rec["rd"]
+        if rec["tier"] != "conjecture":
+            report["witness_search"][cid] = rec["witness_plan"]
         if packet.get("conditional"):
             report["conditional_claims"].append(dict(claim=cid, assumes=work.get("assumes") or packet["assumes"]))
         proof_checked = work.get("status") in ("closed", "conditional")
@@ -348,8 +1402,11 @@ def review_work(root, labels=(), *, require_ci=False, ci_receipt=None):
                 report["ci_pending"].append(cid)
     book, edits = manuscript_edits.inventory(root)
     for key,item in edits.items():
-        if item["claim"] in selected and key not in book.get("cleared",{}) and item.get("status")=="Draft requested":
+        in_scope = item["claim"] in selected_set or (not labels and item["claim"] not in by_id)
+        if in_scope and key not in book.get("cleared",{}) and item.get("status")=="Draft requested":
             report["agent_tasks"].append(dict(claim=item["claim"], edit=key, next="Prepare the requested manuscript draft."))
+    report["summary"] = summarize_records(selected_records)
+    report["refinement_backlog"] = build_refinement_backlog(project, selected_records)
     return report
 
 
@@ -711,6 +1768,7 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
     subproof_lists = {}
     closed_results = 0
     conditional_results = 0
+    profile = proof_work_profile(p)
     prereqs_by_cid = {c["id"]: set() for c in claims}
     for edge in edges:
         prereqs_by_cid[edge["claim"]].add(edge["prerequisite"])
@@ -719,10 +1777,13 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         cid = c["id"]
         w = work.get(cid, {})
         m = notes.get(cid, {})
+        tier = claim_tier(c, m, w)
         status = w.get("status", "open")
         if status not in {"open", "drafted", "blocked", "attempted", "conditional", "closed"}:
             raise ValueError(f"{cid}: unsupported checkpoint status {status}")
         entry = {**c, **m, **w}
+        entry["tier"] = tier
+        entry["headline"] = tier == "headline"
         audit = None
         receipt = None
         assumed_items = []
@@ -822,6 +1883,17 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         entry["subproofs"] = subproofs
         checked = status == "closed"
         has_parts = any(part["status"] == "checked" for part in subproofs)
+        res = claim_resolution(checked, is_conditional, rd["disputed"], has_parts)
+        entry["resolution"] = res
+        unres_defaults = unresolved_defaults(rd)
+        if unres_defaults:
+            entry["unresolved_defaults"] = unres_defaults
+        bridging = _deferred_bridging_lemmas(cid, w)
+        if bridging:
+            entry["deferred_bridging_lemmas"] = bridging
+        undistilled = _is_undistilled(cid, w, profile, checked, is_conditional)
+        if undistilled:
+            entry["undistilled"] = True
         cond_label = f"Conditional (assumes {', '.join(item['reference'] for item in assumed_items)})"
         label = ("Open conjecture" if c["kind"] == "conjecture" and status == "open" else
                  "Lean checked" if checked else "Awaiting Lean recheck" if changed else
@@ -870,11 +1942,26 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
             entry["log"] = "logs/" + name
             log_links[cid] = f'<p><a href="logs/{name}">Read the recorded Lean run</a></p>'
         entries.append(entry)
-        built_records.append((c, entry, rd, checked, is_conditional, label))
+        built_records.append(dict(
+            claim=c, entry=entry, work=w, note=m, rd=rd, audit=active_audit,
+            tier=tier, resolution=res, checked=checked, is_conditional=is_conditional,
+            has_parts=has_parts, changed=bool(changed), assumed_items=assumed_items,
+            unresolved_defaults=unres_defaults, deferred_bridging_lemmas=bridging,
+            undistilled=undistilled,
+            witness_plan=witness_plan(p, w, rd["witness"]) if tier != "conjecture" else None,
+            machine_verified="evidence" in verification,
+            label=label,
+        ))
 
     # Propagate Needs author confirmation from unattended quick-mode readings to transitive dependents.
     direct_confirm = {rd["id"] for rd in review_entries if rd.get("needs_author_confirmation")}
-    for c, entry, rd, checked, is_conditional, label in built_records:
+    for rec in built_records:
+        c = rec["claim"]
+        entry = rec["entry"]
+        rd = rec["rd"]
+        checked = rec["checked"]
+        is_conditional = rec["is_conditional"]
+        label = rec["label"]
         cid = c["id"]
         visited = set()
         stack = list(prereqs_by_cid.get(cid, ()))
@@ -900,6 +1987,10 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         badge = f' · <a href="{url}?view=lean">{esc(label)}</a>'
         if (checked or is_conditional) and not entry.get("hypotheses"):
             badge += f' · {NO_EXAMPLE}'
+        if rec["unresolved_defaults"]:
+            badge += f' · <a href="{reviews.review_url(cid)}">Unresolved default-value flag ({len(rec["unresolved_defaults"])})</a>'
+        if rec["undistilled"]:
+            badge += ' · Exploratory proof (undistilled)'
         if rd.get("needs_author_confirmation"):
             badge += f' · <a href="{reviews.review_url(cid)}"><strong>Needs author confirmation</strong></a>'
         elif via_items:
@@ -927,10 +2018,17 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
                           'GitHub artifact (sign-in required)</a>')
         elif "remote" in verification:
             badge += f' · <a href="{esc(verification["url"])}">{esc(verification["remote"])}</a>'
-        rows.append(f'<li data-claim="{esc(cid)}"><a href="{url}">{esc(entry["reference"])} · {esc(c["title"])}</a> · {esc(entry["status"])}{badge}{target}<span class="claim-activity"></span></li>')
+        rows.append(f'<li data-claim="{esc(cid)}" data-tier="{esc(rec["tier"])}" data-resolution="{esc(rec["resolution"])}"><a href="{url}">{esc(entry["reference"])} · {esc(c["title"])}</a> · {esc(entry["status"])}{badge}{target}<span class="claim-activity"></span></li>')
     if ci:
         (output / "logs").mkdir(exist_ok=True)
         atomic(output / "logs/lean-verification.json", Path(ci_receipt).read_bytes())
+    summary = summarize_records(built_records)
+    backlog = build_refinement_backlog(p, built_records)
+    caveats = _collect_scope_caveats(built_records)
+    pinned = _collect_pinned_metadata(root, p, built_records, ci)
+    latex_snippet = _render_manifest_latex(p, summary, caveats, backlog, pinned)
+    verification_md = _render_manifest_markdown(p, built_records, summary, caveats, backlog, pinned, latex_snippet)
+    atomic(output / "VERIFICATION.md", verification_md.encode("utf-8"))
     sources = edition_links(p)
     folio = p.get("folio", {})
     short_title = folio.get("short_title") or p["title"]
@@ -961,8 +2059,20 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         content = esc(paragraph.lstrip("# ").strip())
         sections.append(f"<{tag}>" + re.sub(r"`([^`]+)`", r"<code>\1</code>", content) + f"</{tag}>")
     atomic(output/"guide.html", review_web.document("How to use this atlas","".join(sections),"./"))
-    dashboard = heading + f'<section id="claim-inventory" data-feed="{esc(feed)}"><h2>Claim inventory</h2><p><strong>Authorized proof work</strong><br>{esc(scope)}</p><p><a href="guide.html">How to use this atlas</a> · <a href="review.html">Review queue</a></p><p>{closed_results} of {total_results} stated results closed{pending}</p><ol>' + "".join(rows) + '</ol></section>' + active
-    payload = dict(title=p["title"], focus=focus, claims=entries, dependencies=edges, macros=materials.get("macros", {}))
+    summary_html = render_summary_table(summary)
+    backlog_html = render_backlog_section(backlog)
+    dashboard = (
+        heading
+        + f'<section id="claim-inventory" data-feed="{esc(feed)}"><h2>Claim inventory</h2>'
+        + f'<p><strong>Authorized proof work</strong><br>{esc(scope)}</p>'
+        + '<p><a href="guide.html">How to use this atlas</a> · <a href="review.html">Review queue</a> · <a href="VERIFICATION.md">Verification manifest</a></p>'
+        + f'<p>{closed_results} of {total_results} stated results closed{pending}</p>'
+        + summary_html
+        + backlog_html
+        + '<ol>' + "".join(rows) + '</ol></section>' + active
+    )
+    payload = dict(title=p["title"], focus=focus, claims=entries, dependencies=edges,
+                   macros=materials.get("macros", {}), summary=summary, backlog=backlog)
     template = (assets / "explorer.html").read_text(encoding="utf-8-sig")
     packed = json.dumps(payload, ensure_ascii=False)
     first = focus or folio.get("featured_claim") or (entries[0]["id"] if entries else "")
@@ -983,11 +2093,14 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
             extras.append(f'<a class="status approval approved" href="{esc(v["review_url"])}">{esc(v["approval"])}</a>')
         if extras:
             mark = f'<span class="marks">{mark}{"".join(extras)}</span>'
-        contents.append(f'<li><a class="toc-claim" href="{link}"><small>{esc(entry["reference"])}</small>'
+        tier_label = "Headline" if entry["tier"] == "headline" else ("Conjecture" if entry["tier"] == "conjecture" else "Supporting")
+        contents.append(f'<li data-tier="{esc(entry["tier"])}" data-resolution="{esc(entry["resolution"])}"><a class="toc-claim" href="{link}"><small>{esc(entry["reference"])} · {tier_label}</small>'
                         f'<strong>{esc(entry["title"])}</strong></a>{mark}</li>')
     explorer = (template.replace("__MAST__", mast).replace("__TITLE__", esc(p["title"]))
                 .replace("__SHORT_TITLE__", esc(short_title)).replace("__BYLINE__", byline)
-                .replace("__FEATURE__", feature).replace("__COUNT__", str(len(entries)))
+                .replace("__FEATURE__", feature)
+                .replace("__SUMMARY__", render_summary_table(summary, compact=True))
+                .replace("__COUNT__", str(len(entries)))
                 .replace("__CONTENTS__", "".join(contents)))
     digest = hashlib.sha256((packed + dashboard + explorer).encode())
     for name in ("explorer.js", "explorer.css", "graph.js", "graph.css", "style.css", "live.js", "activity.js", "artifact.js"):
@@ -1029,7 +2142,7 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["build", "assemble", "approve", "review", "review-inputs","compare","review-work"])
+    parser.add_argument("operation", choices=["build", "assemble", "manifest", "approve", "review", "review-inputs","compare","review-work"])
     parser.add_argument("project", type=Path)
     parser.add_argument("claims", nargs="*", help="approve: claim labels (default: every closed claim awaiting approval)")
     parser.add_argument("--by", help="approve: the author approving the statements. Only the author runs approve")
@@ -1044,11 +2157,41 @@ if __name__ == "__main__":
     parser.add_argument("--readings",type=Path,help="Agent comparison record for one claim")
     parser.add_argument("--check",action="store_true",help="review-work: exit nonzero for pending agent tasks or requested CI evidence")
     parser.add_argument("--require-ci",action="store_true",help="review-work: verify receipt coverage for the current checkout commit")
+    parser.add_argument("--format",choices=["text","markdown","latex","json"],default="text",help="manifest: output format printed to stdout")
+    parser.add_argument("--propose-edit",action="store_true",help="manifest: propose a synchronized manuscript-edits.json entry with the LaTeX scope snippet")
+    parser.add_argument("--edit-location",default="",help="manifest --propose-edit: manuscript section/location for the proposed scope edit")
+    parser.add_argument("--edit-original",default="",help="manifest --propose-edit: quoted manuscript text being clarified or replaced")
+    parser.add_argument("--edit-reason",default="",help="manifest --propose-edit: rationale for the manuscript scope edit")
+    parser.add_argument("--edit-claim",default="manuscript",help="manifest --propose-edit: claim label or 'manuscript' for paper-wide scope")
     args = parser.parse_args()
     try:
         if args.operation == "assemble":
             report = assemble(args.project.resolve(), package=args.package, run_audit=args.audit)
             print(json.dumps(report, ensure_ascii=False, indent=2))
+        elif args.operation == "manifest":
+            result = manifest(
+                args.project.resolve(),
+                ci_receipt=args.ci_receipt,
+                commit=args.commit,
+                propose_edit=args.propose_edit,
+                edit_location=args.edit_location,
+                edit_original=args.edit_original,
+                edit_reason=args.edit_reason,
+                edit_claim=args.edit_claim,
+            )
+            if args.format == "json":
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            elif args.format == "markdown":
+                print(result["markdown"], end="")
+            elif args.format == "latex":
+                print(result["latex"], end="")
+            else:
+                print(f"Wrote {result['markdown_path']}")
+                if result.get("manuscript_edit"):
+                    status = "updated" if result["manuscript_edit"]["updated"] else "unchanged"
+                    print(f"Manuscript edit '{result['manuscript_edit']['key']}': {status}")
+                print()
+                print(result["latex"], end="")
         elif args.operation == "review-work":
             report = review_work(args.project.resolve(),args.claims,require_ci=args.require_ci,ci_receipt=args.ci_receipt)
             print(json.dumps(report,ensure_ascii=False,indent=2))

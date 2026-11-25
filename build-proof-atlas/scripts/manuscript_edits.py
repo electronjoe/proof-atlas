@@ -25,6 +25,44 @@ def token(book, edits):
     return digest([edits, book.get("cleared", {})])
 
 
+def propose(root, key, *, claim, edition, location="", original="", replacement="",
+            reason="", status="Proposed", evidence="", review_id=None, force=False):
+    """Create or update a manuscript edit suggestion without disturbing cleared entries."""
+    from atlas import atomic
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("Manuscript edit key must be a non-empty string")
+    if status not in ("Suggested", "Proposed", "Draft requested", "Draft ready", "Applied"):
+        raise ValueError(f"Unsupported manuscript edit status: {status}")
+    with project_lock(root):
+        book, _ = inventory(root)
+        cleared = book.get("cleared", {})
+        if key in cleared and not force:
+            return key, book["edits"].get(key), False
+        existing = book["edits"].get(key, {})
+        entry = dict(existing)
+        entry.update(claim=claim, edition=edition)
+        if location:
+            entry["location"] = location
+        if original:
+            entry["original"] = original
+        if replacement:
+            entry["replacement"] = replacement
+        if reason:
+            entry["reason"] = reason
+        if evidence:
+            entry["evidence"] = evidence
+        if review_id:
+            entry["review_id"] = review_id
+        # Preserve an author-initiated draft request or applied status unless forced.
+        if force or existing.get("status") not in ("Draft requested", "Draft ready", "Applied"):
+            entry["status"] = status
+        if existing == entry and key in book["edits"]:
+            return key, entry, False
+        book["edits"][key] = entry
+        atomic(root/"manuscript-edits.json", (json.dumps(book, indent=2, ensure_ascii=False) + "\n").encode())
+        return key, entry, True
+
+
 def update(root, expected, action, selected):
     from atlas import atomic
     with project_lock(root):

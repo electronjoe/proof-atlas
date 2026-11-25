@@ -30,13 +30,29 @@ function rich(text,tag="p") {
   }
   return p;
 }
+function tierLabel(tier) {
+  return tier==="headline" ? "Headline result" : tier==="conjecture" ? "Conjecture" : "Supporting result";
+}
 function fillList(selected) {
   const list=document.querySelector("#claim-list"), term=document.querySelector("#search").value.toLowerCase().trim();
   list.replaceChildren();
+  if (data.summary) {
+    const h=data.summary.headline, s=data.summary.supporting, conj=data.summary.conjectures;
+    const bits=[`Headline: ${h.unconditionally_closed}/${h.total} closed`];
+    if (h.conditional) bits[0]+=` · ${h.conditional} cond.`;
+    if (s.total) {
+      let sp=`Supporting: ${s.unconditionally_closed}/${s.total} closed`;
+      if (s.conditional) sp+=` · ${s.conditional} cond.`;
+      bits.push(sp);
+    }
+    if (conj.total) bits.push(`Conjectures: ${conj.total}`);
+    list.append(el("div", bits.join(" | "), "sidebar-summary"));
+  }
   for (const c of claims.values()) {
-    if (!(c.reference+" "+c.title+" "+c.id).toLowerCase().includes(term)) continue;
+    const tLabel = tierLabel(c.tier);
+    if (!(c.reference+" "+c.title+" "+c.id+" "+(c.tier||"")+" "+tLabel).toLowerCase().includes(term)) continue;
     const a=link("",route(c.id),"claim-choice");
-    a.append(el("small",c.reference),el("span",c.title));
+    a.append(el("small",c.reference+" · "+tLabel),el("span",c.title));
     if(c.verification.evidence) a.append(el("small","✓ Machine verified on GitHub","verified-badge"));
     else a.append(el("small", [c.verification.label, c.verification.remote].filter(Boolean).join(" · ")));
     if(c.verification.needs_author_confirmation || c.verification.needs_author_confirmation_via?.length) a.append(el("small","Needs author confirmation"));
@@ -44,13 +60,13 @@ function fillList(selected) {
     if(c.id===selected) a.setAttribute("aria-current","page");
     list.append(a);
   }
-  if (!list.childElementCount) list.append(el("p","No matching claims."));
+  if (!list.querySelector(".claim-choice")) list.append(el("p","No matching claims."));
 }
 function relations(c, reverse=false) {
   return data.dependencies.filter(e=>reverse?e.prerequisite===c.id:e.claim===c.id);
 }
 function proofView(c,view) {
-  pane.append(el("small",c.reference),el("h2",c.title));
+  pane.append(el("small",c.reference+" · "+tierLabel(c.tier)),el("h2",c.title));
   const v=c.verification;
   if(v.review_url) pane.append(link("Review this claim",v.review_url,"graph-link"));
   for(const [key,title] of [["stronger_result","Lean proves more"],["author_scope","Author’s scope note"]]){
@@ -189,6 +205,15 @@ function proofView(c,view) {
       note.append(el("code",c.hypotheses.declaration),document.createTextNode(" proves:"));
       pane.append(note,el("pre",c.hypotheses.proposition));
     } else if(c.audit_log) pane.append(el("p","No checked example shows the hypotheses can hold.","muted"));
+    if(c.undistilled){
+      pane.append(el("p","Exploratory proof (undistilled). Factor reusable glue into Routine/ and mark distilled once refined.","muted"));
+    }
+    if(c.deferred_bridging_lemmas?.length){
+      pane.append(el("h3","Deferred Mathlib bridging lemmas"));
+      const bl=el("ul");
+      for(const item of c.deferred_bridging_lemmas) bl.append(el("li",item));
+      pane.append(bl);
+    }
     pane.append(rich(c.scope || "No Lean formalization has been selected for this claim."));
     if(c.subproofs?.length){
       const list=el("ol");

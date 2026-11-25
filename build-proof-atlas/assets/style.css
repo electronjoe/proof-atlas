@@ -44,4 +44,19 @@ summary {color:var(--accent);cursor:pointer} pre {white-space:pre-wrap;overflow-
 .artifact-notice::backdrop {background:#24262280}.artifact-notice h2 {margin:0}
 .artifact-notice div {display:flex;flex-wrap:wrap;align-items:center;gap:.8rem 1rem;font:.9rem/1.5 var(--sans)}
 .artifact-notice .public-record {font-weight:700}.artifact-notice button {font:inherit;cursor:pointer}
+.summary-table {margin:1rem 0 1.4rem;overflow-x:auto}
+.summary-table table {width:100%;border-collapse:collapse;font:.84rem/1.45 var(--sans);background:var(--surface);border:1px solid var(--rule)}
+.summary-table caption {text-align:left;font:600 .88rem/1.4 var(--sans);color:var(--muted);margin-bottom:.35rem}
+.summary-table th,.summary-table td {padding:.42rem .6rem;border-bottom:1px solid var(--rule);text-align:right;white-space:nowrap}
+.summary-table thead th {background:var(--wash);font-weight:600;color:var(--ink)}
+.summary-table tbody th {text-align:left;font-weight:600;color:var(--ink)}
+.summary-table tr.summary-total th,.summary-table tr.summary-total td {border-top:2px solid var(--ink);font-weight:700}
+.summary-table tr.summary-conjecture th,.summary-table tr.summary-conjecture td {color:var(--muted);font-style:italic}
+.shortcoming-banner {margin:1.4rem 0;padding:1rem 1.2rem;background:#fbf4ea;border:1px solid #d9be9c;border-left:4px solid var(--accent);font:.88rem/1.5 var(--sans)}
+.shortcoming-banner h2 {font:600 1.25rem/1.2 var(--serif);margin:0 0 .45rem;color:var(--ink)}
+.shortcoming-banner h3 {font:600 .95rem/1.3 var(--sans);margin:.9rem 0 .35rem;color:var(--accent)}
+.shortcoming-banner ul {margin:.2rem 0 0;padding-left:1.25rem}
+.shortcoming-banner li {padding:.3rem 0;border-bottom:none}
+.backlog-action {color:var(--muted);font-size:.82rem}
+.sidebar-summary {font:.74rem/1.4 var(--mono);color:var(--muted);padding:.35rem .5rem;margin:.2rem 0 .45rem;background:var(--surface);border:1px solid var(--rule)}
 @media(max-width:760px){.mast{flex-wrap:wrap;gap:.5rem;padding:.65rem 1rem}.wordmark{font-size:1.6rem}.mast nav{order:3;width:100%;gap:0}.mast nav a{padding:.3rem .55rem}.citation{font-size:.8rem}main{padding-top:1.1rem}.rulehead{flex-wrap:wrap;gap:.25rem}}
