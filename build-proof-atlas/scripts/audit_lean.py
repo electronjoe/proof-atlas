@@ -37,6 +37,164 @@ def import_headers(lake, paths, root, env):
     return imports
 
 
+def statement_paths(root, statements):
+    files = set()
+    for name in statements:
+        path = (root/name).resolve(strict=True)
+        if not path.is_relative_to(root):
+            raise ValueError(f"Statement path outside the package: {name}")
+        found = sorted(path.rglob("*.lean")) if path.is_dir() else [path]
+        files.update(p.relative_to(root).as_posix() for p in found if p.suffix == ".lean")
+    return files
+
+
+def strip_lean_comments_and_strings(text):
+    """Blank Lean comments, strings, char literals and guillemet identifiers, preserving line numbers."""
+    out = []
+    i, n = 0, len(text)
+    depth = 0
+
+    def is_ident(ch):
+        return ch.isalnum() or ch in "_'"
+
+    while i < n:
+        if depth:
+            if text[i:i+2] == "/-":
+                depth += 1
+                out.append("  ")
+                i += 2
+            elif text[i:i+2] == "-/":
+                depth -= 1
+                out.append("  ")
+                i += 2
+            elif text[i] == "\n":
+                out.append("\n")
+                i += 1
+            else:
+                out.append(" ")
+                i += 1
+            continue
+        if text[i:i+2] == "/-":
+            depth = 1
+            out.append("  ")
+            i += 2
+        elif text[i:i+2] == "--":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif text[i] == "«":
+            out.append(" ")
+            i += 1
+            while i < n and text[i] != "»":
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+            if i < n:
+                out.append(" ")
+                i += 1
+        elif text[i] == "r" and (i == 0 or not is_ident(text[i-1])):
+            j = i + 1
+            while j < n and text[j] == "#":
+                j += 1
+            if j < n and text[j] == '"':
+                hashes = j - (i + 1)
+                closing = '"' + "#" * hashes
+                out.append('""')
+                i = j + 1
+                while i < n and text[i:i+len(closing)] != closing:
+                    out.append("\n" if text[i] == "\n" else " ")
+                    i += 1
+                if i < n:
+                    i += len(closing)
+                continue
+            out.append(text[i])
+            i += 1
+        elif text[i] == '"':
+            out.append('"')
+            i += 1
+            while i < n:
+                if text[i] == "\\" and i + 1 < n:
+                    out.append("\n" if text[i+1] == "\n" else "  ")
+                    i += 2
+                elif text[i] == '"':
+                    out.append('"')
+                    i += 1
+                    break
+                elif text[i] == "\n":
+                    out.append("\n")
+                    i += 1
+                else:
+                    out.append(" ")
+                    i += 1
+        elif text[i] == "'" and (i == 0 or not is_ident(text[i-1])):
+            if text[i+1:i+2] == "\\":
+                j = i + 2
+                while j < n and text[j] not in "'\n" and j - i <= 8:
+                    j += 1
+                if j < n and text[j] == "'":
+                    out.append(" " * (j - i + 1))
+                    i = j + 1
+                    continue
+            elif i + 2 < n and text[i+1] != "\n" and text[i+2] == "'":
+                out.append("   ")
+                i += 3
+                continue
+            out.append("'")
+            i += 1
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+_ATTR_BLOCK = re.compile(r"(?:@|\battribute\s+)\[([^\]]*)\]", re.S)
+_BANNED_ATTR = re.compile(r"\b(implemented_by|extern|csimp)\b")
+_UNSAFE_KW = re.compile(r"\bunsafe\b")
+_EVAL_CMD = re.compile(r"#eval\b")
+_RUN_CMD = re.compile(r"(?m)^\s*(?:(?:local|scoped|private)\s+)*run_cmd\b")
+_METAPROG_CMD = re.compile(r"(?m)^\s*(?:@\[[^\]]*\]\s*)*(?:(?:private|local|scoped)\s+)*(elab_rules|elab|macro_rules|macro)\b")
+_FIXITY_CMD = re.compile(
+    r'(?m)^\s*(?:@\[[^\]]*\]\s*)*(?:(?:private|local|scoped)\s+)*(infixl|infixr|infix|prefix|postfix)'
+    r'(?:\s*\([^)]*\))*\s*:\s*\S+(?:\s*\([^)]*\))*\s*"'
+)
+_NOTATION_CMD = re.compile(
+    r'(?m)^\s*(?:@\[[^\]]*\]\s*)*(?:(?:private|local|scoped)\s+)*notation\b'
+    r'(?=(?:[^\n]*"|[^\n]*=>|\s*:\s*\S+\s*"|\s*\([^)]*\)))'
+)
+
+
+def scan_lean_hygiene(root, lean_paths, statement_files=()):
+    """Scan audited Lean files for metaprogramming escape hatches and custom notation in Statements/."""
+    stmt_set = set(statement_files)
+    findings = []
+    for rel in sorted(lean_paths):
+        cleaned = strip_lean_comments_and_strings((root / rel).read_text(encoding="utf-8-sig"))
+
+        def add(pos, directive, reason):
+            line = cleaned.count("\n", 0, pos) + 1
+            findings.append((rel, line, directive, reason))
+
+        for m in _ATTR_BLOCK.finditer(cleaned):
+            for attr in _BANNED_ATTR.finditer(m.group(1)):
+                add(m.start(1) + attr.start(), f"@[{attr.group(1)}]", "escape-hatch attribute")
+        for m in _UNSAFE_KW.finditer(cleaned):
+            add(m.start(), "unsafe", "unsafe declaration or section")
+        for m in _EVAL_CMD.finditer(cleaned):
+            add(m.start(), "#eval", "compile-time evaluation command")
+        for m in _RUN_CMD.finditer(cleaned):
+            add(m.start(), "run_cmd", "compile-time metaprogramming command")
+        for m in _METAPROG_CMD.finditer(cleaned):
+            add(m.start(1), m.group(1), "custom elaborator or macro")
+        if rel in stmt_set:
+            for m in _FIXITY_CMD.finditer(cleaned):
+                add(m.start(1), m.group(1), "custom notation in Statements/")
+            for m in _NOTATION_CMD.finditer(cleaned):
+                add(m.start(), "notation", "custom notation in Statements/")
+    if findings:
+        details = "; ".join(f"{rel}:{line}: {directive} ({reason})" for rel, line, directive, reason in findings)
+        raise ValueError(f"Disallowed Lean directive in audited sources: {details}")
+    return dict(checked=True, statements_checked=bool(stmt_set))
+
+
 def check_statements(lake, root, env, contract, expected, statements):
     """Keep the expected proposition and its definitions apart from the proofs.
 
@@ -45,13 +203,7 @@ def check_statements(lake, root, env, contract, expected, statements):
     modules and external libraries, and the expected proposition must be defined in
     one of them. Lean resolves every constant from imports, so nothing the statement
     mentions can then come from a proof module or from the contract file."""
-    files = set()
-    for name in statements:
-        path = (root/name).resolve(strict=True)
-        if not path.is_relative_to(root):
-            raise ValueError(f"Statement path outside the package: {name}")
-        found = sorted(path.rglob("*.lean")) if path.is_dir() else [path]
-        files.update(p.relative_to(root).as_posix() for p in found if p.suffix == ".lean")
+    files = statement_paths(root, statements)
     if not files:
         raise ValueError("No Lean files in the statement paths: " + ", ".join(statements))
     modules = {f[:-5].replace("/", "."): f for f in files}
@@ -495,6 +647,9 @@ def audit(args):
     initial = inputs(root) if scoped is None else hash_paths(root, scoped)
     if contract_path not in initial or pin != (root/"lean-toolchain").read_text(encoding="utf-8-sig").strip():
         raise ValueError("Missing contract or toolchain pin changed during audit setup")
+    # Static hygiene runs before `lake build` so compile-time side effects fail before elaboration.
+    stmt_files = statement_paths(root, statements) if statements else set()
+    hygiene = scan_lean_hygiene(root, [p for p in initial if p.endswith(".lean")], stmt_files)
     # The Lake build runner sends output to an actual file descriptor.
     run([*lake, "--no-cache", "build", *build_targets], root, env, sys.stderr)
     if statement_only:
@@ -546,14 +701,16 @@ def audit(args):
         return dict(statement_only=True, contract=contract_path, expected=args.expected,
                     toolchain=pin, axioms=axioms, axiom_profile=profile, external_packages=ext_pkgs,
                     targets=targets, input_scope="module-closure",
-                    checked_inputs=initial, statements=statements, lean_output=output.strip(),
+                    checked_inputs=initial, statements=statements, hygiene=hygiene,
+                    lean_output=output.strip(),
                     statement=statement, defaults=defaults,
                     **({"hypotheses": hypotheses} if hypotheses else {}))
     return dict(declaration=declaration, contract=contract_path,
                 expected=args.expected, toolchain=pin, axioms=axioms, axiom_profile=profile,
                 external_packages=ext_pkgs,
                 targets=targets, input_scope="module-closure" if scoped is not None else "full-package",
-                checked_inputs=initial, statements=statements, lean_output=output.strip(),
+                checked_inputs=initial, statements=statements, hygiene=hygiene,
+                lean_output=output.strip(),
                 **({"statement": statement, "defaults": defaults} if statement else {}),
                 **({"hypotheses": hypotheses} if hypotheses else {}))
 

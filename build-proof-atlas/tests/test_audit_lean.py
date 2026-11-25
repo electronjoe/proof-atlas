@@ -55,6 +55,68 @@ class AuditMetadataHelpers(unittest.TestCase):
             self.assertTrue(forked["mathlib"]["third_party"])
 
 
+class StaticHygieneScan(unittest.TestCase):
+    def scan(self, files, statement_files=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, body in files.items():
+                path = root / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body, encoding="utf-8")
+            return audit_lean.scan_lean_hygiene(root, sorted(files), statement_files)
+
+    def test_clean_sources_comments_strings_and_field_names_pass(self):
+        files = {
+            "Statements/Main.lean": (
+                "-- unsafe #eval run_cmd notation \"x\" => 1\n"
+                "/- nested /- @[implemented_by foo] elab macro -/ still comment -/\n"
+                "open scoped BigOperators\n"
+                "structure Spec where\n"
+                "  prefix : Nat\n"
+                "  notation : String\n"
+                'def msg : String := "unsafe @[extern] #eval run_cmd"\n'
+                "def quoteChar : Char := '\"'\n"
+                "def «unsafe» : Nat := 1\n"
+                "def Statement : Prop := ∀ n : Nat, n = n\n"
+            ),
+            # Proof-local notation is permitted outside Statements/.
+            "Proofs/Main.lean": (
+                "import Statements.Main\n"
+                'local infixl:65 " ⊕ " => Nat.add\n'
+                "theorem main : Statement := fun _ => rfl\n"
+            ),
+        }
+        result = self.scan(files, statement_files={"Statements/Main.lean"})
+        self.assertEqual(result, {"checked": True, "statements_checked": True})
+
+    def test_rejects_escape_hatches_and_statement_custom_notation(self):
+        cases = [
+            ("Proofs/Bad.lean", "unsafe def bad : Nat := 0\n", False, "unsafe"),
+            ("Proofs/Bad.lean", "@[inline, implemented_by Nat.succ]\ndef f (n : Nat) := n\n", False, r"@\[implemented_by\]"),
+            ("Proofs/Bad.lean", "@[extern \"c_fn\"] opaque f : Nat → Nat\n", False, r"@\[extern\]"),
+            ("Proofs/Bad.lean", "attribute [csimp] my_eq\n", False, r"@\[csimp\]"),
+            ("Proofs/Bad.lean", "#eval IO.println \"hi\"\n", False, r"#eval"),
+            ("Proofs/Bad.lean", "run_cmd Lean.logInfo \"hi\"\n", False, r"run_cmd"),
+            ("Proofs/Bad.lean", "elab \"foo\" : command => pure ()\n", False, r"elab"),
+            ("Proofs/Bad.lean", "elab_rules | `(foo) => pure ()\n", False, r"elab_rules"),
+            ("Proofs/Bad.lean", "macro \"my_tac\" : tactic => `(tactic| rfl)\n", False, r"macro"),
+            ("Proofs/Bad.lean", "macro_rules | `(my_tac) => `(tactic| rfl)\n", False, r"macro_rules"),
+            ("Statements/Bad.lean", 'notation "ZERO" => 0\n', True, r"Statements/Bad\.lean:1: notation"),
+            ("Statements/Bad.lean", 'notation "ZERO"\n  => 0\n', True, r"Statements/Bad\.lean:1: notation"),
+            ("Statements/Bad.lean", 'local notation:50 a " ⊕ " b => a + b\n', True, r"notation"),
+            ("Statements/Bad.lean", 'infix:50 " ≈ " => Eq\n', True, r"infix"),
+            ("Statements/Bad.lean", 'scoped infixl:65 " ⊕ " => Nat.add\n', True, r"infixl"),
+            ("Statements/Bad.lean", 'infixr:65 " ⊕ " => Nat.add\n', True, r"infixr"),
+            ("Statements/Bad.lean", 'prefix:75 "!" => Nat.succ\n', True, r"prefix"),
+            ("Statements/Bad.lean", 'postfix:max "!" => Nat.succ\n', True, r"postfix"),
+        ]
+        for rel, body, is_stmt, pattern in cases:
+            with self.subTest(rel=rel, pattern=pattern):
+                stmt_files = {rel} if is_stmt else set()
+                with self.assertRaisesRegex(ValueError, pattern):
+                    self.scan({rel: body}, statement_files=stmt_files)
+
+
 @unittest.skipUnless(os.environ.get("ELAN_TOOLCHAIN"), "requires an installed pinned Lean toolchain")
 class AuditClosure(unittest.TestCase):
     def test_local_dependency_stability(self):
@@ -443,6 +505,46 @@ class AuditClosure(unittest.TestCase):
             self.assertEqual(constructive["axiom_profile"], "Constructive (0 axioms)")
             self.assertEqual(closed["external_packages"], [])
             self.assertEqual(stmt["external_packages"], [])
+            self.assertEqual(stmt["hygiene"], {"checked": True, "statements_checked": True})
+            self.assertEqual(closed["hygiene"], {"checked": True, "statements_checked": True})
+
+    def test_static_hygiene_blocks_escape_hatches_and_statement_notation_before_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pin = os.environ["ELAN_TOOLCHAIN"]
+            (root/"lean-toolchain").write_text(pin)
+            (root/"lakefile.toml").write_text('name = "Example"\n[[lean_lib]]\nname = "Statements"\n'
+                                              '[[lean_lib]]\nname = "Proofs"\n')
+            (root/"Statements").mkdir()
+            (root/"Proofs").mkdir()
+            clean_stmt = "def Statement : Prop := ∀ n : Nat, n = n\n"
+            clean_proof = 'import Statements.Main\nlocal infixl:65 " ⊕ " => Nat.add\ntheorem main : Statement := fun _ => rfl\n'
+            (root/"Statements/Main.lean").write_text(clean_stmt, encoding="utf-8")
+            (root/"Proofs/Main.lean").write_text(clean_proof, encoding="utf-8")
+            (root/"Contract.lean").write_text("import Statements.Main\nimport Proofs.Main\n", encoding="utf-8")
+            env = os.environ.copy()
+            lake = audit_lean.select_lake(root, pin, env, sys.stderr, offline=True)
+            subprocess.run([*lake, "update"], cwd=root, env=env, check=True)
+            args = SimpleNamespace(package=root, contract="Contract.lean", expected="Statement",
+                                   declaration="main", target=["Proofs.Main"], statements=["Statements"])
+
+            receipt = audit_lean.audit(args)
+            self.assertEqual(receipt["hygiene"], {"checked": True, "statements_checked": True})
+
+            # Custom notation inside Statements/ is rejected before running Lake.
+            (root/"Statements/Main.lean").write_text(
+                'local notation "EQ" => Eq\ndef Statement : Prop := ∀ n : Nat, EQ n n\n', encoding="utf-8")
+            with patch.object(audit_lean, "run", side_effect=AssertionError("build should not run")):
+                with self.assertRaisesRegex(ValueError, r"Statements/Main\.lean:1: notation"):
+                    audit_lean.audit(args)
+
+            # #eval inside Proofs/ is rejected before running Lake.
+            (root/"Statements/Main.lean").write_text(clean_stmt, encoding="utf-8")
+            (root/"Proofs/Main.lean").write_text(
+                clean_proof + '#eval IO.println "side effect"\n', encoding="utf-8")
+            with patch.object(audit_lean, "run", side_effect=AssertionError("build should not run")):
+                with self.assertRaisesRegex(ValueError, r"Proofs/Main\.lean:4: #eval"):
+                    audit_lean.audit(args)
 
 
 if __name__ == "__main__":

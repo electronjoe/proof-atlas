@@ -39,7 +39,7 @@ Bhaskar Krishnamachari’s *A Block Hierarchy for Rate-Distortion and Dispersion
 
 **Lean checked** means Lean accepted a proof of the formal statement shown in the Lean view, using only Lean’s standard axioms. **Machine verified on GitHub** means a separate GitHub run repeated that check at the published commit. **Author reviewed** means a named person compared that formal statement with the paper and accepted it. Neither Lean badge says the formal statement is the paper’s theorem. To judge that, read the Lean statement and its definitions beside the paper. The Plain English and Lamport proof views are explanations, not machine-checked, and Lean’s proof may take a different route from the paper’s.
 
-The audit checks the declaration’s type and axioms, which catches mistakes by an honest agent. It does not defend against proof files written to game those checks. For proofs you do not trust, use a dedicated checker such as the Lean FRO’s [Comparator](https://github.com/leanprover/comparator).
+The audit checks the declaration’s type and axioms, and statically scans audited Lean files before building to reject metaprogramming escape hatches (`unsafe`, `@[implemented_by]`, `@[extern]`, `@[csimp]`, `#eval`, `run_cmd`, custom `elab`/`macro`) and custom notation inside `Statements/` (upstream Mathlib notation still works). These checks catch mistakes by an honest agent and block common bypasses, but they are not a substitute for an adversarial verifier. For proofs you do not trust, use a dedicated checker such as the Lean FRO’s [Comparator](https://github.com/leanprover/comparator).
 
 ## Credits
 
