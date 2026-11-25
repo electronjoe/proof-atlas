@@ -18,6 +18,9 @@
 .graph-viewport svg {width:100%;height:100%;display:block;cursor:grab;touch-action:none;user-select:none}
 .graph-viewport svg:active {cursor:grabbing}
 .graph-edge {fill:none;stroke-width:2.3;stroke:#aca79a}.graph-edge.ancestor {stroke:#217768}.graph-edge.descendant {stroke:#946022;stroke-dasharray:6 3}
+.graph-edge.grounding-both {stroke-width:2.8}
+.graph-edge.grounding-paper_only {stroke-dasharray:2 4;opacity:.78}
+.graph-edge.grounding-lean_only {stroke:#2c5ea8;stroke-dasharray:9 4}
 .arrow-ancestor {fill:#217768}.arrow-descendant {fill:#946022}.arrow-other {fill:#aca79a}
 .graph-node {cursor:pointer;text-decoration:none;--line:#c7c1b1;--fill:#fffdf7;--ink:#3a3931;--dot:#a2b3a7}
 .graph-node.ancestor {--line:#4e9482;--fill:#edfaf2;--ink:#123f34;--dot:#1e7763}
@@ -29,6 +32,13 @@
 .graph-legend {gap:.65rem 1.2rem;flex-wrap:wrap;padding:.65rem 1rem;border-top:1px solid #d2cdbf;font-size:.78rem;color:#4c6156}
 .graph-legend span {display:inline-flex;align-items:center;gap:.4rem}
 .graph-legend i {width:10px;height:10px;border-radius:3px;background:#843629}.graph-legend .ancestor {background:#cff0de;border:1px solid #4e9482}.graph-legend .descendant {background:#ffe8c1;border:1px solid #bb884c}
+.graph-legend .edge-swatch {width:18px;height:0;border-radius:0;background:none;border-top:2.5px solid #217768}
+.graph-legend .edge-swatch.grounding-paper_only {border-top:2.5px dotted #8a7e6e}
+.graph-legend .edge-swatch.grounding-lean_only {border-top:2.5px dashed #2c5ea8}
+.edge-grounding {display:inline-block;margin:.2rem 0 0 .35rem;padding:.08rem .4rem;border-radius:3px;font:.72rem/1.3 "Segoe UI",sans-serif;font-weight:600;background:#eef3f0;color:#1d5948;border:1px solid #bdd4c9}
+.edge-grounding.grounding-paper_only {background:#f7f2e8;color:#735629;border-color:#d9c9ad}
+.edge-grounding.grounding-lean_only {background:#ebf1fb;color:#224a87;border-color:#b7cbe8}
+.graph-edge-item {margin-bottom:.35rem}
 .graph-caption {font-size:.82rem;color:#625e53;margin:.6rem 0 1rem}
 #content .graph-inspector {margin:0;border:1px solid #cfcabb;border-top:4px solid #843629;background:#fffdf7;padding:1.2rem;border-radius:2px}
 #content .graph-inspector h3 {font:500 1.75rem/1.13 Georgia,serif;margin:.4rem 0}

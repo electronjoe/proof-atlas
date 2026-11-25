@@ -195,6 +195,17 @@ def scan_lean_hygiene(root, lean_paths, statement_files=()):
     return dict(checked=True, statements_checked=bool(stmt_set))
 
 
+def count_lean_loc(root, lean_paths):
+    """Count non-empty, non-comment Lean lines of code across audited local .lean files."""
+    total = 0
+    for rel in sorted(lean_paths):
+        if not rel.endswith(".lean"):
+            continue
+        cleaned = strip_lean_comments_and_strings((root / rel).read_text(encoding="utf-8-sig"))
+        total += sum(1 for line in cleaned.splitlines() if line.strip())
+    return total
+
+
 def _pure_external_prelude(lake, root, env):
     """Verify that a root Prelude.lean module imports only external libraries."""
     if not (root / "Prelude.lean").is_file():
@@ -638,6 +649,109 @@ DECL_KIND_QUERY = r'''
 '''
 
 
+# Walks the audited proof declaration's transitive local constant closure in Lean.Environment
+# (following both types and proof/definition bodies across local modules, including through
+# compiler-generated auxiliaries) to extract used local theorems, .Statement dependencies,
+# and reachable local definition counts.
+PROOF_CLOSURE_QUERY = r'''
+partial def proofAtlasIsPropType : Lean.Expr → Bool
+  | .sort .zero => true
+  | .forallE _ _ b _ => proofAtlasIsPropType b
+  | .letE _ _ _ b _ => proofAtlasIsPropType b
+  | .mdata _ e => proofAtlasIsPropType e
+  | _ => false
+
+#eval show Lean.CoreM Unit from do
+  let env ← Lean.getEnv
+  let local_ : Lean.NameSet := (__LOCAL__ : List String).foldl (fun s m => s.insert m.toName) {}
+  let mut todo := #[(__DECL__ : String).toName]
+  let mut seen : Lean.NameSet := {}
+  while !todo.isEmpty do
+    let n := todo.back!
+    todo := todo.pop
+    if seen.contains n then continue
+    seen := seen.insert n
+    let some ci := env.find? n | continue
+    let mod := (env.getModuleIdxFor? n).map (env.allImportedModuleNames[·]!)
+    unless mod.all local_.contains do continue
+    let value := ci.value? (allowOpaque := true)
+    let (kind, next) : String × Array Lean.Name := match ci with
+      | .inductInfo v => ("inductive", v.ctors.toArray)
+      | .ctorInfo v => ("constructor", #[v.induct])
+      | .defnInfo _ => ("def", #[]) | .thmInfo _ => ("theorem", #[]) | .opaqueInfo _ => ("opaque", #[])
+      | .axiomInfo _ => ("axiom", #[]) | .recInfo _ => ("recursor", #[]) | .quotInfo _ => ("quot", #[])
+    todo := todo ++ ci.type.getUsedConstants ++ (value.map (·.getUsedConstants)).getD #[] ++ next
+    IO.println <| "PROOF-ATLAS-CLOSURE " ++ (Lean.Json.mkObj [
+      ("name", toString n),
+      ("kind", Lean.Json.str kind),
+      ("module", Lean.toJson (mod.map toString)),
+      ("is_prop", Lean.toJson (proofAtlasIsPropType ci.type))
+    ]).compress
+'''
+
+
+_COMPILER_AUX_PART = re.compile(
+    r"^(?:_proof_\d+|_?match_\d+|_sunfold|_cstage\d+|_closed_\d+|_rarg|_boxed|_aux_\d+|_uniq|"
+    r"eq_\d+|casesOn|recOn|brecOn|below|ibelow|noConfusion|noConfusionType|ctorIdx|sizeOf_spec)$"
+)
+
+
+def is_compiler_aux(name):
+    """Return True if a Lean constant name contains a compiler-generated auxiliary component."""
+    return any(_COMPILER_AUX_PART.match(part) for part in str(name).split("."))
+
+
+def parse_proof_closure(output, declaration, expected, statement_modules=()):
+    """Parse PROOF-ATLAS-CLOSURE lines into kernel-extracted theorem/statement deps and size metrics."""
+    rows = [json.loads(line.split(" ", 1)[1]) for line in output.splitlines()
+            if line.startswith("PROOF-ATLAS-CLOSURE ")]
+    if not rows or not any(row.get("name") == declaration for row in rows):
+        raise ValueError(f"Could not extract local constant closure for {declaration}:\n" + output)
+    stmt_mods = set(statement_modules or ())
+    used_theorems = set()
+    used_statements = set()
+    local_defs = set()
+    seen = set()
+    for row in rows:
+        name = row.get("name", "")
+        if not name or name in seen or is_compiler_aux(name):
+            continue
+        seen.add(name)
+        kind = row.get("kind", "")
+        mod = row.get("module")
+        is_prop = bool(row.get("is_prop", False))
+        if kind == "theorem" and name != declaration:
+            used_theorems.add(name)
+        if kind in ("def", "opaque", "inductive"):
+            local_defs.add(name)
+        if name != expected and kind in ("def", "opaque", "inductive", "axiom"):
+            in_stmt_mod = bool(mod and (mod in stmt_mods or mod == "Statements" or mod.startswith("Statements.")))
+            if name.endswith(".Statement") or (in_stmt_mod and is_prop):
+                used_statements.add(name)
+    ordered_theorems = sorted(used_theorems)
+    ordered_statements = sorted(used_statements)
+    return dict(
+        used_local_theorems=ordered_theorems,
+        used_local_statements=ordered_statements,
+        reachable_local_defs=len(local_defs),
+        reachable_local_theorems=len(ordered_theorems),
+    )
+
+
+def proof_closure_record(lake, root, env, contract, declaration, expected, statement_modules=()):
+    """Walk the audited declaration's transitive local constant closure in Lean.Environment."""
+    modules = {path[:-5].replace("/", ".") for path in inputs(root) if path.endswith(".lean")}
+    program = ("import Lean\n" + (root / contract).read_text(encoding="utf-8-sig") + "\n" +
+               PROOF_CLOSURE_QUERY.replace("__LOCAL__", json.dumps(sorted(modules)))
+               .replace("__DECL__", json.dumps(declaration)))
+    result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
+                            cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = result.stdout.decode("utf-8-sig", errors="replace")
+    if result.returncode:
+        raise ValueError(f"Could not inspect transitive local constant closure for {declaration}:\n" + output)
+    return parse_proof_closure(output, declaration, expected, statement_modules=statement_modules)
+
+
 def expected_claim_type(expected, assumes=()):
     """Build the Lean type `A₁ → … → Aₖ → Expected` for conditional or unconditional proofs."""
     return " → ".join([*assumes, expected]) if assumes else expected
@@ -788,8 +902,9 @@ def audit(args):
         hypotheses = None
         print("Warning: no --witness was given, so nothing shows that the hypotheses of the expected "
               "proposition can hold. See 'Show the hypotheses can hold' in SKILL.md.", file=sys.stderr)
+    stmt_modules = []
     if statements:
-        check_statements(lake, root, env, contract_path, args.expected, statements, assumes=assumes)
+        stmt_modules = check_statements(lake, root, env, contract_path, args.expected, statements, assumes=assumes)
     else:
         print("Warning: no --statements path was given, so nothing checks that the expected proposition "
               "and its definitions are independent of the proof modules. Older atlases keep working; "
@@ -797,6 +912,10 @@ def audit(args):
     # A custom source layout can hide local definitions from the fingerprint.
     statement, defaults = (statement_record(lake, root, env, contract_path, args.expected)
                            if scoped or statements else (None, None))
+    proof_closure = (proof_closure_record(lake, root, env, contract_path, declaration, args.expected,
+                                          statement_modules=stmt_modules)
+                     if (not statement_only and (scoped or statements)) else None)
+    checked_lean_loc = count_lean_loc(root, [p for p in initial if p.endswith(".lean")])
     if scoped is None:
         final = inputs(root)
     else:
@@ -813,19 +932,23 @@ def audit(args):
         return dict(statement_only=True, contract=contract_path, expected=args.expected,
                     toolchain=pin, axioms=axioms, axiom_profile=profile, external_packages=ext_pkgs,
                     targets=targets, input_scope="module-closure",
-                    checked_inputs=initial, statements=statements, hygiene=hygiene,
+                    checked_inputs=initial, checked_lean_loc=checked_lean_loc,
+                    statements=statements, hygiene=hygiene,
                     lean_output=output.strip(),
                     statement=statement, defaults=defaults,
+                    **({"reachable_local_defs": len(statement["constants"])} if statement else {}),
                     **({"routine": routine_modules} if routine_modules else {}),
                     **({"hypotheses": hypotheses} if hypotheses else {}))
     return dict(declaration=declaration, contract=contract_path,
                 expected=args.expected, toolchain=pin, axioms=axioms, axiom_profile=profile,
                 external_packages=ext_pkgs, theorem_info=theorem_info,
                 targets=targets, input_scope="module-closure" if scoped is not None else "full-package",
-                checked_inputs=initial, statements=statements, hygiene=hygiene,
+                checked_inputs=initial, checked_lean_loc=checked_lean_loc,
+                statements=statements, hygiene=hygiene,
                 lean_output=output.strip(),
                 **({"assumes": assumes} if assumes else {}),
                 **({"routine": routine_modules} if routine_modules else {}),
+                **(proof_closure if proof_closure else {}),
                 **({"statement": statement, "defaults": defaults} if statement else {}),
                 **({"hypotheses": hypotheses} if hypotheses else {}))
 

@@ -118,6 +118,75 @@ class AuditMetadataHelpers(unittest.TestCase):
                     statements=["Statements"], assumes=["Statements.Lem"], statement_only=True,
                 ))
 
+    def test_count_lean_loc_ignores_comments_and_blank_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Statements").mkdir()
+            (root / "Statements/A.lean").write_text(
+                "-- header comment\n"
+                "\n"
+                "/- block comment\n"
+                "   /- nested comment -/\n"
+                "   still comment -/\n"
+                "def x : Nat := 1 -- inline comment\n"
+                'def msg : String := "hello"\n'
+                "   \n",
+                encoding="utf-8",
+            )
+            (root / "Proofs").mkdir()
+            (root / "Proofs/A.lean").write_text(
+                "import Statements.A\n"
+                "theorem main : x = 1 :=\n"
+                "  rfl\n",
+                encoding="utf-8",
+            )
+            (root / "lakefile.toml").write_text('name = "Ignored"\n', encoding="utf-8")
+            loc = audit_lean.count_lean_loc(root, ["Statements/A.lean", "Proofs/A.lean", "lakefile.toml"])
+            self.assertEqual(loc, 5)
+
+    def test_parse_proof_closure_and_aux_filtering(self):
+        self.assertTrue(audit_lean.is_compiler_aux("Proofs.B.main._proof_1"))
+        self.assertTrue(audit_lean.is_compiler_aux("Proofs.B.match_1"))
+        self.assertTrue(audit_lean.is_compiler_aux("Statements.MyType.casesOn"))
+        self.assertFalse(audit_lean.is_compiler_aux("_private.Proofs.B.0.helper_lem"))
+        self.assertFalse(audit_lean.is_compiler_aux("Proofs.A.main"))
+
+        rows = [
+            {"name": "Proofs.B.main", "kind": "theorem", "module": "Proofs.B", "is_prop": False},
+            {"name": "Proofs.B.main._proof_1", "kind": "theorem", "module": "Proofs.B", "is_prop": False},
+            {"name": "_private.Proofs.B.0.helper_lem", "kind": "theorem", "module": "Proofs.B", "is_prop": False},
+            {"name": "Proofs.A.main", "kind": "theorem", "module": "Proofs.A", "is_prop": False},
+            {"name": "Routine.Glue.add_zero_glue", "kind": "theorem", "module": "Routine.Glue", "is_prop": False},
+            {"name": "Statements.ThmB", "kind": "def", "module": "Statements.Main", "is_prop": True},
+            {"name": "Statements.LemA", "kind": "def", "module": "Statements.Main", "is_prop": True},
+            {"name": "Custom.Extra.Statement", "kind": "def", "module": "Custom.Extra", "is_prop": True},
+            {"name": "Statements.rate", "kind": "def", "module": "Statements.Main", "is_prop": False},
+            {"name": "Routine.Glue.scale", "kind": "def", "module": "Routine.Glue", "is_prop": False},
+            {"name": "Statements.MyType", "kind": "inductive", "module": "Statements.Main", "is_prop": False},
+            {"name": "Statements.MyType.casesOn", "kind": "recursor", "module": "Statements.Main", "is_prop": False},
+        ]
+        output = "\n".join("PROOF-ATLAS-CLOSURE " + json.dumps(r) for r in rows) + "\n"
+        parsed = audit_lean.parse_proof_closure(
+            output,
+            declaration="Proofs.B.main",
+            expected="Statements.ThmB",
+            statement_modules=["Statements.Main"],
+        )
+        self.assertEqual(parsed["used_local_theorems"], [
+            "Proofs.A.main",
+            "Routine.Glue.add_zero_glue",
+            "_private.Proofs.B.0.helper_lem",
+        ])
+        self.assertEqual(parsed["used_local_statements"], [
+            "Custom.Extra.Statement",
+            "Statements.LemA",
+        ])
+        self.assertEqual(parsed["reachable_local_theorems"], 3)
+        self.assertEqual(parsed["reachable_local_defs"], 6)
+
+        with self.assertRaisesRegex(ValueError, "Could not extract local constant closure"):
+            audit_lean.parse_proof_closure("no markers\n", "Proofs.B.main", "Statements.ThmB")
+
 
 class StaticHygieneScan(unittest.TestCase):
     def scan(self, files, statement_files=()):
@@ -652,6 +721,11 @@ class AuditClosure(unittest.TestCase):
             self.assertTrue(receipt["theorem_info"])
             self.assertEqual(receipt["assumes"], ["LemA"])
             self.assertEqual(receipt["routine"], ["Routine.Glue"])
+            self.assertIn("add_zero_glue", receipt["used_local_theorems"])
+            self.assertIn("LemA", receipt["used_local_statements"])
+            self.assertGreaterEqual(receipt["reachable_local_defs"], 2)
+            self.assertEqual(receipt["reachable_local_theorems"], len(receipt["used_local_theorems"]))
+            self.assertGreater(receipt["checked_lean_loc"], 0)
 
             # Non-theorem declarations (def) are rejected by the kernel .thmInfo check.
             with self.assertRaisesRegex(ValueError, r"must be a Lean theorem \(\.thmInfo\), found def"):

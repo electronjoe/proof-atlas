@@ -92,9 +92,31 @@ def render(data,secret=None,notice=""):
             )
         return "".join(rendered)
     def metadata_panel():
+        from atlas import BASIS_LABELS
         parts = []
         if data.get("axiom_profile"):
             parts.append(f'<p><strong>Axiom profile:</strong> {esc(data["axiom_profile"])}</p>')
+        if data.get("basis"):
+            b = data["basis"]
+            label = BASIS_LABELS.get(b, b)
+            extra = (f' · <a href="../{esc(data["supplement_url"])}">Read supplied proof in supplement.md</a>'
+                     if b == "supplied" and data.get("supplement_url") else "")
+            parts.append(f'<p><strong>Proof basis:</strong> {esc(label)} (<code>{esc(b)}</code>){extra}</p>')
+        metrics = data.get("proof_metrics")
+        if metrics:
+            bits = []
+            if "checked_lean_loc" in metrics:
+                bits.append(f'{metrics["checked_lean_loc"]} checked Lean LoC')
+            if "reachable_local_defs" in metrics:
+                bits.append(f'{metrics["reachable_local_defs"]} reachable local defs')
+            if "reachable_local_theorems" in metrics:
+                bits.append(f'{metrics["reachable_local_theorems"]} reachable local theorems')
+            if data.get("distilled") is True:
+                bits.append("Distilled")
+            elif data.get("undistilled"):
+                bits.append("Exploratory proof (undistilled)")
+            if bits:
+                parts.append(f'<p><strong>Proof size:</strong> {esc(" · ".join(bits))}</p>')
         if data.get("noncomputable_constants"):
             names = ", ".join(f'<code>{esc(n)}</code>' for n in data["noncomputable_constants"])
             parts.append(
@@ -122,6 +144,13 @@ def render(data,secret=None,notice=""):
                 '<section><h2>What Lean proved</h2><small>Mathematical reading of the audited Lean statement</small>'+para(view["lean_reading"] or "The agent has not supplied a current independent reading.")+
                 para(view["lean_refs"])+'</section></div>')
     body=f'<p>{esc(v["edition"])} · {cid}</p><h1>{esc(data["title"])}</h1>'
+    if data.get("basis") == "supplied":
+        supp_href = f'../{esc(data["supplement_url"])}' if data.get("supplement_url") else "../supplement.md"
+        badge_lead = ("Lean checked (proof supplied outside manuscript)" if data["checked"]
+                      else "Proof supplied outside manuscript")
+        body+=(f'<aside class="confirmation-warning"><h2>{esc(badge_lead)}</h2>'
+               '<p>The manuscript states this claim without a complete written proof (for example, an unproved remark or skipped step); '
+               f'Lean supplies the argument outside the PDF. <a href="{supp_href}">Open supplement.md</a>.</p></aside>')
     if data.get("conditional"):
         assumed_text = ", ".join(esc(a) for a in data.get("assumes", []))
         body+=(f'<p><strong>Conditional (assumes {assumed_text})</strong> · Lean checked this claim assuming '
@@ -210,6 +239,8 @@ def queue(entries):
             parts.append("Statement drafted (proof in progress) · " + d["assessment"])
         else:
             parts.append(d["assessment"])
+        if d.get("basis") == "supplied":
+            parts.append("Proof supplied outside manuscript")
         if d.get("needs_author_confirmation"):
             parts.append("Needs author confirmation")
         elif d.get("needs_author_confirmation_via"):

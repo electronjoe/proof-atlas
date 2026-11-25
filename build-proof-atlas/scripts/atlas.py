@@ -18,6 +18,20 @@ from urllib.parse import quote, urlsplit
 NO_EXAMPLE = "No checked example shows the hypotheses can hold"
 HEADLINE_KINDS = frozenset({"theorem", "corollary", "proposition"})
 MANIFEST_EDIT_KEY = "manifest-verification-scope"
+PROOF_BASES = frozenset({"paper", "lean", "aligned", "supplied"})
+BASIS_LABELS = {
+    "paper": "Follows paper proof",
+    "lean": "Lean-only proof route",
+    "aligned": "Aligned paper & Lean proof",
+    "supplied": "Proof supplied outside manuscript",
+}
+SUPPLIED_BADGE = "Lean checked (proof supplied outside manuscript)"
+EDGE_GROUNDING_LABELS = {
+    "both": "Used in both paper & Lean proof",
+    "paper_only": "Paper-only dependency",
+    "lean_only": "Lean-only prerequisite",
+    "paper": "Paper dependency",
+}
 
 
 def esc(value):
@@ -378,6 +392,310 @@ def _is_undistilled(cid, work, profile, checked, is_conditional):
     return profile == "quick" and work.get("distilled") is not True
 
 
+def claim_basis(cid, note=None, work=None):
+    """Return validated TINA Two Homes proof basis ('paper', 'lean', 'aligned', 'supplied') or None."""
+    raw = None
+    if isinstance(work, dict) and "basis" in work:
+        raw = work["basis"]
+    elif isinstance(note, dict) and "basis" in note:
+        raw = note["basis"]
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or raw not in PROOF_BASES:
+        allowed = ", ".join(sorted(PROOF_BASES))
+        raise ValueError(f"{cid}: basis must be one of {allowed}")
+    return raw
+
+
+def extract_proof_metrics(audit):
+    """Extract kernel-recorded proof size metrics from an audit receipt, if present."""
+    if not isinstance(audit, dict):
+        return None
+    metrics = {}
+    for key in ("reachable_local_defs", "reachable_local_theorems", "checked_lean_loc"):
+        val = audit.get(key)
+        if type(val) is int and val >= 0:
+            metrics[key] = val
+    return metrics or None
+
+
+def supplement_anchor(cid):
+    """Deterministic HTML/Markdown anchor slug for a claim in dist/supplement.md."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(cid).casefold()).strip("-")
+    return slug or "claim"
+
+
+def ground_claim_dependencies(claims, records, paper_edges):
+    """Cross-reference kernel-extracted Lean constant closures against reader.json dependencies.
+
+    Classifies each claim-to-claim edge as:
+      - 'both': Used in both paper & Lean proof
+      - 'paper_only': Paper-only dependency (Lean proved independently)
+      - 'lean_only': Lean-only prerequisite (not listed in reader.json, transitively reduced)
+      - 'paper': Paper dependency whose target claim has no kernel-extracted proof closure yet
+    """
+    by_id = {c["id"]: c for c in claims}
+    rec_by_id = {rec["claim"]["id"]: rec for rec in records}
+    order = [c["id"] for c in claims]
+    order_idx = {cid: i for i, cid in enumerate(order)}
+
+    expected_to_cid = {}
+    decl_to_cid = {}
+    for rec in records:
+        cid = rec["claim"]["id"]
+        w = rec["work"]
+        audit = rec.get("audit") or {}
+        for holder in (w.get("closure"), w.get("assembly"), w.get("statement_check")):
+            if isinstance(holder, dict):
+                if holder.get("expected"):
+                    expected_to_cid.setdefault(holder["expected"], cid)
+                if holder.get("declaration"):
+                    decl_to_cid.setdefault(holder["declaration"], cid)
+        if audit.get("expected"):
+            expected_to_cid.setdefault(audit["expected"], cid)
+        if (audit.get("statement") or {}).get("expected"):
+            expected_to_cid.setdefault(audit["statement"]["expected"], cid)
+        if audit.get("declaration"):
+            decl_to_cid.setdefault(audit["declaration"], cid)
+        for part in w.get("subproofs", []):
+            if part.get("status") == "checked" and part.get("declaration"):
+                decl_to_cid.setdefault(part["declaration"], cid)
+
+    has_kernel_dag = {}
+    lean_prereqs = {cid: {} for cid in by_id}
+    for rec in records:
+        cid = rec["claim"]["id"]
+        audit = rec.get("audit") or {}
+        w = rec["work"]
+        is_proof_audited = bool(rec.get("checked") or rec.get("is_conditional"))
+        has_closure_fields = is_proof_audited and (
+            "used_local_theorems" in audit or "used_local_statements" in audit
+        )
+        has_kernel_dag[cid] = has_closure_fields
+        refs_by_prereq = {}
+
+        def add_ref(dep_cid, lean_name):
+            if not dep_cid or dep_cid == cid or dep_cid not in by_id:
+                return
+            refs_by_prereq.setdefault(dep_cid, set()).add(lean_name)
+
+        if is_proof_audited:
+            for thm in audit.get("used_local_theorems") or []:
+                add_ref(decl_to_cid.get(thm), thm)
+            for stmt in audit.get("used_local_statements") or []:
+                add_ref(expected_to_cid.get(stmt), stmt)
+            for assumed in audit.get("assumes") or []:
+                add_ref(expected_to_cid.get(assumed), assumed)
+            for assumed_cid in w.get("assumes") or []:
+                if assumed_cid in by_id and assumed_cid != cid:
+                    exp_name = None
+                    other_w = rec_by_id[assumed_cid]["work"]
+                    for holder in (other_w.get("closure"), other_w.get("assembly"), other_w.get("statement_check")):
+                        if isinstance(holder, dict) and holder.get("expected"):
+                            exp_name = holder["expected"]
+                            break
+                    add_ref(assumed_cid, exp_name or assumed_cid)
+        lean_prereqs[cid] = {k: sorted(v) for k, v in refs_by_prereq.items()}
+
+    def lean_reaches(start, target, forbidden):
+        visited = set()
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            if cur in visited or cur == forbidden:
+                continue
+            visited.add(cur)
+            for nxt in lean_prereqs.get(cur, ()):
+                if nxt == target:
+                    return True
+                if nxt not in visited:
+                    stack.append(nxt)
+        return False
+
+    grounded_edges = []
+    paper_pairs = set()
+    per_claim_edges = {cid: {"both": [], "paper_only": [], "lean_only": []} for cid in by_id}
+    counts = {"both": 0, "paper_only": 0, "lean_only": 0, "paper": 0}
+
+    for edge in paper_edges:
+        cid = edge["claim"]
+        prereq = edge["prerequisite"]
+        if cid not in by_id or prereq not in by_id:
+            continue
+        paper_pairs.add((cid, prereq))
+        refs = lean_prereqs.get(cid, {}).get(prereq)
+        if refs:
+            grounding = "both"
+            item = dict(edge, grounding="both", grounding_label=EDGE_GROUNDING_LABELS["both"], lean_refs=refs)
+            per_claim_edges[cid]["both"].append(dict(
+                id=prereq, reference=rec_by_id[prereq]["entry"]["reference"], lean_refs=refs,
+            ))
+        elif has_kernel_dag.get(cid):
+            grounding = "paper_only"
+            item = dict(edge, grounding="paper_only", grounding_label=EDGE_GROUNDING_LABELS["paper_only"])
+            per_claim_edges[cid]["paper_only"].append(dict(
+                id=prereq, reference=rec_by_id[prereq]["entry"]["reference"],
+            ))
+        else:
+            grounding = "paper"
+            item = dict(edge, grounding="paper", grounding_label=EDGE_GROUNDING_LABELS["paper"])
+        counts[grounding] += 1
+        grounded_edges.append(item)
+
+    # Emit transitively reduced Lean-only prerequisite edges not already in reader.json.
+    for cid in order:
+        prereq_map = lean_prereqs.get(cid, {})
+        extras = [p for p in prereq_map if (cid, p) not in paper_pairs]
+        extras.sort(key=lambda p: order_idx.get(p, len(order)))
+        for prereq in extras:
+            if any(mid != prereq and lean_reaches(mid, prereq, cid) for mid in prereq_map):
+                continue
+            refs = prereq_map[prereq]
+            reason = "Referenced in Lean proof via " + ", ".join(refs)
+            item = dict(
+                claim=cid,
+                prerequisite=prereq,
+                reason=reason,
+                grounding="lean_only",
+                grounding_label=EDGE_GROUNDING_LABELS["lean_only"],
+                lean_refs=refs,
+            )
+            counts["lean_only"] += 1
+            grounded_edges.append(item)
+            per_claim_edges[cid]["lean_only"].append(dict(
+                id=prereq, reference=rec_by_id[prereq]["entry"]["reference"], lean_refs=refs,
+            ))
+
+    per_claim = {}
+    for rec in records:
+        cid = rec["claim"]["id"]
+        audit = rec.get("audit") or {}
+        if has_kernel_dag.get(cid) or lean_prereqs.get(cid):
+            per_claim[cid] = dict(
+                used_local_theorems=list(audit.get("used_local_theorems") or []),
+                used_local_statements=list(audit.get("used_local_statements") or []),
+                both=per_claim_edges[cid]["both"],
+                paper_only=per_claim_edges[cid]["paper_only"],
+                lean_only=per_claim_edges[cid]["lean_only"],
+            )
+    return grounded_edges, per_claim, counts
+
+
+def render_supplement_markdown(project, records):
+    """Generate dist/supplement.md for claims whose proofs were supplied outside the manuscript."""
+    supplied = [rec for rec in records if rec.get("basis") == "supplied"]
+    if not supplied:
+        return None
+    lines = [
+        f"# Supplied Proofs Supplement — {project['title']}",
+        "",
+        f"- **Edition:** {project.get('edition', 'unspecified')}",
+    ]
+    if project.get("authors"):
+        lines.append(f"- **Authors:** {', '.join(project['authors'])}")
+    lines.extend([
+        "",
+        "> **Two Homes Provenance Note:** The claims collected in this supplement are stated in the manuscript "
+        "without a written proof (for example, unproved remarks, skipped steps, or omitted derivations). "
+        "Their proofs were supplied and checked in Lean outside the manuscript PDF so readers never mistake "
+        "a Lean-supplied argument for text present in the paper.",
+        "",
+        "## Summary of Supplied Proofs",
+        "",
+        "| Claim | Tier | Status | Lean declaration | Axiom profile | Statement SHA-256 |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+    ])
+    res_labels = {
+        "unconditionally_closed": SUPPLIED_BADGE,
+        "conditional": "Conditional (proof supplied outside manuscript)",
+        "subproofs_checked": "Subproofs checked (proof supplied outside manuscript)",
+        "open": "Open (proof supplied outside manuscript)",
+    }
+    for rec in supplied:
+        cid = rec["claim"]["id"]
+        anchor = supplement_anchor(cid)
+        ref = f"[{rec['entry']['reference']}](#{anchor}) (`{cid}`)"
+        decl = ((rec.get("audit") or {}).get("declaration")
+                or (rec["work"].get("closure") or {}).get("declaration")
+                or "—")
+        decl_cell = f"`{decl}`" if decl != "—" else "—"
+        ax = rec["rd"].get("axiom_profile") or "—"
+        sha = ((rec.get("audit") or {}).get("statement") or {}).get("sha256")
+        sha_cell = f"`{sha[:12]}`" if sha else "—"
+        lines.append(f"| {ref} | {rec['tier']} | {res_labels[rec['resolution']]} | {decl_cell} | {ax} | {sha_cell} |")
+
+    for rec in supplied:
+        c = rec["claim"]
+        cid = c["id"]
+        entry = rec["entry"]
+        audit = rec.get("audit") or {}
+        anchor = supplement_anchor(cid)
+        heading_text = (f"{entry['reference']} — {c['title']} (`{cid}`)"
+                        if c.get("title") and c["title"] != cid
+                        else f"{entry['reference']} (`{cid}`)")
+        lines.extend([
+            "",
+            f'<a id="{anchor}"></a>',
+            f"## {heading_text}",
+            "",
+            f"- **Manuscript source:** `{c['file']}`, line {c['line']}"
+            + (f" (PDF page {entry['page']})" if entry.get("page") else ""),
+            f"- **Verification badge:** {res_labels[rec['resolution']]}",
+            f"- **Proof basis:** `supplied` ({BASIS_LABELS['supplied']})",
+        ])
+        decl = audit.get("declaration") or (rec["work"].get("closure") or {}).get("declaration")
+        exp = audit.get("expected") or (rec["work"].get("closure") or {}).get("expected")
+        if decl:
+            lines.append(f"- **Lean declaration:** `{decl}`" + (f" (`{exp}`)" if exp else ""))
+        if rec["rd"].get("axiom_profile"):
+            lines.append(f"- **Axiom profile:** {rec['rd']['axiom_profile']}")
+        metrics = rec.get("proof_metrics")
+        if metrics:
+            bits = []
+            if "checked_lean_loc" in metrics:
+                bits.append(f"{metrics['checked_lean_loc']} checked Lean LoC")
+            if "reachable_local_defs" in metrics:
+                bits.append(f"{metrics['reachable_local_defs']} reachable local defs")
+            if "reachable_local_theorems" in metrics:
+                bits.append(f"{metrics['reachable_local_theorems']} reachable local theorems")
+            if bits:
+                lines.append(f"- **Proof size metrics:** {', '.join(bits)}")
+        if entry.get("scope"):
+            lines.append(f"- **Scope note:** {entry['scope']}")
+        lines.extend([
+            "",
+            "### Manuscript Passage",
+            "",
+            "```tex",
+            c["excerpt"].rstrip("\n"),
+            "```",
+            "",
+            "### Supplied Proof",
+            "",
+        ])
+        has_written = False
+        if entry.get("summary"):
+            lines.append(f"**Summary:** {entry['summary']}")
+            lines.append("")
+            has_written = True
+        if entry.get("sketch"):
+            lines.append(f"**Proof idea:** {entry['sketch']}")
+            lines.append("")
+            has_written = True
+        if entry.get("steps"):
+            lines.append(entry["steps"].rstrip("\n"))
+            lines.append("")
+            has_written = True
+        elif entry.get("structured"):
+            lines.append(entry["structured"].rstrip("\n"))
+            lines.append("")
+            has_written = True
+        if not has_written:
+            lines.append("_No prose or Lamport proof steps have been written yet; inspect the checked Lean proof declaration in the atlas._")
+            lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
 def _empty_bucket():
     return dict(
         total=0,
@@ -560,12 +878,16 @@ def build_refinement_backlog(project, records):
 
 def render_summary_table(summary, *, compact=False):
     """Render the headline vs. supporting vs. conjectures multi-resolution table."""
+    show_supplied = any(b["supplied_proof"] for b in summary.values())
+
     def row(label, b, extra_cls=""):
         cls = f' class="{extra_cls}"' if extra_cls else ""
+        supplied_td = f"<td>{b['supplied_proof']}</td>" if show_supplied else ""
         return (
             f"<tr{cls}><th scope=\"row\">{esc(label)}</th>"
             f"<td>{b['total']}</td>"
             f"<td>{b['unconditionally_closed']}</td>"
+            f"{supplied_td}"
             f"<td>{b['conditional']}</td>"
             f"<td>{b['subproofs_checked']}</td>"
             f"<td>{b['open']}</td>"
@@ -584,11 +906,12 @@ def render_summary_table(summary, *, compact=False):
         rows.append(row("Conjectures (separate)", summary["conjectures"], "summary-conjecture"))
     caption = ("Verification breakdown by claim tier" if not compact
                else "Headline vs. supporting verification summary")
+    supplied_th = "<th>Supplied proof</th>" if show_supplied else ""
     return (
         '<div class="summary-table">'
         f'<table><caption>{esc(caption)}</caption>'
         '<thead><tr><th>Category</th><th>Total</th><th>Unconditionally closed</th>'
-        '<th>Conditional</th><th>Subproofs checked</th><th>Open</th>'
+        f'{supplied_th}<th>Conditional</th><th>Subproofs checked</th><th>Open</th>'
         '<th>Witness</th><th>Needs confirmation</th><th>CI verified</th><th>Author reviewed</th></tr></thead>'
         '<tbody>' + "".join(rows) + '</tbody></table></div>'
     )
@@ -685,10 +1008,15 @@ def _collect_claim_states(root, project, claims, *, ci=None):
         w = work.get(cid, {})
         m = notes.get(cid, {})
         tier = claim_tier(c, m, w)
+        basis = claim_basis(cid, m, w)
         entry = {**c, **m, **w}
         entry.setdefault("reference", c["kind"].title())
         entry["tier"] = tier
         entry["headline"] = tier == "headline"
+        if basis is not None:
+            entry["basis"] = basis
+        if m.get("lamport"):
+            entry["steps"] = local(root, m["lamport"]).read_text(encoding="utf-8-sig")
 
         audit = None
         receipt_bytes = None
@@ -722,6 +1050,16 @@ def _collect_claim_states(root, project, claims, *, ci=None):
                 prereqs_by_cid[cid].add(dep)
 
         entry["hypotheses"] = (audit or {}).get("hypotheses")
+        metrics = extract_proof_metrics(audit)
+        if metrics:
+            entry["proof_metrics"] = metrics
+        undistilled = _is_undistilled(cid, w, profile, checked, is_conditional)
+        distilled = w.get("distilled") if isinstance(w.get("distilled"), bool) else None
+        if distilled is not None:
+            entry["distilled"] = distilled
+        if undistilled:
+            entry["undistilled"] = True
+        supp_url = f"supplement.md#{supplement_anchor(cid)}" if basis == "supplied" else ""
         subproofs = []
         for part in w.get("subproofs", []):
             state = part["status"]
@@ -736,6 +1074,8 @@ def _collect_claim_states(root, project, claims, *, ci=None):
             checked, statement_checked,
             conditional=is_conditional,
             assumes=[item["reference"] for item in assumed_items] if is_conditional else (),
+            basis=basis, proof_metrics=metrics, distilled=distilled, undistilled=undistilled,
+            supplement_url=supp_url,
         )
         rd["witness"] = reviews.witness_source(root, w, audit) if audit else None
         machine_verified = False
@@ -758,6 +1098,9 @@ def _collect_claim_states(root, project, claims, *, ci=None):
             rd=rd,
             audit=audit,
             tier=tier,
+            basis=basis,
+            proof_metrics=metrics,
+            distilled=distilled,
             resolution=res,
             checked=checked,
             is_conditional=is_conditional,
@@ -766,10 +1109,19 @@ def _collect_claim_states(root, project, claims, *, ci=None):
             assumed_items=assumed_items,
             unresolved_defaults=unresolved_defaults(rd),
             deferred_bridging_lemmas=_deferred_bridging_lemmas(cid, w),
-            undistilled=_is_undistilled(cid, w, profile, checked, is_conditional),
+            undistilled=undistilled,
             witness_plan=witness_plan(project, w, rd["witness"]) if tier != "conjecture" else None,
             machine_verified=machine_verified,
         ))
+
+    grounded_edges, per_claim_deps, _ = ground_claim_dependencies(claims, records, edges)
+    for edge in grounded_edges:
+        if edge["claim"] in prereqs_by_cid and edge["prerequisite"] in by_id:
+            prereqs_by_cid[edge["claim"]].add(edge["prerequisite"])
+    for rec in records:
+        cid = rec["claim"]["id"]
+        if cid in per_claim_deps:
+            rec["entry"]["lean_dependencies"] = per_claim_deps[cid]
 
     direct_confirm = {rec["claim"]["id"] for rec in records if rec["rd"].get("needs_author_confirmation")}
     order_ids = [rec["claim"]["id"] for rec in records]
@@ -1008,6 +1360,12 @@ def _render_manifest_latex(project, summary, caveats, backlog, pinned):
         coverage += f" ({conj['total']} conjecture{'s' if conj['total'] != 1 else ''} tracked separately)"
     coverage += "."
     sentences.append(coverage)
+    if a["supplied_proof"] or conj["supplied_proof"]:
+        total_supplied = a["supplied_proof"] + conj["supplied_proof"]
+        sentences.append(
+            f"For {total_supplied} claim{'s' if total_supplied != 1 else ''} stated without a complete manuscript proof, "
+            "Lean supplies the derivation outside the PDF (collected in \\texttt{supplement.md})."
+        )
 
     # Verification tier (CI vs local-only).
     if a["machine_verified"]:
@@ -1097,7 +1455,8 @@ def _render_manifest_latex(project, summary, caveats, backlog, pinned):
     return "\\paragraph{Formal Verification and Scope.}\n" + " ".join(sentences) + "\n"
 
 
-def _render_manifest_markdown(project, records, summary, caveats, backlog, pinned, latex_snippet):
+def _render_manifest_markdown(project, records, summary, caveats, backlog, pinned, latex_snippet,
+                              *, dag_grounding=None, has_supplement=False):
     """Deterministically generate dist/VERIFICATION.md."""
     profile = proof_work_profile(project)
     lines = [
@@ -1262,6 +1621,59 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
             f"| {ref} | {rec['tier']} | {state_labels[rec['resolution']]} | — | {ax} | {wit} | {sha_cell} |"
         )
 
+    supplied_recs = [rec for rec in records if rec.get("basis") == "supplied"]
+    if supplied_recs:
+        lines.extend([
+            "",
+            "## Supplied Proofs (Outside Manuscript)",
+            "",
+            "The following claims are stated in the manuscript without a written proof (or with skipped steps); "
+            "their Lean-checked proofs are supplied outside the manuscript PDF"
+            + (" and collected in [`supplement.md`](supplement.md)." if has_supplement else "."),
+            "",
+        ])
+        for rec in supplied_recs:
+            cid = rec["claim"]["id"]
+            ref = f"**{rec['entry']['reference']}** (`{cid}`)"
+            badge = (SUPPLIED_BADGE if rec["resolution"] == "unconditionally_closed"
+                     else f"{rec['resolution'].replace('_', ' ').title()} (proof supplied outside manuscript)")
+            decl = ((rec.get("audit") or {}).get("declaration")
+                    or (rec["work"].get("closure") or {}).get("declaration") or "")
+            decl_bit = f" — `{decl}`" if decl else ""
+            lines.append(f"- {ref} ({rec['tier']}) — {badge}{decl_bit}")
+
+    metrics_recs = [rec for rec in records if rec.get("proof_metrics") or rec.get("distilled") is not None]
+    if metrics_recs:
+        lines.extend([
+            "",
+            "## Proof Size & Distillation Metrics",
+            "",
+            "| Claim | Checked Lean LoC | Reachable local defs | Reachable local theorems | Distillation |",
+            "| :--- | :---: | :---: | :---: | :--- |",
+        ])
+        for rec in metrics_recs:
+            cid = rec["claim"]["id"]
+            ref = f"{rec['entry']['reference']} (`{cid}`)"
+            m = rec.get("proof_metrics") or {}
+            loc_cell = str(m["checked_lean_loc"]) if "checked_lean_loc" in m else "—"
+            defs_cell = str(m["reachable_local_defs"]) if "reachable_local_defs" in m else "—"
+            thms_cell = str(m["reachable_local_theorems"]) if "reachable_local_theorems" in m else "—"
+            dist_cell = ("Distilled" if rec.get("distilled") is True else
+                         "Exploratory (undistilled)" if rec.get("undistilled") else "—")
+            lines.append(f"| {ref} | {loc_cell} | {defs_cell} | {thms_cell} | {dist_cell} |")
+
+    if dag_grounding and any(dag_grounding.get(k) for k in ("both", "paper_only", "lean_only")):
+        lines.extend([
+            "",
+            "## Kernel-Extracted Dependency Grounding",
+            "",
+            f"- **Used in both paper & Lean proof:** {dag_grounding.get('both', 0)}",
+            f"- **Paper-only dependency (Lean proved independently):** {dag_grounding.get('paper_only', 0)}",
+            f"- **Lean-only prerequisite:** {dag_grounding.get('lean_only', 0)}",
+        ])
+        if dag_grounding.get("paper"):
+            lines.append(f"- **Paper dependency (Lean proof not yet audited):** {dag_grounding['paper']}")
+
     lines.extend([
         "",
         "## Paste-Ready LaTeX Snippet",
@@ -1294,17 +1706,29 @@ def manifest(root, *, ci_receipt=None, commit=None, write=True, propose_edit=Fal
                 ci = github_verification(project, receipt, commit or data.get("commit"))
             except (OSError, ValueError):
                 ci = None
+    materials = json.loads(local(root, project["reader"]).read_text(encoding="utf-8-sig")) if project.get("reader") else {}
+    paper_edges = materials.get("dependencies", [])
     records = _collect_claim_states(root, project, claims, ci=ci)
+    _, _, dag_grounding = ground_claim_dependencies(claims, records, paper_edges)
     summary = summarize_records(records)
     backlog = build_refinement_backlog(project, records)
     caveats = _collect_scope_caveats(records)
     pinned = _collect_pinned_metadata(root, project, records, ci)
+    supplement_md = render_supplement_markdown(project, records)
     latex_snippet = _render_manifest_latex(project, summary, caveats, backlog, pinned)
-    markdown = _render_manifest_markdown(project, records, summary, caveats, backlog, pinned, latex_snippet)
+    markdown = _render_manifest_markdown(
+        project, records, summary, caveats, backlog, pinned, latex_snippet,
+        dag_grounding=dag_grounding, has_supplement=supplement_md is not None,
+    )
     md_path = root / "dist" / "VERIFICATION.md"
+    supp_path = root / "dist" / "supplement.md"
     if write:
         md_path.parent.mkdir(parents=True, exist_ok=True)
         atomic(md_path, markdown.encode("utf-8"))
+        if supplement_md is not None:
+            atomic(supp_path, supplement_md.encode("utf-8"))
+        elif supp_path.exists():
+            supp_path.unlink()
     edit_result = None
     if propose_edit:
         reason = edit_reason or (
@@ -1326,6 +1750,9 @@ def manifest(root, *, ci_receipt=None, commit=None, write=True, propose_edit=Fal
         markdown_path=str(md_path),
         markdown=markdown,
         latex=latex_snippet,
+        supplement_path=str(supp_path) if supplement_md is not None else None,
+        supplement=supplement_md,
+        dag_grounding=dag_grounding,
         summary=summary,
         caveats=caveats,
         backlog=backlog,
@@ -1778,12 +2205,15 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         w = work.get(cid, {})
         m = notes.get(cid, {})
         tier = claim_tier(c, m, w)
+        basis = claim_basis(cid, m, w)
         status = w.get("status", "open")
         if status not in {"open", "drafted", "blocked", "attempted", "conditional", "closed"}:
             raise ValueError(f"{cid}: unsupported checkpoint status {status}")
         entry = {**c, **m, **w}
         entry["tier"] = tier
         entry["headline"] = tier == "headline"
+        if basis is not None:
+            entry["basis"] = basis
         audit = None
         receipt = None
         assumed_items = []
@@ -1840,10 +2270,22 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
             except (ValueError, OSError):
                 statement_audit = None
         active_audit = audit if (checked or is_conditional) else statement_audit
+        metrics = extract_proof_metrics(active_audit)
+        if metrics:
+            entry["proof_metrics"] = metrics
+        undistilled = _is_undistilled(cid, w, profile, checked, is_conditional)
+        distilled = w.get("distilled") if isinstance(w.get("distilled"), bool) else None
+        if distilled is not None:
+            entry["distilled"] = distilled
+        if undistilled:
+            entry["undistilled"] = True
+        supp_url = f"supplement.md#{supplement_anchor(cid)}" if basis == "supplied" else ""
         rd = reviews.packet(root,p,c,w,active_audit,comparisons.get(cid),reviews.history(root,cid),
                             checked,statement_checked,
                             conditional=is_conditional,
-                            assumes=[item["reference"] for item in assumed_items] if is_conditional else ())
+                            assumes=[item["reference"] for item in assumed_items] if is_conditional else (),
+                            basis=basis, proof_metrics=metrics, distilled=distilled,
+                            undistilled=undistilled, supplement_url=supp_url)
         rd["page"] = entry.get("page")
         rd["sources"] = reviews.exact_sources(root,w,active_audit) if active_audit else []
         rd["witness"] = reviews.witness_source(root,w,active_audit) if active_audit else None
@@ -1891,16 +2333,21 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         bridging = _deferred_bridging_lemmas(cid, w)
         if bridging:
             entry["deferred_bridging_lemmas"] = bridging
-        undistilled = _is_undistilled(cid, w, profile, checked, is_conditional)
-        if undistilled:
-            entry["undistilled"] = True
+        checked_label = SUPPLIED_BADGE if basis == "supplied" else "Lean checked"
         cond_label = f"Conditional (assumes {', '.join(item['reference'] for item in assumed_items)})"
+        if basis == "supplied":
+            cond_label += " · proof supplied outside manuscript"
         label = ("Open conjecture" if c["kind"] == "conjecture" and status == "open" else
-                 "Lean checked" if checked else "Awaiting Lean recheck" if changed else
+                 checked_label if checked else "Awaiting Lean recheck" if changed else
                  cond_label if is_conditional else
                  "Subproofs checked" if has_parts else
                  "Statement drafted (proof in progress)" if statement_checked else "No completed Lean check")
         verification = {"label": label}
+        if basis is not None:
+            verification["basis"] = basis
+        if basis == "supplied":
+            verification["supplied"] = True
+            verification["supplement_url"] = supp_url
         if is_conditional:
             verification["conditional"] = True
             verification["assumes"] = assumed_items
@@ -1944,7 +2391,9 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         entries.append(entry)
         built_records.append(dict(
             claim=c, entry=entry, work=w, note=m, rd=rd, audit=active_audit,
-            tier=tier, resolution=res, checked=checked, is_conditional=is_conditional,
+            tier=tier, basis=basis, proof_metrics=metrics, distilled=distilled,
+            supplement_url=supp_url,
+            resolution=res, checked=checked, is_conditional=is_conditional,
             has_parts=has_parts, changed=bool(changed), assumed_items=assumed_items,
             unresolved_defaults=unres_defaults, deferred_bridging_lemmas=bridging,
             undistilled=undistilled,
@@ -1952,6 +2401,23 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
             machine_verified="evidence" in verification,
             label=label,
         ))
+
+    # Cross-reference kernel-extracted Lean constant closures against reader.json dependencies.
+    grounded_edges, per_claim_deps, dag_grounding = ground_claim_dependencies(claims, built_records, edges)
+    for edge in grounded_edges:
+        prereqs_by_cid[edge["claim"]].add(edge["prerequisite"])
+    for rec in built_records:
+        cid = rec["claim"]["id"]
+        if cid in per_claim_deps:
+            rec["entry"]["lean_dependencies"] = per_claim_deps[cid]
+
+    # Generate dist/supplement.md whenever any claim carries basis='supplied'.
+    supplement_md = render_supplement_markdown(p, built_records)
+    supp_path = output / "supplement.md"
+    if supplement_md is not None:
+        atomic(supp_path, supplement_md.encode("utf-8"))
+    elif supp_path.exists():
+        supp_path.unlink()
 
     # Propagate Needs author confirmation from unattended quick-mode readings to transitive dependents.
     direct_confirm = {rd["id"] for rd in review_entries if rd.get("needs_author_confirmation")}
@@ -1985,12 +2451,18 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         url = "proofs/index.html#/claim/" + quote(cid, safe="")
         target = ' <strong class="proof-target">Current proof target</strong>' if cid == p.get("focus") else ''
         badge = f' · <a href="{url}?view=lean">{esc(label)}</a>'
+        if rec["basis"] == "supplied" and rec["supplement_url"]:
+            badge += f' · <a href="{esc(rec["supplement_url"])}">Supplied proof</a>'
         if (checked or is_conditional) and not entry.get("hypotheses"):
             badge += f' · {NO_EXAMPLE}'
         if rec["unresolved_defaults"]:
             badge += f' · <a href="{reviews.review_url(cid)}">Unresolved default-value flag ({len(rec["unresolved_defaults"])})</a>'
         if rec["undistilled"]:
             badge += ' · Exploratory proof (undistilled)'
+        elif rec["distilled"] is True and (checked or is_conditional):
+            badge += ' · Distilled'
+        if rec["proof_metrics"] and "checked_lean_loc" in rec["proof_metrics"]:
+            badge += f' · {rec["proof_metrics"]["checked_lean_loc"]} LoC'
         if rd.get("needs_author_confirmation"):
             badge += f' · <a href="{reviews.review_url(cid)}"><strong>Needs author confirmation</strong></a>'
         elif via_items:
@@ -2027,7 +2499,10 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
     caveats = _collect_scope_caveats(built_records)
     pinned = _collect_pinned_metadata(root, p, built_records, ci)
     latex_snippet = _render_manifest_latex(p, summary, caveats, backlog, pinned)
-    verification_md = _render_manifest_markdown(p, built_records, summary, caveats, backlog, pinned, latex_snippet)
+    verification_md = _render_manifest_markdown(
+        p, built_records, summary, caveats, backlog, pinned, latex_snippet,
+        dag_grounding=dag_grounding, has_supplement=supplement_md is not None,
+    )
     atomic(output / "VERIFICATION.md", verification_md.encode("utf-8"))
     sources = edition_links(p)
     folio = p.get("folio", {})
@@ -2061,18 +2536,21 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
     atomic(output/"guide.html", review_web.document("How to use this atlas","".join(sections),"./"))
     summary_html = render_summary_table(summary)
     backlog_html = render_backlog_section(backlog)
+    supp_link = ' · <a href="supplement.md">Supplied proofs supplement</a>' if supplement_md is not None else ""
     dashboard = (
         heading
         + f'<section id="claim-inventory" data-feed="{esc(feed)}"><h2>Claim inventory</h2>'
         + f'<p><strong>Authorized proof work</strong><br>{esc(scope)}</p>'
-        + '<p><a href="guide.html">How to use this atlas</a> · <a href="review.html">Review queue</a> · <a href="VERIFICATION.md">Verification manifest</a></p>'
+        + f'<p><a href="guide.html">How to use this atlas</a> · <a href="review.html">Review queue</a> · <a href="VERIFICATION.md">Verification manifest</a>{supp_link}</p>'
         + f'<p>{closed_results} of {total_results} stated results closed{pending}</p>'
         + summary_html
         + backlog_html
         + '<ol>' + "".join(rows) + '</ol></section>' + active
     )
-    payload = dict(title=p["title"], focus=focus, claims=entries, dependencies=edges,
-                   macros=materials.get("macros", {}), summary=summary, backlog=backlog)
+    payload = dict(title=p["title"], focus=focus, claims=entries, dependencies=grounded_edges,
+                   dag_grounding=dag_grounding,
+                   macros=materials.get("macros", {}), summary=summary, backlog=backlog,
+                   **({"supplement": "supplement.md"} if supplement_md is not None else {}))
     template = (assets / "explorer.html").read_text(encoding="utf-8-sig")
     packed = json.dumps(payload, ensure_ascii=False)
     first = focus or folio.get("featured_claim") or (entries[0]["id"] if entries else "")
@@ -2085,6 +2563,8 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         mark = (f'<a class="verified-badge" href="{esc(v["url"])}">✓ {esc(v["remote"])}</a>'
                 if v.get("evidence") else f'<a class="status" href="{link}?view=lean">{esc(v["label"])}</a>')
         extras = []
+        if v.get("evidence") and v.get("supplied"):
+            extras.append(f'<a class="status" href="{esc(v.get("supplement_url", "supplement.md"))}">Proof supplied outside manuscript</a>')
         if v.get("needs_author_confirmation"):
             extras.append(f'<a class="status" href="{esc(v["review_url"])}">Needs author confirmation</a>')
         elif v.get("needs_author_confirmation_via"):

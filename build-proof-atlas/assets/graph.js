@@ -2,6 +2,12 @@
 // Dagre handles branching, disconnected components and cyclic input. Positions are
 // computed from the recorded relationships; paper-specific geometry is unnecessary.
 const graphState = {chainOnly:false, camera:null, autoFit:true, layoutKey:"", resize:null};
+const EDGE_GROUNDING_LABELS = {
+  both: "Used in both paper & Lean proof",
+  paper_only: "Paper-only dependency",
+  lean_only: "Lean-only prerequisite",
+  paper: "Paper dependency",
+};
 
 function graphSVG(tag, attrs={}) {
   const n=document.createElementNS("http://www.w3.org/2000/svg",tag);
@@ -102,9 +108,13 @@ function graphView(selected) {
   edges.forEach((e,i)=>{
     const kind=(up.has(e.prerequisite)||e.prerequisite===selected.id) && (up.has(e.claim)||e.claim===selected.id)?"ancestor":
       (down.has(e.prerequisite)||e.prerequisite===selected.id) && (down.has(e.claim)||e.claim===selected.id)?"descendant":"other";
-    const path=graphSVG("path",{class:"graph-edge "+kind,d:smoothEdge(graph.edge(e.prerequisite,e.claim,String(i)).points),
+    const grounding=e.grounding||"paper";
+    const path=graphSVG("path",{class:"graph-edge "+kind+" grounding-"+grounding,d:smoothEdge(graph.edge(e.prerequisite,e.claim,String(i)).points),
       "marker-end":"url("+docURL+"#arrow-"+kind+")"});
-    const tip=graphSVG("title");tip.textContent=e.reason;path.append(tip);svg.append(path);
+    const tip=graphSVG("title");
+    const gLabel=e.grounding_label||EDGE_GROUNDING_LABELS[grounding];
+    tip.textContent=(grounding!=="paper"&&gLabel?gLabel+" — ":"")+e.reason;
+    path.append(tip);svg.append(path);
   });
   for(const c of shown){
     const g=graph.node(c.id);
@@ -179,6 +189,16 @@ function graphView(selected) {
   for(const [label,key] of [["Selected","selected"],["Prerequisite","ancestor"],["Uses selected claim","descendant"]]){
     const item=el("span",label);item.prepend(el("i",null,key));legend.append(item);
   }
+  const hasGrounding=edges.some(e=>e.grounding==="both"||e.grounding==="paper_only"||e.grounding==="lean_only");
+  if(hasGrounding){
+    for(const [label,key] of [
+      ["Used in both paper & Lean proof","edge-swatch grounding-both"],
+      ["Paper-only dependency","edge-swatch grounding-paper_only"],
+      ["Lean-only prerequisite","edge-swatch grounding-lean_only"],
+    ]){
+      const item=el("span",label);item.prepend(el("i",null,key));legend.append(item);
+    }
+  }
   board.append(legend);
   main.append(el("p","Arrows run from a prerequisite to the result that uses it."+
     (isolated.length?" Claims without arrows have no recorded dependencies or dependents.":""),"graph-caption"));
@@ -189,7 +209,13 @@ function graphView(selected) {
     const items=relations(selected,reverse);section.append(el("h4",label+" ("+items.length+")"));
     for(const e of items){
       const c=claims.get(reverse?e.claim:e.prerequisite);
-      section.append(link(c.reference+" · "+c.title,route(c.id,"english",true)),el("p",e.reason));
+      const row=el("div",null,"graph-edge-item");
+      row.append(link(c.reference+" · "+c.title,route(c.id,"english",true)));
+      if(e.grounding && e.grounding!=="paper"){
+        row.append(el("span",e.grounding_label||EDGE_GROUNDING_LABELS[e.grounding]||e.grounding,"edge-grounding grounding-"+e.grounding));
+      }
+      row.append(el("p",e.reason));
+      section.append(row);
     }
     if(!items.length)section.append(el("p","No recorded links."));
     inspector.append(section);

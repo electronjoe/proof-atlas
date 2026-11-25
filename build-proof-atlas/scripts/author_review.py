@@ -78,7 +78,8 @@ def history(root, cid):
 
 
 def packet(root, project, claim, work, audit, comparison, events, checked, statement_checked=False,
-           *, conditional=False, assumes=()):
+           *, conditional=False, assumes=(), basis=None, proof_metrics=None,
+           distilled=None, undistilled=False, supplement_url=""):
     from atlas import statement_defaults
     from audit_lean import axiom_profile as format_axiom_profile
     has_audit = bool(checked or conditional or statement_checked)
@@ -170,6 +171,9 @@ def packet(root, project, claim, work, audit, comparison, events, checked, state
                 axiom_profile=axiom_prof, external_packages=ext_pkgs, noncomputable_constants=noncomp,
                 checked=checked, conditional=bool(conditional), assumes=list(assumes),
                 statement_checked=has_audit,
+                basis=basis, proof_metrics=proof_metrics,
+                distilled=distilled, undistilled=bool(undistilled),
+                supplement_url=supplement_url,
                 approved=approved, preapproved=preapproved, disputed=disputed,
                 needs_author_confirmation=needs_author_confirmation,
                 needs_author_confirmation_via=[],
@@ -227,13 +231,19 @@ def witness_source(root, work, audit):
 
 
 def get_packet(root, cid):
-    from atlas import current_statement_audit, manuscript_claims, read_source, local
+    from atlas import (
+        _is_undistilled, claim_basis, current_statement_audit, extract_proof_metrics,
+        local, manuscript_claims, proof_work_profile, read_source, supplement_anchor,
+    )
     project = read(root/"project.json", {})
     read_source(root,project["pdf"])
     claim = next((c for c in manuscript_claims(root,project) if c["id"]==cid), None)
     if claim is None:
         raise ValueError("Unknown claim")
     work = project.get("work", {}).get(cid, {})
+    reader = read(local(root,project["reader"]), {}) if project.get("reader") else {}
+    note = reader.get("claims", {}).get(cid, {})
+    basis = claim_basis(cid, note, work)
     audit = None
     checked = False
     conditional = False
@@ -249,10 +259,15 @@ def get_packet(root, cid):
         except (ValueError, OSError):
             pass
     comp = read(root/"comparisons.json", {}).get(cid)
+    profile = proof_work_profile(project)
+    undistilled = _is_undistilled(cid, work, profile, checked, conditional)
+    distilled = work.get("distilled") if isinstance(work.get("distilled"), bool) else None
+    metrics = extract_proof_metrics(audit)
+    supp_url = f"supplement.md#{supplement_anchor(cid)}" if basis == "supplied" else ""
     data = packet(root,project,claim,work,audit,comp,history(root,cid),checked,statement_checked,
-                  conditional=conditional,assumes=assumes)
-    reader = read(local(root,project["reader"]), {}) if project.get("reader") else {}
-    data["page"] = work.get("page") or reader.get("claims",{}).get(cid,{}).get("page")
+                  conditional=conditional,assumes=assumes,basis=basis,proof_metrics=metrics,
+                  distilled=distilled,undistilled=undistilled,supplement_url=supp_url)
+    data["page"] = work.get("page") or note.get("page")
     data["sources"] = exact_sources(root,work,audit)
     data["witness"] = witness_source(root,work,audit)
     return data

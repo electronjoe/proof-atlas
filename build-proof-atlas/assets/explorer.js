@@ -2,6 +2,12 @@
 const data = JSON.parse(document.querySelector("#atlas-data").textContent);
 const claims = new Map(data.claims.map(c => [c.id,c]));
 const views = {english:"Plain English", paper:"Paper", lamport:"Lamport proof", lean:"Lean"};
+const basisLabels = {
+  paper: "Follows paper proof",
+  lean: "Lean-only proof route",
+  aligned: "Aligned paper & Lean proof",
+  supplied: "Proof supplied outside manuscript",
+};
 const pane = document.querySelector("#content");
 function el(tag, text, cls) {
   const node = document.createElement(tag);
@@ -53,8 +59,10 @@ function fillList(selected) {
     if (!(c.reference+" "+c.title+" "+c.id+" "+(c.tier||"")+" "+tLabel).toLowerCase().includes(term)) continue;
     const a=link("",route(c.id),"claim-choice");
     a.append(el("small",c.reference+" · "+tLabel),el("span",c.title));
-    if(c.verification.evidence) a.append(el("small","✓ Machine verified on GitHub","verified-badge"));
-    else a.append(el("small", [c.verification.label, c.verification.remote].filter(Boolean).join(" · ")));
+    if(c.verification.evidence) {
+      a.append(el("small","✓ Machine verified on GitHub","verified-badge"));
+      if(c.verification.supplied) a.append(el("small","Proof supplied outside manuscript"));
+    } else a.append(el("small", [c.verification.label, c.verification.remote].filter(Boolean).join(" · ")));
     if(c.verification.needs_author_confirmation || c.verification.needs_author_confirmation_via?.length) a.append(el("small","Needs author confirmation"));
     if(c.verification.approval) a.append(el("small",c.verification.approval,c.verification.approved?"approval approved":"approval"));
     if(c.id===selected) a.setAttribute("aria-current","page");
@@ -75,6 +83,13 @@ function proofView(c,view) {
       note.append(el("strong",title),el("p",v[key]));
       pane.append(note);
     }
+  }
+  if(c.basis==="supplied"){
+    const note=el("aside",null,"scope-note");
+    const p=el("p","This claim is stated in the manuscript without a complete proof (for example, an unproved remark or skipped step). Lean supplies the checked argument outside the PDF. ");
+    p.append(link("Open supplement.md", v.supplement_url || "supplement.md"));
+    note.append(el("strong","Proof supplied outside manuscript"), p);
+    pane.append(note);
   }
   if(v.needs_author_confirmation){
     const note=el("aside",null,"scope-note");
@@ -138,6 +153,11 @@ function proofView(c,view) {
       }
     }
   } else if(view==="lamport"){
+    if(c.basis){
+      const bLine=el("p","Proof basis: "+(basisLabels[c.basis]||c.basis)+(c.basis==="supplied"?" · ":""),"muted");
+      if(c.basis==="supplied") bLine.append(link("Read in supplement.md", v.supplement_url || "supplement.md"));
+      pane.append(bLine);
+    }
     if(c.steps){
       pane.append(el("p",c.origin || "Structured proof","muted"));
       if(c.source_url && /^https?:\/\//.test(c.source_url)) pane.append(link("Source companion and mapping ledger",c.source_url));
@@ -207,6 +227,51 @@ function proofView(c,view) {
     } else if(c.audit_log) pane.append(el("p","No checked example shows the hypotheses can hold.","muted"));
     if(c.undistilled){
       pane.append(el("p","Exploratory proof (undistilled). Factor reusable glue into Routine/ and mark distilled once refined.","muted"));
+    } else if(c.distilled===true){
+      pane.append(el("p","Distilled proof (factored into Routine/ with clean paper-statement target).","muted"));
+    }
+    if(c.basis){
+      const bNote=el("p","Proof basis: "+(basisLabels[c.basis]||c.basis)+(c.basis==="supplied"?" · ":""),"muted");
+      if(c.basis==="supplied") bNote.append(link("Open supplement.md", v.supplement_url || "supplement.md"));
+      pane.append(bNote);
+    }
+    if(c.proof_metrics){
+      const m=c.proof_metrics, bits=[];
+      if(m.checked_lean_loc!==undefined) bits.push(m.checked_lean_loc+" checked Lean LoC");
+      if(m.reachable_local_defs!==undefined) bits.push(m.reachable_local_defs+" reachable local defs");
+      if(m.reachable_local_theorems!==undefined) bits.push(m.reachable_local_theorems+" reachable local theorems");
+      if(bits.length) pane.append(el("p","Proof size: "+bits.join(" · "),"muted"));
+    }
+    if(c.lean_dependencies){
+      const ld=c.lean_dependencies;
+      const groups=[
+        ["Used in both paper & Lean proof", ld.both||[]],
+        ["Paper-only dependency (Lean proved independently)", ld.paper_only||[]],
+        ["Lean-only prerequisite", ld.lean_only||[]],
+      ].filter(([,items])=>items.length);
+      if(groups.length || (ld.used_local_theorems||[]).length || (ld.used_local_statements||[]).length){
+        pane.append(el("h3","Kernel-extracted Lean dependencies"));
+        for(const [heading, items] of groups){
+          const p=el("p",heading+": ","muted");
+          items.forEach((dep,idx)=>{
+            if(idx) p.append(document.createTextNode(", "));
+            p.append(dep.id && claims.has(dep.id) ? link(dep.reference, route(dep.id)) : document.createTextNode(dep.reference));
+            if(dep.lean_refs?.length) p.append(document.createTextNode(" ("), el("code", dep.lean_refs.join(", ")), document.createTextNode(")"));
+          });
+          pane.append(p);
+        }
+        if((ld.used_local_theorems||[]).length || (ld.used_local_statements||[]).length){
+          const details=el("details");
+          details.append(el("summary","Reachable local Lean theorems & .Statement constants"));
+          if(ld.used_local_theorems?.length){
+            details.append(el("p","Local theorems ("+ld.used_local_theorems.length+"): "+ld.used_local_theorems.join(", "),"muted"));
+          }
+          if(ld.used_local_statements?.length){
+            details.append(el("p","Statement constants ("+ld.used_local_statements.length+"): "+ld.used_local_statements.join(", "),"muted"));
+          }
+          pane.append(details);
+        }
+      }
     }
     if(c.deferred_bridging_lemmas?.length){
       pane.append(el("h3","Deferred Mathlib bridging lemmas"));
