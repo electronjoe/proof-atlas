@@ -1,9 +1,27 @@
 # Proof Atlas Skill Revision Plan: Addressing AI-Lean Verification Risks in Engineering & Applied Theory
 
 **Authors / Reviewers:** Scott Moeller & Bhaskar Krishnamachari  
-**Date:** November 22, 2026  
-**Baseline:** `proof-atlas` `main` (`build-proof-atlas` v0.10.0, incorporating PRs #1, #2, #3, #6) + Open PRs [#4](https://github.com/ANRGUSC/proof-atlas/pull/4) (`hypothesis-examples`) and [#5](https://github.com/ANRGUSC/proof-atlas/pull/5) (`default-value-scan`)  
+**Date:** November 22, 2026 *(Progress updated November 26, 2026)*  
+**Original RFC Baseline:** `proof-atlas` `main` (`build-proof-atlas` v0.10.0, PRs #1, #2, #3, #6) + Open PRs [#4](https://github.com/ANRGUSC/proof-atlas/pull/4) and [#5](https://github.com/ANRGUSC/proof-atlas/pull/5)  
+**Current Integration Branch (`skill-v2`):** Based on `upstream/main` (`ed1f562`, PRs #1–#8 merged) + integrated open PRs [#9](https://github.com/ANRGUSC/proof-atlas/pull/9) (`phase-2a-semantic-auditing`) and [#10](https://github.com/ANRGUSC/proof-atlas/pull/10) (`phase-2b-static-hygiene`)  
 **Companion Evidence Base:** `survey-lean-proofs-eng-arxiv` (`proof-methods.md` 12-mode taxonomy + Nov 1–19, 2026 empirical survey of 3,160 arXiv preprints across `cs.DC`, `cs.NI`, `cs.IT`, `eess.SY`, `cs.CR`, `cs.RO`)
+
+---
+
+## Implementation Progress Tracker
+
+| Milestone | Scope | Upstream PR(s) | Status (as of Nov 26, 2026) |
+| :--- | :--- | :--- | :--- |
+| **RFC Sign-Off** | Phased revision plan & baseline design decisions | [#7](https://github.com/ANRGUSC/proof-atlas/pull/7) | **Merged** (`upstream/main`) |
+| **Phase 0** | Hypothesis witnesses (`--witness`), default-value scan (`defaults`), engineering totalizations (`ENNReal`, `Matrix.inv`, `condExp`, `invFun`), non-degenerate witness guidance, witness preferences & per-finding default assessments | [#4](https://github.com/ANRGUSC/proof-atlas/pull/4), [#5](https://github.com/ANRGUSC/proof-atlas/pull/5) | **Merged** (`upstream/main`) |
+| **Phase 1** | Pre-proof Gate 1 spec-lock (`audit_lean.py --statement-only`), pre-closure correspondence & review carryover, author choice on pre-proof ambiguities | [#8](https://github.com/ANRGUSC/proof-atlas/pull/8) | **Merged** (`upstream/main`) |
+| **Phase 2a** | Clause-enumerated blind comparison (`C1, C2, …`), skeptical-referee subagent guidance, `weaker conclusion` kind (cannot match), `noncomputable` + `pp.notation false` + `external_packages` + `axiom_profile` metadata, Mathlib-first & bridging-lemma rule | [#9](https://github.com/ANRGUSC/proof-atlas/pull/9) | **Open upstream · Integrated on `skill-v2`** |
+| **Phase 2b** | Pre-build static hygiene scanner blocking metaprogramming/escape hatches (`unsafe`, `@[implemented_by]`/`@[extern]`/`@[csimp]`, `#eval`, `run_cmd`, `elab`/`macro`) and custom notation in `Statements/` | [#10](https://github.com/ANRGUSC/proof-atlas/pull/10) | **Open upstream · Integrated on `skill-v2`** |
+| **Pilot Validation** | Dogfood Phases 0–2 (`skill-v2`) on `markov-block-hierarchy-proof-atlas` + compact surveyed `eess.SY`/`cs.IT` paper | — | **Next** |
+| **Phase 4** | Headline-vs.-supporting claim rollup + `atlas.py manifest` LaTeX/MD scope generator | — | **Not started** (P1/P2) |
+| **Phase 3** | Kernel-extracted claim DAG edges (`used_local_theorems`), `lamport` provenance (`basis`), size metrics & distillation pass | — | **Not started** (P2) |
+| **Phase 5** | Opt-in `"paranoid"` multi-kernel / `Comparator` / `lean4checker` GitHub CI tier | — | **Not started** (P2) |
+| **Phase 6** | Batched package build & verification (`audit_batch`) in `verify_ci.py` | — | **Not started** (P2) |
 
 ---
 
@@ -227,15 +245,15 @@ flowchart LR
 
 ## 5. Summary Prioritization & Effort Matrix
 
-| Phase | Focus | Primary Layers / Modes | Touches | Est. Scope | Recommended Priority |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Phase 0** | Merge PRs #4 & #5 + `ENNReal.toReal`/`Matrix.inv` defaults + non-degenerate witness rule | Layer A (`Mode #4`) | `audit_lean.py`, `SKILL.md`, `correspondence.md`, `atlas.py` | Small | **Immediate (P0)** |
-| **Phase 1** | Pre-proof `Gate 1` (`--statement-only` + pre-closure `compare` & `review`, author chooses when to resolve ambiguities) | Layer A (`Mode #1`), `P1 → P4` | `audit_lean.py`, `author_review.py`, `atlas.py`, `review_web.py`, `SKILL.md` | Medium | **High (P1)** |
-| **Phase 2** | Clause-enumerated blind diff, `weaker conclusion` kind + open algorithmic obligations, `noncomputable` & external-pkg flags, `pp.notation false`, Mathlib bridging rule, static escape-hatch & custom-notation ban | Layer A (`Modes #1, #2, #3`), Layer B (`Modes #5, #6, #7`) | `correspondence.md`, `SKILL.md`, `author_review.py`, `audit_lean.py`, `atlas.py` | Medium | **High (P1)** |
-| **Phase 4** | Headline-vs.-lemma rollup + `atlas.py manifest` LaTeX/MD scope generator (Lean + prose only) | Layer A/C (`Modes #2, #12`) | `atlas.py`, `explorer.html`, `SKILL.md` | Small–Med | **High (P1/P2)** |
-| **Phase 3** | Kernel-extracted claim DAG edges + `lamport` provenance + distillation pass | Layer C (`Mode #10`), Type (i)/(ii) | `audit_lean.py`, `atlas.py`, `graph.js`, `SKILL.md` | Medium | **Medium (P2)** |
-| **Phase 5** | Opt-in `paranoid` (`Comparator`/multi-kernel) GitHub CI tier | Layer B (`Mode #8`) | `hosting.py`, `verify_ci.py`, `verify-lean.yml` | Med–Large | **Medium (P2)** |
-| **Phase 6** | Batched package build & verification in `verify_ci.py` | Layer C (`Mode #11`) | `audit_lean.py`, `verify_ci.py` | Small–Med | **Medium (P2 — before first >50k LoC atlas)** |
+| Phase | Focus | Primary Layers / Modes | Touches | Est. Scope | Recommended Priority | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Phase 0** | Merge PRs #4 & #5 + `ENNReal.toReal`/`Matrix.inv` defaults + non-degenerate witness rule | Layer A (`Mode #4`) | `audit_lean.py`, `SKILL.md`, `correspondence.md`, `atlas.py` | Small | **Immediate (P0)** | **Merged** ([#4](https://github.com/ANRGUSC/proof-atlas/pull/4), [#5](https://github.com/ANRGUSC/proof-atlas/pull/5)) |
+| **Phase 1** | Pre-proof `Gate 1` (`--statement-only` + pre-closure `compare` & `review`, author chooses when to resolve ambiguities) | Layer A (`Mode #1`), `P1 → P4` | `audit_lean.py`, `author_review.py`, `atlas.py`, `review_web.py`, `SKILL.md` | Medium | **High (P1)** | **Merged** ([#8](https://github.com/ANRGUSC/proof-atlas/pull/8)) |
+| **Phase 2** | Clause-enumerated blind diff, `weaker conclusion` kind + open algorithmic obligations, `noncomputable` & external-pkg flags, `pp.notation false`, Mathlib bridging rule, static escape-hatch & custom-notation ban | Layer A (`Modes #1, #2, #3`), Layer B (`Modes #5, #6, #7`) | `correspondence.md`, `SKILL.md`, `author_review.py`, `audit_lean.py`, `atlas.py` | Medium | **High (P1)** | **Open upstream · on `skill-v2`** ([#9](https://github.com/ANRGUSC/proof-atlas/pull/9), [#10](https://github.com/ANRGUSC/proof-atlas/pull/10)) |
+| **Phase 4** | Headline-vs.-lemma rollup + `atlas.py manifest` LaTeX/MD scope generator (Lean + prose only) | Layer A/C (`Modes #2, #12`) | `atlas.py`, `explorer.html`, `SKILL.md` | Small–Med | **High (P1/P2)** | **Not started** |
+| **Phase 3** | Kernel-extracted claim DAG edges + `lamport` provenance + distillation pass | Layer C (`Mode #10`), Type (i)/(ii) | `audit_lean.py`, `atlas.py`, `graph.js`, `SKILL.md` | Medium | **Medium (P2)** | **Not started** |
+| **Phase 5** | Opt-in `paranoid` (`Comparator`/multi-kernel) GitHub CI tier | Layer B (`Mode #8`) | `hosting.py`, `verify_ci.py`, `verify-lean.yml` | Med–Large | **Medium (P2)** | **Not started** |
+| **Phase 6** | Batched package build & verification in `verify_ci.py` | Layer C (`Mode #11`) | `audit_lean.py`, `verify_ci.py` | Small–Med | **Medium (P2 — before first >50k LoC atlas)** | **Not started** |
 
 ---
 
