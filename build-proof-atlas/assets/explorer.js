@@ -39,6 +39,7 @@ function fillList(selected) {
     a.append(el("small",c.reference),el("span",c.title));
     if(c.verification.evidence) a.append(el("small","✓ Machine verified on GitHub","verified-badge"));
     else a.append(el("small", [c.verification.label, c.verification.remote].filter(Boolean).join(" · ")));
+    if(c.verification.needs_author_confirmation || c.verification.needs_author_confirmation_via?.length) a.append(el("small","Needs author confirmation"));
     if(c.verification.approval) a.append(el("small",c.verification.approval,c.verification.approved?"approval approved":"approval"));
     if(c.id===selected) a.setAttribute("aria-current","page");
     list.append(a);
@@ -58,6 +59,22 @@ function proofView(c,view) {
       note.append(el("strong",title),el("p",v[key]));
       pane.append(note);
     }
+  }
+  if(v.needs_author_confirmation){
+    const note=el("aside",null,"scope-note");
+    note.append(el("strong","Needs author confirmation"),
+      el("p","This claim uses an unattended reading (chosen reading, added hypothesis, or restriction) recorded during a quick triage pass. Review the comparison to confirm or adjust it."));
+    pane.append(note);
+  }
+  if(v.needs_author_confirmation_via?.length){
+    const note=el("aside",null,"scope-note");
+    const p=el("p","Depends on unconfirmed unattended reading(s) in: ");
+    v.needs_author_confirmation_via.forEach((item,idx)=>{
+      if(idx) p.append(document.createTextNode(", "));
+      p.append(item.id && claims.has(item.id) ? link(item.reference, route(item.id)) : document.createTextNode(item.reference));
+    });
+    note.append(el("strong","Needs author confirmation (upstream dependency)"), p);
+    pane.append(note);
   }
   if(v.approval){
     // Two separate claims: Lean proved the formal statement; the author approved it as the paper's.
@@ -125,6 +142,18 @@ function proofView(c,view) {
     if(c.log) checks.append(link("Lean run log",c.log));
     if(v.remote && !v.evidence) checks.append(link(v.remote,v.url));
     pane.append(checks);
+    if(v.conditional && v.assumes?.length){
+      pane.append(el("h3","Assumed prerequisites (conditional proof)"),
+        el("p","Lean checked this claim assuming the following unproved statement(s). Closing those prerequisites and reassembling upgrades this claim to Lean checked.","muted"));
+      const list=el("ul");
+      for(const dep of v.assumes){
+        const item=el("li");
+        if(dep.id && claims.has(dep.id)) item.append(link(dep.reference, route(dep.id)), document.createTextNode(" · "), el("code",dep.expected));
+        else item.append(el("code",dep.expected));
+        list.append(item);
+      }
+      pane.append(list);
+    }
     if(c.noncomputable_constants?.length){
       const nc=el("p","Noncomputable definitions in statement: ","muted");
       c.noncomputable_constants.forEach((name,idx)=>{

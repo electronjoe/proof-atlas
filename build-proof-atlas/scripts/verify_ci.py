@@ -46,6 +46,8 @@ def verify(root):
             raise ValueError(f"{label}: recorded source hashes differ from the checkout")
         if any(closure[key] != prior[key] for key in ("declaration", "expected")):
             raise ValueError(f"{label}: local certificate names differ from the closure")
+        if prior.get("assumes") or work.get("assumes"):
+            raise ValueError(f"{label}: closed claim cannot carry unresolved conditional assumptions")
         packages.setdefault(package, []).append((label, prior, hashlib.sha256(raw).hexdigest()))
     for package, group in packages.items():
         prepare(package, [prior for _, prior, _ in group])
@@ -58,6 +60,8 @@ def verify(root):
             checked = audit(SimpleNamespace(package=package, contract=prior["contract"], target=targets,
                                             expected=prior["expected"], declaration=prior["declaration"],
                                             statements=prior.get("statements", []),
+                                            routine=prior.get("routine", []),
+                                            assumes=prior.get("assumes", []),
                                             witness=prior.get("hypotheses", {}).get("declaration")))
             fingerprint = checked.get("statement", {}).get("sha256")
             if prior.get("statement") and fingerprint != prior["statement"]["sha256"]:

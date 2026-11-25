@@ -516,3 +516,97 @@ class StatementApproval(unittest.TestCase):
         self.assertIn('"noncomputable_constants": ["rate"]', explorer)
         self.assertIn('"unfolded_signatures":', explorer)
         self.assertIn("riemann-roch", explorer)
+
+    def test_quick_profile_witness_default_and_unattended_confirmation_propagation(self):
+        from review_web import queue, render
+        tex_data = (
+            r"\begin{lemma}\label{lem1}The rate at zero is positive.\end{lemma}" "\n"
+            r"\begin{theorem}\label{thm2}Main bound.\end{theorem}"
+        ).encode()
+        (self.root / "paper.tex").write_bytes(tex_data)
+        self.project["tex"] = [{"path": "paper.tex", "sha256": hashlib.sha256(tex_data).hexdigest()}]
+        self.project["environments"] = ["lemma", "theorem"]
+        self.project["proof_work"] = {"mode": "paper", "profile": "quick"}
+        reader = {
+            "schema_version": 1,
+            "claims": {"lem1": {"reference": "Lemma 1"}, "thm2": {"reference": "Theorem 2"}},
+            "dependencies": [{"claim": "thm2", "prerequisite": "lem1", "reason": "Uses Lemma 1."}],
+        }
+        (self.root / "reader.json").write_text(json.dumps(reader), encoding="utf-8")
+        self.project["reader"] = "reader.json"
+        closed_work = self.project["work"].pop("t")
+        self.project["work"]["lem1"] = dict(closed_work)
+        self.project["work"]["thm2"] = {
+            "status": "drafted", "summary": "Drafted.", "step": "Gate 1.", "next": "Prove.",
+            "updated": "2026-11-26T00:00:00Z",
+        }
+        (self.root / "project.json").write_text(json.dumps(self.project), encoding="utf-8")
+
+        # Quick profile defaults witness_search to skip, while respecting explicit overrides.
+        rw = atlas.review_work(self.root)
+        self.assertEqual(rw["profile"], "quick")
+        self.assertEqual(rw["witness_search"]["lem1"], {"mode": "skip", "action": "skip search"})
+        self.project["work"]["lem1"]["witness_search"] = "pursue"
+        (self.root / "project.json").write_text(json.dumps(self.project), encoding="utf-8")
+        self.assertEqual(atlas.review_work(self.root)["witness_search"]["lem1"]["mode"], "pursue")
+        del self.project["work"]["lem1"]["witness_search"]
+        (self.root / "project.json").write_text(json.dumps(self.project), encoding="utf-8")
+
+        # Invalid profile is rejected.
+        self.project["proof_work"]["profile"] = "invalid"
+        (self.root / "project.json").write_text(json.dumps(self.project), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "proof_work.profile must be thorough or quick"):
+            atlas.review_work(self.root)
+        self.project["proof_work"]["profile"] = "quick"
+        (self.root / "project.json").write_text(json.dumps(self.project), encoding="utf-8")
+
+        # needs_author_confirmation is only valid on chosen reading / added hypothesis / restriction.
+        bindings = review.get_packet(self.root, "lem1")["view"]["bindings"]
+        base_record = dict(
+            bindings=bindings, result="match", paper_reading="Rate is positive.", lean_reading="0 < rate 0.",
+            paper_refs="paper.tex, lem1", lean_refs="Statement",
+            analysis=dict(
+                summary="Chose strict inequality reading.", scope="Zero case.",
+                cases=[dict(case="C1", paper="Positive", lean="0 < rate 0", why="Strict positivity.", kind="agrees",
+                            needs_author_confirmation=True)],
+                advice="Confirm strict vs non-strict reading.",
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "chosen reading, added hypothesis, or restriction"):
+            review.save_comparison(self.root, "lem1", base_record)
+
+        # Valid quick-mode unattended chosen reading with needs_author_confirmation.
+        base_record["analysis"]["cases"][0]["kind"] = "chosen reading"
+        base_record["needs_author_confirmation"] = True
+        review.save_comparison(self.root, "lem1", base_record)
+
+        rw = atlas.review_work(self.root)
+        self.assertFalse(rw["agent_tasks"])
+        self.assertEqual([q["claim"] for q in rw["author_questions"]], ["lem1"])
+        self.assertIn("author confirmation", rw["author_questions"][0]["issue"].lower())
+
+        with redirect_stdout(io.StringIO()):
+            atlas.build(self.root)
+        dashboard = (self.root / "dist/progress.html").read_text(encoding="utf-8")
+        self.assertIn("Quick triage profile (hands-off)", dashboard)
+        self.assertIn("Needs author confirmation", dashboard)
+        self.assertIn("depends on Lemma 1", dashboard)
+        lem1_review = (self.root / "dist" / review.review_url("lem1")).read_text(encoding="utf-8")
+        thm2_review = (self.root / "dist" / review.review_url("thm2")).read_text(encoding="utf-8")
+        self.assertIn("Needs author confirmation", lem1_review)
+        self.assertIn("needs author confirmation", lem1_review)
+        self.assertIn("Needs author confirmation (upstream dependency)", thm2_review)
+        self.assertIn("Lemma 1", thm2_review)
+        review_queue = (self.root / "dist/review.html").read_text(encoding="utf-8")
+        self.assertIn("Needs author confirmation (depends on Lemma 1)", review_queue)
+
+        # Approving lem1 clears Needs author confirmation on both lem1 and dependent thm2.
+        pkt = review.get_packet(self.root, "lem1")
+        self.assertTrue(pkt["ready"])
+        review.decide(self.root, "lem1", pkt["token"], "approve", "Author")
+        self.assertFalse(review.get_packet(self.root, "lem1")["needs_author_confirmation"])
+        self.assertFalse(atlas.review_work(self.root)["author_questions"])
+        with redirect_stdout(io.StringIO()):
+            atlas.build(self.root)
+        dashboard_after = (self.root / "dist/progress.html").read_text(encoding="utf-8")
+        self.assertNotIn("Needs author confirmation", dashboard_after)

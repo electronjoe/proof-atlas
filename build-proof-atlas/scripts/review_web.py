@@ -61,7 +61,8 @@ def render(data,secret=None,notice=""):
         if not analysis:
             return ""
         rows = "".join(
-            "<tr><th scope=\"row\">"+esc(row["case"])+"<br><small>"+esc(row.get("kind","not classified"))+"</small></th>"+
+            "<tr><th scope=\"row\">"+esc(row["case"])+"<br><small>"+esc(row.get("kind","not classified"))
+            + (" · needs author confirmation" if row.get("needs_author_confirmation") else "")+"</small></th>"+
             "".join("<td>"+esc(row[k])+"</td>" for k in ("paper","lean","why"))+"</tr>"
             for row in analysis["cases"])
         parts = ['<section class="analysis"><h2>How the statements compare</h2>', para(analysis["summary"]),
@@ -121,8 +122,23 @@ def render(data,secret=None,notice=""):
                 '<section><h2>What Lean proved</h2><small>Mathematical reading of the audited Lean statement</small>'+para(view["lean_reading"] or "The agent has not supplied a current independent reading.")+
                 para(view["lean_refs"])+'</section></div>')
     body=f'<p>{esc(v["edition"])} · {cid}</p><h1>{esc(data["title"])}</h1>'
-    if data.get("statement_checked") and not data["checked"]:
+    if data.get("conditional"):
+        assumed_text = ", ".join(esc(a) for a in data.get("assumes", []))
+        body+=(f'<p><strong>Conditional (assumes {assumed_text})</strong> · Lean checked this claim assuming '
+               'unproved prerequisite statement(s). It upgrades to Lean checked once those prerequisites close.</p>')
+    elif data.get("statement_checked") and not data["checked"]:
         body+='<p><strong>Statement drafted (proof in progress)</strong> · Lean checked the statement definitions; the proof is not closed yet.</p>'
+    if data.get("needs_author_confirmation"):
+        body+=('<aside class="confirmation-warning"><h2>Needs author confirmation</h2>'
+               '<p>This comparison records an unattended reading (chosen reading, added hypothesis, or restriction). '
+               'Confirm it below to approve, or report a difference.</p></aside>')
+    if data.get("needs_author_confirmation_via"):
+        via_links = ", ".join(
+            f'<a href="../{esc(item["review_url"])}">{esc(item["reference"])}</a>'
+            for item in data["needs_author_confirmation_via"]
+        )
+        body+=(f'<aside class="confirmation-warning"><h2>Needs author confirmation (upstream dependency)</h2>'
+               f'<p>This claim depends on unconfirmed unattended reading(s) in: {via_links}.</p></aside>')
     body+=para(notice)+para(data["assessment"])
     body+=metadata_panel()
     body+=default_panel(data.get("defaults", []), v)
@@ -183,13 +199,23 @@ def render(data,secret=None,notice=""):
 def queue(entries):
     from atlas import esc
     def status_label(d):
+        parts = []
         if d["approved"]:
-            return BADGE
-        if d.get("preapproved"):
-            return "Statement approved (proof in progress)"
-        if d.get("statement_checked") and not d["checked"]:
-            return "Statement drafted (proof in progress) · " + d["assessment"]
-        return d["assessment"]
+            parts.append(BADGE)
+        elif d.get("preapproved"):
+            parts.append("Statement approved (proof in progress)")
+        elif d.get("conditional"):
+            parts.append(f'Conditional (assumes {", ".join(d.get("assumes", []))}) · {d["assessment"]}')
+        elif d.get("statement_checked") and not d["checked"]:
+            parts.append("Statement drafted (proof in progress) · " + d["assessment"])
+        else:
+            parts.append(d["assessment"])
+        if d.get("needs_author_confirmation"):
+            parts.append("Needs author confirmation")
+        elif d.get("needs_author_confirmation_via"):
+            refs = ", ".join(item["reference"] for item in d["needs_author_confirmation_via"])
+            parts.append(f"Needs author confirmation (depends on {refs})")
+        return " · ".join(parts)
     rows="".join(f'<li><a href="{review_url(d["id"])}">{esc(d["title"])}</a><br>'
                  f'{esc(status_label(d))} · {esc(d["actor"])}: {esc(d["next"])}</li>' for d in entries)
     return document("Author review",'<h1>Author review</h1><p>Compare the paper and the formal statement. Human review is optional.</p>'

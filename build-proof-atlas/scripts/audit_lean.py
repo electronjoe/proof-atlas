@@ -195,14 +195,67 @@ def scan_lean_hygiene(root, lean_paths, statement_files=()):
     return dict(checked=True, statements_checked=bool(stmt_set))
 
 
-def check_statements(lake, root, env, contract, expected, statements):
+def _pure_external_prelude(lake, root, env):
+    """Verify that a root Prelude.lean module imports only external libraries."""
+    if not (root / "Prelude.lean").is_file():
+        return False
+    imports = import_headers(lake, ["Prelude.lean"], root, env)
+    local_imports = [m for m in sorted(imports) if (root / ("/".join(m.split(".")) + ".lean")).is_file()]
+    if local_imports:
+        raise ValueError(
+            "Prelude.lean imports local modules (" + ", ".join(local_imports)
+            + "); keep Prelude.lean restricted to external/Mathlib imports"
+        )
+    return True
+
+
+def check_routine(lake, root, env, routine_paths=(), checked_files=()):
+    """Keep Routine/ glue disjoint from Statements/, Proofs/, and other local libraries.
+
+    Routine modules may import external libraries (e.g. Mathlib), a pure-external
+    Prelude.lean, and other Routine modules—never Statements/ or Proofs/.
+    """
+    files = statement_paths(root, routine_paths) if routine_paths else set()
+    for rel in checked_files:
+        if rel == "Routine.lean" or rel.startswith("Routine/"):
+            files.add(rel)
+    if not files:
+        return []
+    modules = {f[:-5].replace("/", "."): f for f in files}
+    ordered = sorted(files)
+    rows = lake_json(lake, ["env", "lean", "--deps-json", "--stdin"], root, env, ("\n".join(ordered) + "\n").encode())
+    if len(rows) != 1 or len(rows[0]["imports"]) != len(ordered):
+        raise ValueError("Incomplete Lean import headers for the routine modules")
+    prelude_ok = None
+    for path, item in zip(ordered, rows[0]["imports"]):
+        if item["errors"]:
+            raise ValueError(f"Lean could not read the imports of {path}")
+        for imp in item["result"]["imports"]:
+            name = imp["module"]
+            source = "/".join(name.split(".")) + ".lean"
+            if name in modules or not (root / source).is_file():
+                continue
+            if name == "Prelude":
+                if prelude_ok is None:
+                    prelude_ok = _pure_external_prelude(lake, root, env)
+                if prelude_ok:
+                    continue
+            raise ValueError(
+                f"Routine module {path} imports {name} ({source}), which is outside Routine/. "
+                "Keep Routine/ restricted to external/Mathlib imports, Prelude, and other Routine/ modules"
+            )
+    return sorted(modules)
+
+
+def check_statements(lake, root, env, contract, expected, statements, assumes=()):
     """Keep the expected proposition and its definitions apart from the proofs.
 
     `statements` lists directories or files of the package holding the paper's
     statements and definitions. Each of those modules may import only statement
-    modules and external libraries, and the expected proposition must be defined in
-    one of them. Lean resolves every constant from imports, so nothing the statement
-    mentions can then come from a proof module or from the contract file."""
+    modules, a pure-external Prelude.lean, and external libraries, and the expected
+    proposition (plus any --assumes propositions) must be defined in one of them.
+    Lean resolves every constant from imports, so nothing the statement mentions
+    can then come from a proof module or from the contract file."""
     files = statement_paths(root, statements)
     if not files:
         raise ValueError("No Lean files in the statement paths: " + ", ".join(statements))
@@ -211,6 +264,7 @@ def check_statements(lake, root, env, contract, expected, statements):
     rows = lake_json(lake, ["env", "lean", "--deps-json", "--stdin"], root, env, ("\n".join(ordered) + "\n").encode())
     if len(rows) != 1 or len(rows[0]["imports"]) != len(ordered):
         raise ValueError("Incomplete Lean import headers for the statement modules")
+    prelude_ok = None
     for path, item in zip(ordered, rows[0]["imports"]):
         if item["errors"]:
             raise ValueError(f"Lean could not read the imports of {path}")
@@ -218,24 +272,37 @@ def check_statements(lake, root, env, contract, expected, statements):
             name = imp["module"]
             source = "/".join(name.split(".")) + ".lean"
             if name not in modules and (root/source).is_file():
+                if name == "Prelude":
+                    if prelude_ok is None:
+                        prelude_ok = _pure_external_prelude(lake, root, env)
+                    if prelude_ok:
+                        continue
                 raise ValueError(f"Statement module {path} imports {name} ({source}), which is not a statement "
                                  f"module. Move the definitions it needs into {', '.join(statements)}")
+    to_check = [expected, *assumes]
     query = ("import Lean\n" + (root/contract).read_text(encoding="utf-8-sig") + "\n" +
-             f"#eval show Lean.CoreM Unit from do\n  let env ← Lean.getEnv\n  let n := ({json.dumps(expected)} : String).toName\n"
-             "  IO.println s!\"PROOF-ATLAS-MODULE {(env.getModuleIdxFor? n).map (env.allImportedModuleNames[·]!)}\"\n")
+             "#eval show Lean.CoreM Unit from do\n  let env ← Lean.getEnv\n" +
+             f"  for nameStr in ({json.dumps(to_check)} : List String) do\n" +
+             "    let n := nameStr.toName\n" +
+             "    IO.println s!\"PROOF-ATLAS-MODULE {nameStr} {(env.getModuleIdxFor? n).map (env.allImportedModuleNames[·]!)}\"\n")
     result = subprocess.run([*lake, "env", "lean", "--stdin"], input=query.encode(), cwd=root, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     output = result.stdout.decode("utf-8-sig", errors="replace")
-    found = re.findall(r"^PROOF-ATLAS-MODULE (none|\(some (\S+)\))\r?$", output, re.M)
-    if result.returncode or len(found) != 1:
+    found = re.findall(r"^PROOF-ATLAS-MODULE (\S+) (none|\(some (\S+)\))\r?$", output, re.M)
+    if result.returncode or len(found) != len(to_check):
         raise ValueError("Could not locate the expected proposition:\n" + output)
-    module = found[0][1]
-    if module not in modules:
-        where = (f"the contract {contract}" if not module else
-                 f"{module} ({'/'.join(module.split('.'))}.lean)" if (root/("/".join(module.split(".")) + ".lean")).is_file()
-                 else f"the external module {module}")
-        raise ValueError(f"The expected proposition {expected} is defined in {where}, which is not a statement module. "
-                         f"Define it in {', '.join(statements)}")
+    by_name = {prop: mod for prop, _, mod in found}
+    for idx, prop in enumerate(to_check):
+        if prop not in by_name:
+            raise ValueError(f"Could not locate proposition {prop}:\n" + output)
+        module = by_name[prop]
+        if module not in modules:
+            where = (f"the contract {contract}" if not module else
+                     f"{module} ({'/'.join(module.split('.'))}.lean)" if (root/("/".join(module.split(".")) + ".lean")).is_file()
+                     else f"the external module {module}")
+            role = "expected" if idx == 0 else "assumed"
+            raise ValueError(f"The {role} proposition {prop} is defined in {where}, which is not a statement module. "
+                             f"Define it in {', '.join(statements)}")
     return sorted(modules)
 
 
@@ -553,6 +620,39 @@ partial def proofAtlasPaths (e : Lean.Expr) (xs chosen : Array Lean.Expr) : Lean
 '''
 
 
+DECL_KIND_QUERY = r'''
+#eval show Lean.CoreM Unit from do
+  let env ← Lean.getEnv
+  let n := (__DECL__ : String).toName
+  let kind := match env.find? n with
+    | some (.thmInfo _) => "theorem"
+    | some (.defnInfo _) => "def"
+    | some (.axiomInfo _) => "axiom"
+    | some (.opaqueInfo _) => "opaque"
+    | some (.inductInfo _) => "inductive"
+    | some (.ctorInfo _) => "constructor"
+    | some (.recInfo _) => "recursor"
+    | some (.quotInfo _) => "quot"
+    | none => "missing"
+  IO.println s!"PROOF-ATLAS-DECL-KIND {kind}"
+'''
+
+
+def expected_claim_type(expected, assumes=()):
+    """Build the Lean type `A₁ → … → Aₖ → Expected` for conditional or unconditional proofs."""
+    return " → ".join([*assumes, expected]) if assumes else expected
+
+
+def theorem_info_report(output, declaration):
+    """Verify the audited proof declaration is a kernel `.thmInfo` (`wasOriginallyTheorem`)."""
+    kinds = re.findall(r"^PROOF-ATLAS-DECL-KIND (\S+)\r?$", output, re.M)
+    if len(kinds) != 1:
+        raise ValueError(f"Could not verify kernel declaration kind for {declaration}:\n" + output)
+    if kinds[0] != "theorem":
+        raise ValueError(f"Proof declaration {declaration} must be a Lean theorem (.thmInfo), found {kinds[0]}")
+    return True
+
+
 def axiom_report(output, declaration):
     """The axioms `#print axioms` lists for one declaration, refusing any beyond Lean's standard three."""
     quoted = re.escape("'"+declaration+"'")
@@ -612,14 +712,18 @@ def audit(args):
     witness = getattr(args, "witness", None)
     targets = list(getattr(args, "target", None) or [])
     statements = list(getattr(args, "statements", None) or [])
+    routine = list(getattr(args, "routine", None) or [])
+    assumes = list(getattr(args, "assumes", None) or [])
     if statement_only:
         if declaration:
             raise ValueError("--statement-only does not accept a proof declaration")
+        if assumes:
+            raise ValueError("--statement-only does not accept --assumes")
         if not statements:
             raise ValueError("--statement-only requires --statements")
     elif not declaration:
         raise ValueError("Supply a proof declaration, or pass --statement-only")
-    for name in (*([declaration] if declaration else []), args.expected, *targets, *([witness] if witness else [])):
+    for name in (*([declaration] if declaration else []), args.expected, *assumes, *targets, *([witness] if witness else [])):
         if not re.fullmatch(r"[A-Za-z_][\w']*(?:\.[A-Za-z_][\w']*)*", name):
             raise ValueError("Expected a fully qualified Lean identifier")
     pin = (root/"lean-toolchain").read_text(encoding="utf-8-sig").strip()
@@ -649,9 +753,14 @@ def audit(args):
         raise ValueError("Missing contract or toolchain pin changed during audit setup")
     # Static hygiene runs before `lake build` so compile-time side effects fail before elaboration.
     stmt_files = statement_paths(root, statements) if statements else set()
+    if statements and "Prelude.lean" in initial:
+        stmt_files = set(stmt_files) | {"Prelude.lean"}
     hygiene = scan_lean_hygiene(root, [p for p in initial if p.endswith(".lean")], stmt_files)
+    # Keep Routine/ glue isolated from Statements/ and Proofs/ before building.
+    routine_modules = check_routine(lake, root, env, routine, [p for p in initial if p.endswith(".lean")])
     # The Lake build runner sends output to an actual file descriptor.
     run([*lake, "--no-cache", "build", *build_targets], root, env, sys.stderr)
+    theorem_info = False
     if statement_only:
         program = (contract.read_text(encoding="utf-8-sig") + "\n" +
                    f"example : Prop := {args.expected}\n#print axioms {args.expected}\n")
@@ -662,14 +771,17 @@ def audit(args):
             raise ValueError("Lean statement check did not pass cleanly:\n"+output)
         axioms = axiom_report(output, args.expected)
     else:
-        program = (contract.read_text(encoding="utf-8-sig") + "\n" +
-                   f"example : {args.expected} := {declaration}\n#print axioms {declaration}\n")
+        claim_type = expected_claim_type(args.expected, assumes)
+        program = ("import Lean\n" + contract.read_text(encoding="utf-8-sig") + "\n" +
+                   f"example : {claim_type} := {declaration}\n#print axioms {declaration}\n" +
+                   DECL_KIND_QUERY.replace("__DECL__", json.dumps(declaration)))
         result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
                                 cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         output = result.stdout.decode("utf-8-sig", errors="replace")
         if result.returncode or re.search(r"\bwarning:", output, re.I):
             raise ValueError("Lean contract check did not pass cleanly:\n"+output)
         axioms = axiom_report(output, declaration)
+        theorem_info = theorem_info_report(output, declaration)
     if witness:
         hypotheses = hypotheses_record(lake, root, env, contract_path, args.expected, witness)
     else:
@@ -677,7 +789,7 @@ def audit(args):
         print("Warning: no --witness was given, so nothing shows that the hypotheses of the expected "
               "proposition can hold. See 'Show the hypotheses can hold' in SKILL.md.", file=sys.stderr)
     if statements:
-        check_statements(lake, root, env, contract_path, args.expected, statements)
+        check_statements(lake, root, env, contract_path, args.expected, statements, assumes=assumes)
     else:
         print("Warning: no --statements path was given, so nothing checks that the expected proposition "
               "and its definitions are independent of the proof modules. Older atlases keep working; "
@@ -704,13 +816,16 @@ def audit(args):
                     checked_inputs=initial, statements=statements, hygiene=hygiene,
                     lean_output=output.strip(),
                     statement=statement, defaults=defaults,
+                    **({"routine": routine_modules} if routine_modules else {}),
                     **({"hypotheses": hypotheses} if hypotheses else {}))
     return dict(declaration=declaration, contract=contract_path,
                 expected=args.expected, toolchain=pin, axioms=axioms, axiom_profile=profile,
-                external_packages=ext_pkgs,
+                external_packages=ext_pkgs, theorem_info=theorem_info,
                 targets=targets, input_scope="module-closure" if scoped is not None else "full-package",
                 checked_inputs=initial, statements=statements, hygiene=hygiene,
                 lean_output=output.strip(),
+                **({"assumes": assumes} if assumes else {}),
+                **({"routine": routine_modules} if routine_modules else {}),
                 **({"statement": statement, "defaults": defaults} if statement else {}),
                 **({"hypotheses": hypotheses} if hypotheses else {}))
 
@@ -726,6 +841,10 @@ if __name__ == "__main__":
     parser.add_argument("--target", action="append", default=[], help="Build this proof module before checking its independent contract")
     parser.add_argument("--statements", action="append", default=[],
                         help="Directory or file holding the paper's statements and definitions; they may not import proof modules")
+    parser.add_argument("--routine", action="append", default=[],
+                        help="Directory or file holding Routine/ glue lemmas; they may not import Statements/ or Proofs/")
+    parser.add_argument("--assumes", action="append", default=[],
+                        help="Expected proposition in Statements/ assumed as a hypothesis by a conditional proof (repeatable in binder order)")
     parser.add_argument("--witness", help="Declaration proving that the hypotheses of the expected proposition can all hold")
     parser.add_argument("--output", type=Path, help="New evidence file to create on success")
     args = parser.parse_args()

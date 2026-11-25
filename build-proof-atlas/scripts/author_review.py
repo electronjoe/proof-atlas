@@ -11,6 +11,7 @@ BADGE = "Author reviewed the theorem statement proved in Lean"
 ADVICE = {"match": "Recommend approval", "difference": "Report a difference", "unsure": "Hold approval for clarification"}
 # How each compared case relates to the paper. Every kind except "agrees" counts as a difference.
 KINDS = ("agrees", "added hypothesis", "restriction", "chosen reading", "other form", "stronger", "weaker conclusion")
+CONFIRMATION_KINDS = ("chosen reading", "added hypothesis", "restriction")
 
 
 def differences(analysis):
@@ -32,6 +33,14 @@ def validate_analysis(analysis, result, require_kinds=False):
         raise ValueError("Explain at least one case with its paper claim, Lean claim and mathematical justification")
     if any(row.get("kind", KINDS[0]) not in KINDS or require_kinds and "kind" not in row for row in cases):
         raise ValueError("Give each case a kind: " + ", ".join(KINDS))
+    for row in cases:
+        if "needs_author_confirmation" in row:
+            if type(row["needs_author_confirmation"]) is not bool:
+                raise ValueError("Case needs_author_confirmation must be a boolean")
+            if row["needs_author_confirmation"] and row.get("kind") not in CONFIRMATION_KINDS:
+                raise ValueError(
+                    "needs_author_confirmation may only be set on chosen reading, added hypothesis, or restriction cases"
+                )
     if result == "match" and any(row.get("kind") == "weaker conclusion" for row in cases):
         raise ValueError("A weaker conclusion cannot be recorded as a match; use difference or unsure")
     if (result != "match" or "suggested_feedback" in analysis) and not present(analysis, ("suggested_feedback",)):
@@ -68,18 +77,20 @@ def history(root, cid):
     return book["claims"].get(cid, [])
 
 
-def packet(root, project, claim, work, audit, comparison, events, checked, statement_checked=False):
+def packet(root, project, claim, work, audit, comparison, events, checked, statement_checked=False,
+           *, conditional=False, assumes=()):
     from atlas import statement_defaults
     from audit_lean import axiom_profile as format_axiom_profile
-    defaults = statement_defaults(audit) if checked or statement_checked else []
+    has_audit = bool(checked or conditional or statement_checked)
+    defaults = statement_defaults(audit) if has_audit else []
     axiom_prof = ""
-    if audit and (checked or statement_checked) and "axioms" in audit:
+    if audit and has_audit and "axioms" in audit:
         axiom_prof = audit.get("axiom_profile") or format_axiom_profile(audit["axioms"])
-    ext_pkgs = list((audit or {}).get("external_packages") or []) if checked or statement_checked else []
+    ext_pkgs = list((audit or {}).get("external_packages") or []) if has_audit else []
     noncomp = sorted(c["name"] for c in (audit or {}).get("statement", {}).get("constants", [])
-                     if c.get("noncomputable")) if checked or statement_checked else []
+                     if c.get("noncomputable")) if has_audit else []
     keys = bindings(project, claim, audit)
-    has_statement = bool((checked or statement_checked) and keys["statement"])
+    has_statement = bool(has_audit and keys["statement"])
     current = comparison and comparison.get("bindings") == keys and has_statement
     fields = ("paper_reading", "lean_reading", "paper_refs", "lean_refs")
     if current:
@@ -88,12 +99,16 @@ def packet(root, project, claim, work, audit, comparison, events, checked, state
             raise ValueError(f"{claim['id']}: incomplete independent comparison")
         if comparison["result"] != "match" and not all(comparison.get(k) for k in ("issue", "actor", "next")):
             raise ValueError(f"{claim['id']}: give the difference, next actor and resolution")
+        if "needs_author_confirmation" in comparison and type(comparison["needs_author_confirmation"]) is not bool:
+            raise ValueError(f"{claim['id']}: needs_author_confirmation must be a boolean")
     comp = comparison if current else {}
     view = dict(bindings=keys, excerpt=claim["excerpt"], edition=project["edition"],
                 **{k:comp.get(k, "") for k in fields})
     if "analysis" in comp:
         validate_analysis(comp["analysis"], comp["result"])
         view.update(analysis=comp["analysis"], result=comp["result"])
+    if comp.get("needs_author_confirmation"):
+        view["needs_author_confirmation"] = True
     stronger = comp.get("stronger_result", "")
     if "stronger_result" in comp and (comp["result"] != "match" or not isinstance(stronger,str) or not stronger.strip()):
         raise ValueError("Use a stronger-result note only for a match and describe the extra conclusion")
@@ -109,14 +124,19 @@ def packet(root, project, claim, work, audit, comparison, events, checked, state
     statement_approved = (has_statement and comp.get("result") == "match" and not disputed
                           and last.get("decision") == "approve" and (last.get("version") == version or prior_readings))
     approved = bool(checked and statement_approved)
-    preapproved = bool(statement_checked and not checked and statement_approved)
+    preapproved = bool((statement_checked or conditional) and not checked and statement_approved)
+    raw_confirmation = bool(
+        comp.get("needs_author_confirmation")
+        or any(row.get("needs_author_confirmation") for row in comp.get("analysis", {}).get("cases", []))
+    )
+    needs_author_confirmation = bool(raw_confirmation and not statement_approved)
     if outstanding:
         issue, actor, step = " · ".join(e["comment"] for e in outstanding), "Proof agent", "Investigate the reported difference and record a resolution."
     elif machine_issue:
         issue, actor, step = (comparison.get(k,"") for k in ("issue","actor","next"))
     elif not has_statement:
-        if work.get("status") == "closed":
-            step = ("Refresh the Lean audit for the current sources." if not checked
+        if work.get("status") in ("closed", "conditional"):
+            step = ("Refresh the Lean audit for the current sources." if not (checked or conditional)
                     else "Refresh the legacy audit to record statement fingerprints for optional review.")
         elif work.get("statement_check"):
             step = "Refresh the statement audit for the current sources."
@@ -127,6 +147,15 @@ def packet(root, project, claim, work, audit, comparison, events, checked, state
         issue, actor, step = "", "Proof agent", "Prepare independent paper and Lean readings."
     elif "analysis" not in comp:
         issue, actor, step = "", "Proof agent", "Add the case-by-case justification and recommendation."
+    elif needs_author_confirmation:
+        issue = "Unattended reading awaits author confirmation."
+        actor = "Author"
+        step = "Confirm the chosen reading, added hypothesis, or restriction, or report a difference."
+    elif conditional:
+        if preapproved:
+            issue, actor, step = "", "Proof agent", work.get("next") or "Close the assumed prerequisite claims and reassemble."
+        else:
+            issue, actor, step = "", "Author (optional)", "Review the conditionally proved statement whenever convenient while prerequisites remain open."
     elif not checked:
         if preapproved:
             issue, actor, step = "", "Proof agent", work.get("next") or "Finish the Lean proof."
@@ -135,10 +164,15 @@ def packet(root, project, claim, work, audit, comparison, events, checked, state
     else:
         issue, actor, step = "", "Author (optional)", "Review the comparison whenever convenient."
     return dict(id=claim["id"], title=claim["title"], view=view, version=version,
-                token=digest([version, comparison, last.get("id"), checked, bool(statement_checked), defaults]), events=events, defaults=defaults,
+                token=digest([version, comparison, last.get("id"), checked, bool(conditional), list(assumes),
+                              bool(statement_checked), needs_author_confirmation, defaults]),
+                events=events, defaults=defaults,
                 axiom_profile=axiom_prof, external_packages=ext_pkgs, noncomputable_constants=noncomp,
-                checked=checked, statement_checked=bool(checked or statement_checked),
+                checked=checked, conditional=bool(conditional), assumes=list(assumes),
+                statement_checked=has_audit,
                 approved=approved, preapproved=preapproved, disputed=disputed,
+                needs_author_confirmation=needs_author_confirmation,
+                needs_author_confirmation_via=[],
                 ready=bool("analysis" in view and comp.get("result")=="match" and not disputed),
                 feedback_open=bool(outstanding), approved_before_analysis=bool((approved or preapproved) and prior_readings),
                 stronger_result=stronger if not disputed else "",
@@ -149,7 +183,7 @@ def packet(root, project, claim, work, audit, comparison, events, checked, state
 
 
 def _audit_package(work):
-    if work.get("status") == "closed" and work.get("closure"):
+    if work.get("status") in ("closed", "conditional") and work.get("closure"):
         return work["closure"]["package"]
     return (work.get("statement_check") or work["closure"])["package"]
 
@@ -202,15 +236,21 @@ def get_packet(root, cid):
     work = project.get("work", {}).get(cid, {})
     audit = None
     checked = False
+    conditional = False
     statement_checked = False
-    if work.get("status") == "closed" or work.get("statement_check"):
+    assumes = []
+    if work.get("status") in ("closed", "conditional") or work.get("statement_check"):
         try:
             audit, checked = current_statement_audit(root,cid,work)
             statement_checked = True
-        except ValueError:
+            if work.get("status") == "conditional":
+                conditional = True
+                assumes = list((audit or {}).get("assumes") or [])
+        except (ValueError, OSError):
             pass
     comp = read(root/"comparisons.json", {}).get(cid)
-    data = packet(root,project,claim,work,audit,comp,history(root,cid),checked,statement_checked)
+    data = packet(root,project,claim,work,audit,comp,history(root,cid),checked,statement_checked,
+                  conditional=conditional,assumes=assumes)
     reader = read(local(root,project["reader"]), {}) if project.get("reader") else {}
     data["page"] = work.get("page") or reader.get("claims",{}).get(cid,{}).get("page")
     data["sources"] = exact_sources(root,work,audit)
@@ -282,6 +322,15 @@ def save_comparison(root,cid,record):
         if result not in ("match","difference","unsure"):
             raise ValueError("Choose match, difference or unsure")
         validate_analysis(record.get("analysis"), result, require_kinds=True)
+        if "needs_author_confirmation" in record:
+            if type(record["needs_author_confirmation"]) is not bool:
+                raise ValueError("needs_author_confirmation must be a boolean")
+            if record["needs_author_confirmation"] and not any(
+                row.get("kind") in CONFIRMATION_KINDS for row in record["analysis"]["cases"]
+            ):
+                raise ValueError(
+                    "needs_author_confirmation requires at least one chosen reading, added hypothesis, or restriction case"
+                )
         assessments = record["analysis"].get("default_assessments", {})
         expected_ids = {finding["id"] for finding in data["defaults"]}
         if not isinstance(assessments, dict) or set(assessments) != expected_ids:

@@ -145,14 +145,25 @@ def page(title, mast, body, watch=""):
             + mast + '<main>' + body + '</main>' + watch + '</body></html>').encode()
 
 
+def proof_work_profile(project):
+    scope = project.get("proof_work") or {}
+    profile = scope.get("profile", "thorough")
+    if profile not in ("thorough", "quick"):
+        raise ValueError("proof_work.profile must be thorough or quick")
+    return profile
+
+
 def proof_work_description(project, claims, *, closed_results=None):
     scope = project.get("proof_work")
     if scope is None:
         return "Proof-work authorization has not been recorded."
+    profile = proof_work_profile(project)
     mode = scope["mode"]
+    is_complete = False
     if mode == "paper":
         total = sum(claim["kind"] != "conjecture" for claim in claims)
         if total and closed_results == total:
+            is_complete = True
             text = "Paper-wide proof work complete. All stated results are closed."
         else:
             text = f"Paper-wide. Continue through all {total} stated results, including their prerequisites. Track conjectures separately."
@@ -163,6 +174,8 @@ def proof_work_description(project, claims, *, closed_results=None):
         text = f"One claim. Work through {selected['title']} ({selected['id']}) and its prerequisites, then stop for the author."
     else:
         raise ValueError("proof_work.mode must be paper or claim")
+    if profile == "quick" and not is_complete:
+        text = "Quick triage profile (hands-off). " + text + " Deferred checks and conditional assumptions stay explicitly badged."
     if scope.get("paused"):
         return "Paused by the author. Saved scope: " + text
     return text
@@ -188,9 +201,11 @@ def manuscript_claims(root, p):
     return claims
 
 
-def current_audit(root, cid, w):
+def current_audit(root, cid, w, *, allow_conditional=False):
     """The closure's receipt, provided the audited sources are unchanged."""
-    if w.get("status") != "closed":
+    status = w.get("status")
+    allowed = ("closed", "conditional") if allow_conditional else ("closed",)
+    if status not in allowed:
         raise ValueError(f"{cid}: only a closed claim with a Lean audit can be approved")
     audit = json.loads(local(root, w["closure"]["audit"]).read_bytes())
     for path, digest in w.get("checked_inputs", {}).items():
@@ -202,13 +217,19 @@ def current_audit(root, cid, w):
         any(audit[k] != closure[k] for k in ("expected","declaration")) or
         set(audit["axioms"]) - {"propext","Classical.choice","Quot.sound"}):
         raise ValueError("Inconsistent audit receipt")
+    if status == "closed" and (audit.get("assumes") or w.get("assumes")):
+        raise ValueError(f"{cid}: closed claim cannot carry unresolved assumptions; use status 'conditional'")
+    if status == "conditional" and not audit.get("assumes"):
+        raise ValueError(f"{cid}: conditional claim requires non-empty assumes in its audit receipt")
     return audit
 
 
 def current_statement_audit(root, cid, w):
-    """Return `(audit, proof_checked)` for either a closed claim or a Gate 1 statement check."""
+    """Return `(audit, proof_checked)` for a closed, conditional, or Gate 1 statement check."""
     if w.get("status") == "closed":
         return current_audit(root, cid, w), True
+    if w.get("status") == "conditional":
+        return current_audit(root, cid, w, allow_conditional=True), False
     sc = w.get("statement_check")
     if not sc:
         raise ValueError(f"{cid}: only a closed claim or a drafted claim with a statement audit can be compared")
@@ -256,7 +277,8 @@ def build_local(root):
 
 
 def witness_plan(project, work, witness):
-    mode = work.get("witness_search", project.get("witness_search", "available"))
+    default_mode = "skip" if proof_work_profile(project) == "quick" else "available"
+    mode = work.get("witness_search", project.get("witness_search", default_mode))
     if mode not in ("available", "skip", "pursue"):
         raise ValueError("witness_search must be available, skip, or pursue")
     missing = work.get("witness_missing_result")
@@ -282,7 +304,9 @@ def review_work(root, labels=(), *, require_ci=False, ci_receipt=None):
     if set(labels) - claims.keys():
         raise ValueError("Unknown review-work claim")
     selected = list(dict.fromkeys(labels or claims))
-    report = {"scope": project.get("proof_work"), "agent_tasks": [], "author_questions": [],
+    report = {"scope": project.get("proof_work"), "profile": proof_work_profile(project),
+              "agent_tasks": [], "author_questions": [],
+              "conditional_claims": [],
               "uncommitted_delivery_files": [], "ci_pending": [], "witness_search": {}}
     ci = None
     if require_ci:
@@ -306,9 +330,13 @@ def review_work(root, labels=(), *, require_ci=False, ci_receipt=None):
         packet = reviews.get_packet(root,cid)
         if claims[cid]["kind"] != "conjecture":
             report["witness_search"][cid] = witness_plan(project, work, packet["witness"])
-        needs_gate1_review = (work.get("status") != "closed" and packet["statement_checked"]
+        if packet.get("conditional"):
+            report["conditional_claims"].append(dict(claim=cid, assumes=work.get("assumes") or packet["assumes"]))
+        proof_checked = work.get("status") in ("closed", "conditional")
+        needs_gate1_review = (not proof_checked and packet["statement_checked"]
                               and not packet["disputed"] and "analysis" not in packet["view"])
-        if packet["disputed"] or (work.get("status")=="closed" and packet["actor"]=="Proof agent") or needs_gate1_review:
+        if (packet["disputed"] or (proof_checked and packet["actor"]=="Proof agent")
+                or needs_gate1_review or packet.get("needs_author_confirmation")):
             key = "author_questions" if packet["actor"]=="Author" else "agent_tasks"
             report[key].append(dict(claim=cid, issue=packet["issue"], next=packet["next"]))
         if require_ci and work.get("status")=="closed":
@@ -322,6 +350,326 @@ def review_work(root, labels=(), *, require_ci=False, ci_receipt=None):
     for key,item in edits.items():
         if item["claim"] in selected and key not in book.get("cleared",{}) and item.get("status")=="Draft requested":
             report["agent_tasks"].append(dict(claim=item["claim"], edit=key, next="Prepare the requested manuscript draft."))
+    return report
+
+
+_LEAN_KEYWORDS = {
+    "theorem", "lemma", "def", "structure", "class", "inductive", "axiom", "opaque",
+    "namespace", "section", "end", "import", "open", "where", "let", "in", "by", "fun",
+    "match", "with", "if", "then", "else", "do", "return", "for", "type", "Prop", "Type", "Sort",
+}
+
+
+def _lean_ident(label, used=()):
+    ident = re.sub(r"[^A-Za-z0-9_]", "_", str(label)).strip("_")
+    if not ident or ident[0].isdigit() or ident in _LEAN_KEYWORDS:
+        ident = "claim_" + (ident or "item")
+    candidate = ident
+    suffix = 2
+    while candidate in used:
+        candidate = f"{ident}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _claim_ref_label(cid, by_id, notes):
+    note_ref = (notes.get(cid) or {}).get("reference")
+    if note_ref:
+        return note_ref
+    claim = by_id.get(cid)
+    if not claim:
+        return cid
+    if claim.get("title") and claim["title"] != cid:
+        return f"{claim['kind'].title()} ({claim['title']})"
+    return f"{claim['kind'].title()} {cid}"
+
+
+def _resolve_assumes_items(audit_assumes, work_assumes, by_id, work, notes):
+    expected_to_cid = {}
+    for other_cid, other_w in work.items():
+        for container in (other_w.get("assembly"), other_w.get("closure"), other_w.get("statement_check")):
+            if isinstance(container, dict) and container.get("expected"):
+                expected_to_cid.setdefault(container["expected"], other_cid)
+    items = []
+    seen = set()
+    for idx, prop in enumerate(audit_assumes or ()):
+        hint = work_assumes[idx] if idx < len(work_assumes) and work_assumes[idx] in by_id else None
+        dep_cid = hint or expected_to_cid.get(prop) or (prop if prop in by_id else None)
+        key = dep_cid or prop
+        if key in seen:
+            continue
+        seen.add(key)
+        ref = _claim_ref_label(dep_cid, by_id, notes) if dep_cid else prop
+        items.append(dict(id=dep_cid, reference=ref, expected=prop))
+    return items
+
+
+def assemble(root, *, package=None, run_audit=False):
+    """Generate Assembly.lean composing separable per-claim proofs in topological order.
+
+    Claims whose upstream prerequisites are proved compose unconditionally; any
+    unproved prerequisite remains an explicit `Statements.*` hypothesis binder on
+    `Assembly.<name>` and is reported in `assumes_claims` / `assumes_expected`.
+    """
+    from types import SimpleNamespace
+    import audit_lean
+
+    p = json.loads((root / "project.json").read_text(encoding="utf-8-sig"))
+    claims = manuscript_claims(root, p)
+    by_id = {c["id"]: c for c in claims}
+    order = p.get("claim_order") or [c["id"] for c in claims]
+    work = p.get("work", {})
+
+    expected_by_cid = {}
+    stmt_modules_by_cid = {}
+    pkg_specs = {}
+
+    for cid in order:
+        w = work.get(cid, {})
+        asm = w.get("assembly")
+        closure = w.get("closure")
+        sc = w.get("statement_check")
+        exp = ((asm or {}).get("expected") or (closure or {}).get("expected")
+               or (sc or {}).get("expected"))
+        if exp:
+            expected_by_cid[cid] = exp
+        stmt_mods = list((asm or {}).get("statement_modules") or [])
+        for audit_holder in (closure, sc):
+            if audit_holder and audit_holder.get("audit") and not stmt_mods:
+                try:
+                    rec = json.loads(local(root, audit_holder["audit"]).read_bytes())
+                    for const in rec.get("statement", {}).get("constants", []):
+                        if const.get("name") == exp and const.get("file", "").endswith(".lean"):
+                            stmt_mods.append(const["file"][:-5].replace("/", "."))
+                except (OSError, ValueError):
+                    pass
+        if stmt_mods:
+            stmt_modules_by_cid[cid] = stmt_mods
+
+        if asm:
+            pkg = asm.get("package") or (closure or {}).get("package") or (sc or {}).get("package")
+            if not pkg:
+                raise ValueError(f"{cid}: assembly requires a package path")
+            if package and pkg != package:
+                continue
+            if not exp or not asm.get("module") or not asm.get("declaration"):
+                raise ValueError(f"{cid}: assembly requires expected, module, and declaration")
+            pkg_specs.setdefault(pkg, {})[cid] = dict(
+                cid=cid, package=pkg, expected=exp, module=asm["module"],
+                declaration=asm["declaration"], assumes=list(asm.get("assumes") or []),
+                name=asm.get("name"), statements=list(asm.get("statements") or ["Statements"]),
+                routine=list(asm.get("routine") or []), witness=asm.get("witness"),
+                statement_modules=stmt_mods,
+            )
+        elif w.get("status") == "closed" and closure and closure.get("package"):
+            pkg = closure["package"]
+            if package and pkg != package:
+                continue
+            if closure.get("declaration", "").startswith("Assembly."):
+                continue
+            targets = []
+            try:
+                rec = json.loads(local(root, closure["audit"]).read_bytes())
+                targets = list(rec.get("targets") or [])
+            except (OSError, ValueError):
+                pass
+            if targets:
+                pkg_specs.setdefault(pkg, {})[cid] = dict(
+                    cid=cid, package=pkg, expected=closure["expected"], module=targets[0],
+                    declaration=closure["declaration"], assumes=[], name=None,
+                    statements=list(rec.get("statements") or ["Statements"]),
+                    routine=list(rec.get("routine") or []),
+                    witness=(rec.get("hypotheses") or {}).get("declaration"),
+                    statement_modules=stmt_mods,
+                )
+
+    if not pkg_specs:
+        raise ValueError("No separable assembly specifications found in project.json")
+
+    expected_to_cid = {exp: cid for cid, exp in expected_by_cid.items()}
+    report = {"packages": {}}
+    project_changed = False
+
+    for pkg, specs in sorted(pkg_specs.items()):
+        pkg_root = local(root, pkg)
+        used_names = set()
+        ident_by_cid = {}
+        for cid in order:
+            if cid in specs:
+                chosen = specs[cid]["name"] or _lean_ident(cid, used_names)
+                if chosen in used_names:
+                    raise ValueError(f"{cid}: duplicate assembly theorem name {chosen}")
+                used_names.add(chosen)
+                ident_by_cid[cid] = chosen
+
+        # Normalize each claim's proof assumptions to (dep_cid_or_none, dep_expected).
+        deps_by_cid = {}
+        for cid, spec in specs.items():
+            resolved_deps = []
+            for dep in spec["assumes"]:
+                if dep in by_id:
+                    dep_exp = expected_by_cid.get(dep)
+                    if not dep_exp:
+                        raise ValueError(f"{cid}: assumed claim {dep} has no recorded expected Lean proposition")
+                    resolved_deps.append((dep, dep_exp))
+                elif dep in expected_to_cid:
+                    dep_cid = expected_to_cid[dep]
+                    resolved_deps.append((dep_cid, dep))
+                else:
+                    if not re.fullmatch(r"[A-Za-z_][\w']*(?:\.[A-Za-z_][\w']*)*", dep):
+                        raise ValueError(f"{cid}: unknown assumed claim or Lean identifier {dep}")
+                    resolved_deps.append((None, dep))
+            deps_by_cid[cid] = resolved_deps
+
+        # Topological sort over assembled claims in this package.
+        indegree = {cid: 0 for cid in specs}
+        dependents = {cid: [] for cid in specs}
+        for cid, deps in deps_by_cid.items():
+            for dep_cid, _ in deps:
+                if dep_cid in specs:
+                    indegree[cid] += 1
+                    dependents[dep_cid].append(cid)
+        ready = [cid for cid in order if cid in specs and indegree[cid] == 0]
+        topo = []
+        while ready:
+            cur = ready.pop(0)
+            topo.append(cur)
+            for nxt in dependents[cur]:
+                indegree[nxt] -= 1
+                if indegree[nxt] == 0:
+                    ready.append(nxt)
+            ready.sort(key=lambda c: order.index(c) if c in order else len(order))
+        if len(topo) != len(specs):
+            stuck = sorted(set(specs) - set(topo))
+            raise ValueError("Cyclic assembly dependency involving: " + ", ".join(stuck))
+
+        imports = set()
+        decls_lean = []
+        unresolved_by_cid = {}
+        claim_reports = []
+
+        for cid in topo:
+            spec = specs[cid]
+            imports.add(spec["module"])
+            imports.update(spec["statement_modules"])
+            unresolved = []
+            unresolved_keys = set()
+
+            def add_unresolved(dep_cid, dep_exp):
+                key = dep_cid or dep_exp
+                if key not in unresolved_keys:
+                    unresolved_keys.add(key)
+                    unresolved.append((dep_cid, dep_exp))
+                    if dep_cid and dep_cid in stmt_modules_by_cid:
+                        imports.update(stmt_modules_by_cid[dep_cid])
+
+            arg_exprs = []
+            for dep_cid, dep_exp in deps_by_cid[cid]:
+                if dep_cid in unresolved_by_cid:
+                    dep_unresolved = unresolved_by_cid[dep_cid]
+                    for u_cid, u_exp in dep_unresolved:
+                        add_unresolved(u_cid, u_exp)
+                    if dep_unresolved:
+                        u_args = " ".join("h_" + _lean_ident(u_cid or u_exp) for u_cid, u_exp in dep_unresolved)
+                        arg_exprs.append(f"({ident_by_cid[dep_cid]} {u_args})")
+                    else:
+                        arg_exprs.append(ident_by_cid[dep_cid])
+                else:
+                    add_unresolved(dep_cid, dep_exp)
+                    arg_exprs.append("h_" + _lean_ident(dep_cid or dep_exp))
+
+            unresolved_by_cid[cid] = unresolved
+            name = ident_by_cid[cid]
+            binders = "".join(f" (h_{_lean_ident(u_cid or u_exp)} : _root_.{u_exp})" for u_cid, u_exp in unresolved)
+            rhs = f"_root_.{spec['declaration']}" + ("" if not arg_exprs else " " + " ".join(arg_exprs))
+            decls_lean.append(f"theorem {name}{binders} : _root_.{spec['expected']} :=\n  {rhs}")
+
+            assumes_claims = [u_cid or u_exp for u_cid, u_exp in unresolved]
+            assumes_expected = [u_exp for _, u_exp in unresolved]
+            claim_reports.append(dict(
+                claim=cid,
+                declaration=f"Assembly.{name}",
+                expected=spec["expected"],
+                assumes_claims=assumes_claims,
+                assumes_expected=assumes_expected,
+                unconditional=not unresolved,
+            ))
+
+        if (pkg_root / "Statements.lean").is_file() and not any(m == "Statements" or m.startswith("Statements.") for m in imports):
+            imports.add("Statements")
+
+        header = "/- Generated by `atlas.py assemble`. Do not edit by hand. -/\n"
+        import_block = "\n".join(f"import {mod}" for mod in sorted(imports))
+        assembly_source = header + import_block + "\n\nnamespace Assembly\n\n" + "\n\n".join(decls_lean) + "\n\nend Assembly\n"
+        assembly_path = pkg_root / "Assembly.lean"
+        atomic(assembly_path, assembly_source.encode("utf-8"))
+
+        if run_audit:
+            contract_rel = "AssemblyContract.lean"
+            contract_imports = ["Assembly"]
+            if (pkg_root / "Examples.lean").is_file():
+                contract_imports.append("Examples")
+            for cid in topo:
+                spec = specs[cid]
+                if spec.get("witness") and "." in spec["witness"]:
+                    mod_guess = spec["witness"].rsplit(".", 1)[0]
+                    if (pkg_root / ("/".join(mod_guess.split(".")) + ".lean")).is_file():
+                        contract_imports.append(mod_guess)
+            contract_text = "\n".join(f"import {m}" for m in sorted(set(contract_imports))) + "\n"
+            atomic(pkg_root / contract_rel, contract_text.encode("utf-8"))
+            ev_dir = root / "evidence"
+            ev_dir.mkdir(exist_ok=True)
+            for item in claim_reports:
+                cid = item["claim"]
+                spec = specs[cid]
+                audit_data = audit_lean.audit(SimpleNamespace(
+                    package=pkg_root,
+                    contract=contract_rel,
+                    expected=item["expected"],
+                    declaration=item["declaration"],
+                    target=["Assembly"],
+                    statements=spec["statements"],
+                    routine=spec["routine"],
+                    assumes=item["assumes_expected"],
+                    witness=spec["witness"],
+                    statement_only=False,
+                ))
+                ev_rel = f"evidence/assembly-{ident_by_cid[cid]}.json"
+                atomic(root / ev_rel, (json.dumps(audit_data, indent=2) + "\n").encode("utf-8"))
+                w = p.setdefault("work", {}).setdefault(cid, {})
+                existing_closure = w.get("closure") or {}
+                w["closure"] = dict(
+                    package=pkg,
+                    expected=item["expected"],
+                    declaration=item["declaration"],
+                    audit=ev_rel,
+                    correspondence=existing_closure.get("correspondence") or w.get("scope") or f"Assembled proof for {cid}.",
+                )
+                w["checked_inputs"] = {(Path(pkg) / k).as_posix(): v for k, v in audit_data["checked_inputs"].items()}
+                w.setdefault("scope", w["closure"]["correspondence"])
+                if not w.get("run_log"):
+                    log_rel = f"evidence/assembly-{ident_by_cid[cid]}.log"
+                    atomic(root / log_rel, (audit_data.get("lean_output", "") + "\n").encode("utf-8"))
+                    w["run_log"] = log_rel
+                has_open_subproofs = any(part.get("status") != "checked" for part in w.get("subproofs", []))
+                if item["unconditional"]:
+                    w.pop("assumes", None)
+                    if not has_open_subproofs:
+                        w["status"] = "closed"
+                else:
+                    w["assumes"] = item["assumes_claims"]
+                    w["status"] = "conditional"
+                w["updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                project_changed = True
+
+        report["packages"][pkg] = dict(
+            assembly_file=(Path(pkg) / "Assembly.lean").as_posix(),
+            claims=claim_reports,
+        )
+
+    if project_changed:
+        atomic(root / "project.json", (json.dumps(p, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        build_local(root)
     return report
 
 
@@ -362,15 +710,23 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
     no_example = []
     subproof_lists = {}
     closed_results = 0
+    conditional_results = 0
+    prereqs_by_cid = {c["id"]: set() for c in claims}
+    for edge in edges:
+        prereqs_by_cid[edge["claim"]].add(edge["prerequisite"])
+    built_records = []
     for c in claims:
         cid = c["id"]
         w = work.get(cid, {})
         m = notes.get(cid, {})
         status = w.get("status", "open")
-        if status not in {"open", "drafted", "blocked", "attempted", "closed"}:
+        if status not in {"open", "drafted", "blocked", "attempted", "conditional", "closed"}:
             raise ValueError(f"{cid}: unsupported checkpoint status {status}")
         entry = {**c, **m, **w}
-        if status == "closed":
+        audit = None
+        receipt = None
+        assumed_items = []
+        if status in ("closed", "conditional"):
             closure = w["closure"]
             receipt = local(root, closure["audit"]).read_bytes()
             audit = json.loads(receipt)
@@ -381,17 +737,29 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
                 not w.get("scope") or not closure.get("correspondence") or
                 audit["expected"] != closure["expected"] or audit["declaration"] != closure["declaration"] or
                 set(audit["axioms"]) - {"propext", "Classical.choice", "Quot.sound"} or
-                any(part["status"] != "checked" for part in w.get("subproofs", []))):
+                (status == "closed" and any(part["status"] != "checked" for part in w.get("subproofs", [])))):
                 raise ValueError(f"{cid}: closure requires matching audit evidence, correspondence and resolved obligations")
+            if status == "closed" and (audit.get("assumes") or w.get("assumes")):
+                raise ValueError(f"{cid}: closed claim cannot have unresolved assumptions; use status 'conditional' until prerequisites close")
+            if status == "conditional" and not audit.get("assumes"):
+                raise ValueError(f"{cid}: conditional claim requires non-empty assumes in its audit receipt; upgrade to closed if unconditional")
             if not audit.get("statements"):
                 unchecked.append(cid)
             entry["hypotheses"] = audit.get("hypotheses")
-            if not audit.get("hypotheses"):
+            if status == "closed" and not audit.get("hypotheses"):
                 no_example.append(cid)
             (output / "logs").mkdir(exist_ok=True)
             name = hashlib.sha256(receipt).hexdigest() + ".json"
             atomic(output / "logs" / name, receipt)
             entry["audit_log"] = "logs/" + name
+            if status == "conditional":
+                assumed_items = _resolve_assumes_items(audit.get("assumes", []), w.get("assumes", []), by_id, work, notes)
+                for item in assumed_items:
+                    if item["id"] in by_id:
+                        prereqs_by_cid[cid].add(item["id"])
+        for dep in w.get("assumes", []):
+            if dep in by_id:
+                prereqs_by_cid[cid].add(dep)
         changed = [path for path, digest in w.get("checked_inputs", {}).items()
                    if not local(root, path).is_file() or hashlib.sha256(local(root, path).read_bytes()).hexdigest() != digest]
         if changed:
@@ -400,17 +768,21 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
             entry["summary"] = m.get("summary", "The paper claim is awaiting a fresh Lean check.")
             status = "awaiting recheck"
         checked = status == "closed"
-        statement_audit = audit if checked else None
+        is_conditional = status == "conditional"
+        statement_audit = audit if (checked or is_conditional) else None
         statement_checked = False
-        if not checked and w.get("statement_check"):
+        if not checked and not is_conditional and w.get("statement_check"):
             try:
                 statement_audit, _ = current_statement_audit(root, cid, w)
                 statement_checked = True
                 entry["hypotheses"] = statement_audit.get("hypotheses")
-            except ValueError:
+            except (ValueError, OSError):
                 statement_audit = None
-        active_audit = audit if checked else statement_audit
-        rd = reviews.packet(root,p,c,w,active_audit,comparisons.get(cid),reviews.history(root,cid),checked,statement_checked)
+        active_audit = audit if (checked or is_conditional) else statement_audit
+        rd = reviews.packet(root,p,c,w,active_audit,comparisons.get(cid),reviews.history(root,cid),
+                            checked,statement_checked,
+                            conditional=is_conditional,
+                            assumes=[item["reference"] for item in assumed_items] if is_conditional else ())
         rd["page"] = entry.get("page")
         rd["sources"] = reviews.exact_sources(root,w,active_audit) if active_audit else []
         rd["witness"] = reviews.witness_source(root,w,active_audit) if active_audit else None
@@ -428,12 +800,13 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         if unfolded:
             entry["unfolded_signatures"] = unfolded
         review_entries.append(rd)
-        atomic(output/reviews.review_url(cid),review_web.render(rd))
         entry["status"] = "correspondence under review" if rd["disputed"] else status
         if "analysis" in rd["view"]:
             entry["differences"] = reviews.differences(rd["view"]["analysis"])
         if c["kind"] != "conjecture" and checked and not rd["disputed"]:
             closed_results += 1
+        elif c["kind"] != "conjecture" and is_conditional and not rd["disputed"]:
+            conditional_results += 1
         entry.setdefault("reference", c["kind"].title())
         subproofs = []
         for part in w.get("subproofs", []):
@@ -449,11 +822,16 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         entry["subproofs"] = subproofs
         checked = status == "closed"
         has_parts = any(part["status"] == "checked" for part in subproofs)
+        cond_label = f"Conditional (assumes {', '.join(item['reference'] for item in assumed_items)})"
         label = ("Open conjecture" if c["kind"] == "conjecture" and status == "open" else
                  "Lean checked" if checked else "Awaiting Lean recheck" if changed else
+                 cond_label if is_conditional else
                  "Subproofs checked" if has_parts else
                  "Statement drafted (proof in progress)" if statement_checked else "No completed Lean check")
         verification = {"label": label}
+        if is_conditional:
+            verification["conditional"] = True
+            verification["assumes"] = assumed_items
         verification["review_url"] = reviews.review_url(cid)
         for key in ("stronger_result", "author_scope"):
             if rd[key]:
@@ -492,11 +870,41 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
             entry["log"] = "logs/" + name
             log_links[cid] = f'<p><a href="logs/{name}">Read the recorded Lean run</a></p>'
         entries.append(entry)
+        built_records.append((c, entry, rd, checked, is_conditional, label))
+
+    # Propagate Needs author confirmation from unattended quick-mode readings to transitive dependents.
+    direct_confirm = {rd["id"] for rd in review_entries if rd.get("needs_author_confirmation")}
+    for c, entry, rd, checked, is_conditional, label in built_records:
+        cid = c["id"]
+        visited = set()
+        stack = list(prereqs_by_cid.get(cid, ()))
+        while stack:
+            cur = stack.pop()
+            if cur in visited or cur == cid:
+                continue
+            visited.add(cur)
+            stack.extend(prereqs_by_cid.get(cur, ()))
+        via_ids = [u for u in (e["id"] for e in entries) if u in visited and u in direct_confirm]
+        via_items = [dict(id=u, reference=_claim_ref_label(u, by_id, notes), review_url=reviews.review_url(u))
+                     for u in via_ids]
+        rd["needs_author_confirmation_via"] = via_items
+        verification = entry["verification"]
+        if rd.get("needs_author_confirmation"):
+            verification["needs_author_confirmation"] = True
+        if via_items:
+            verification["needs_author_confirmation_via"] = via_items
+        atomic(output/reviews.review_url(cid), review_web.render(rd))
+
         url = "proofs/index.html#/claim/" + quote(cid, safe="")
         target = ' <strong class="proof-target">Current proof target</strong>' if cid == p.get("focus") else ''
         badge = f' · <a href="{url}?view=lean">{esc(label)}</a>'
-        if checked and not entry.get("hypotheses"):
+        if (checked or is_conditional) and not entry.get("hypotheses"):
             badge += f' · {NO_EXAMPLE}'
+        if rd.get("needs_author_confirmation"):
+            badge += f' · <a href="{reviews.review_url(cid)}"><strong>Needs author confirmation</strong></a>'
+        elif via_items:
+            via_refs = ", ".join(item["reference"] for item in via_items)
+            badge += f' · <a href="{reviews.review_url(cid)}"><strong>Needs author confirmation</strong> (depends on {esc(via_refs)})</a>'
         badge += f' · <a href="{reviews.review_url(cid)}">Review this claim</a>'
         if rd["disputed"]:
             badge += f' · {esc(rd["issue"])} · {esc(rd["actor"])}: {esc(rd["next"])}'
@@ -541,7 +949,8 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
     results = [e for e in entries if e["kind"] != "conjecture"]
     machine = sum("evidence" in e["verification"] for e in results)
     reviewed = sum(bool(e["verification"].get("approved")) for e in results)
-    pending = f" · {machine}/{total_results} machine verified · {reviewed}/{total_results} author reviewed"
+    cond_part = f" · {conditional_results} conditional" if conditional_results else ""
+    pending = f"{cond_part} · {machine}/{total_results} machine verified · {reviewed}/{total_results} author reviewed"
     atomic(output/"review.html",review_web.queue(review_entries))
     atomic(output/"edits.html",manuscript_edits.render(root))
     shutil.copyfile(assets/"review.css",output/"review.css")
@@ -565,8 +974,15 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         v = entry["verification"]
         mark = (f'<a class="verified-badge" href="{esc(v["url"])}">✓ {esc(v["remote"])}</a>'
                 if v.get("evidence") else f'<a class="status" href="{link}?view=lean">{esc(v["label"])}</a>')
+        extras = []
+        if v.get("needs_author_confirmation"):
+            extras.append(f'<a class="status" href="{esc(v["review_url"])}">Needs author confirmation</a>')
+        elif v.get("needs_author_confirmation_via"):
+            extras.append(f'<a class="status" href="{esc(v["review_url"])}">Needs author confirmation</a>')
         if "approval" in v:
-            mark = f'<span class="marks">{mark}<a class="status approval approved" href="{esc(v["review_url"])}">{esc(v["approval"])}</a></span>'
+            extras.append(f'<a class="status approval approved" href="{esc(v["review_url"])}">{esc(v["approval"])}</a>')
+        if extras:
+            mark = f'<span class="marks">{mark}{"".join(extras)}</span>'
         contents.append(f'<li><a class="toc-claim" href="{link}"><small>{esc(entry["reference"])}</small>'
                         f'<strong>{esc(entry["title"])}</strong></a>{mark}</li>')
     explorer = (template.replace("__MAST__", mast).replace("__TITLE__", esc(p["title"]))
@@ -613,10 +1029,12 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["build", "approve", "review", "review-inputs","compare","review-work"])
+    parser.add_argument("operation", choices=["build", "assemble", "approve", "review", "review-inputs","compare","review-work"])
     parser.add_argument("project", type=Path)
     parser.add_argument("claims", nargs="*", help="approve: claim labels (default: every closed claim awaiting approval)")
     parser.add_argument("--by", help="approve: the author approving the statements. Only the author runs approve")
+    parser.add_argument("--package", help="assemble: limit Assembly.lean generation to one project-relative Lean package")
+    parser.add_argument("--audit", action="store_true", help="assemble: audit each assembled claim and update project.json")
     parser.add_argument("--ci-receipt", type=Path, help="Evidence downloaded from the trusted Lean workflow")
     parser.add_argument("--commit", help="Git revision being rendered")
     parser.add_argument("--artifact-id", type=int, help="ID of the GitHub artifact containing the supplied CI receipt")
@@ -628,7 +1046,10 @@ if __name__ == "__main__":
     parser.add_argument("--require-ci",action="store_true",help="review-work: verify receipt coverage for the current checkout commit")
     args = parser.parse_args()
     try:
-        if args.operation == "review-work":
+        if args.operation == "assemble":
+            report = assemble(args.project.resolve(), package=args.package, run_audit=args.audit)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        elif args.operation == "review-work":
             report = review_work(args.project.resolve(),args.claims,require_ci=args.require_ci,ci_receipt=args.ci_receipt)
             print(json.dumps(report,ensure_ascii=False,indent=2))
             if args.check and (report["agent_tasks"] or report["uncommitted_delivery_files"] or report["ci_pending"]):

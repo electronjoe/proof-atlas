@@ -54,6 +54,70 @@ class AuditMetadataHelpers(unittest.TestCase):
             forked = {p["name"]: p for p in audit_lean.external_packages(root)}
             self.assertTrue(forked["mathlib"]["third_party"])
 
+    def test_expected_claim_type_and_theorem_info_report(self):
+        self.assertEqual(audit_lean.expected_claim_type("Statements.Main"), "Statements.Main")
+        self.assertEqual(
+            audit_lean.expected_claim_type("Statements.Main", ["Statements.A", "Statements.B"]),
+            "Statements.A → Statements.B → Statements.Main",
+        )
+        self.assertTrue(audit_lean.theorem_info_report("'main' does not depend on any axioms\nPROOF-ATLAS-DECL-KIND theorem\n", "main"))
+        with self.assertRaisesRegex(ValueError, r"must be a Lean theorem \(\.thmInfo\), found def"):
+            audit_lean.theorem_info_report("PROOF-ATLAS-DECL-KIND def\n", "main")
+        with self.assertRaisesRegex(ValueError, r"must be a Lean theorem \(\.thmInfo\), found axiom"):
+            audit_lean.theorem_info_report("PROOF-ATLAS-DECL-KIND axiom\n", "main")
+        with self.assertRaisesRegex(ValueError, r"Could not verify kernel declaration kind"):
+            audit_lean.theorem_info_report("no marker\n", "main")
+
+    def test_routine_isolation_and_prelude_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel in ("Prelude.lean", "Routine/Base.lean", "Routine/Glue.lean",
+                        "Statements/Main.lean", "Proofs/Main.lean"):
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("-- stub\n", encoding="utf-8")
+
+            def fake_deps(imports_by_file):
+                def _lake_json(lake, arguments, cwd, env, stdin=None):
+                    paths = [line for line in stdin.decode().splitlines() if line]
+                    return [{"imports": [
+                        {"errors": [], "result": {"imports": [{"module": m} for m in imports_by_file[p]]}}
+                        for p in paths
+                    ]}]
+                return _lake_json
+
+            clean_map = {
+                "Prelude.lean": ["Mathlib.Data.Nat.Basic"],
+                "Routine/Base.lean": ["Prelude"],
+                "Routine/Glue.lean": ["Prelude", "Routine.Base", "Mathlib.Tactic"],
+            }
+            with patch.object(audit_lean, "lake_json", side_effect=fake_deps(clean_map)):
+                mods = audit_lean.check_routine(["lake"], root, {}, routine_paths=["Routine"])
+            self.assertEqual(mods, ["Routine.Base", "Routine.Glue"])
+
+            # Routine/ importing Statements/ or Proofs/ must fail.
+            for forbidden in ("Statements.Main", "Proofs.Main"):
+                bad_map = dict(clean_map, **{"Routine/Glue.lean": ["Prelude", forbidden]})
+                with patch.object(audit_lean, "lake_json", side_effect=fake_deps(bad_map)):
+                    with self.assertRaisesRegex(ValueError, r"Routine module Routine/Glue\.lean imports " + forbidden.replace(".", r"\.")):
+                        audit_lean.check_routine(["lake"], root, {}, checked_files=["Routine/Glue.lean"])
+
+            # Prelude.lean importing a local proof module must fail.
+            bad_prelude = dict(clean_map, **{"Prelude.lean": ["Proofs.Main"]})
+            with patch.object(audit_lean, "lake_json", side_effect=fake_deps(bad_prelude)):
+                with self.assertRaisesRegex(ValueError, r"Prelude\.lean imports local modules \(Proofs\.Main\)"):
+                    audit_lean.check_routine(["lake"], root, {}, checked_files=["Routine/Base.lean"])
+
+    def test_statement_only_rejects_assumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Contract.lean").write_text("-- stub\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "--statement-only does not accept --assumes"):
+                audit_lean.audit(SimpleNamespace(
+                    package=root, contract="Contract.lean", expected="Statements.Main",
+                    statements=["Statements"], assumes=["Statements.Lem"], statement_only=True,
+                ))
+
 
 class StaticHygieneScan(unittest.TestCase):
     def scan(self, files, statement_files=()):
@@ -545,6 +609,63 @@ class AuditClosure(unittest.TestCase):
             with patch.object(audit_lean, "run", side_effect=AssertionError("build should not run")):
                 with self.assertRaisesRegex(ValueError, r"Proofs/Main\.lean:4: #eval"):
                     audit_lean.audit(args)
+
+    def test_conditional_assumes_routine_prelude_and_thminfo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pin = os.environ["ELAN_TOOLCHAIN"]
+            (root/"lean-toolchain").write_text(pin)
+            (root/"lakefile.toml").write_text(
+                'name = "Example"\n'
+                '[[lean_lib]]\nname = "Prelude"\n'
+                '[[lean_lib]]\nname = "Statements"\n'
+                '[[lean_lib]]\nname = "Routine"\n'
+                '[[lean_lib]]\nname = "Proofs"\n'
+            )
+            for folder in ("Statements", "Routine", "Proofs"):
+                (root/folder).mkdir()
+            sources = {
+                "Prelude.lean": "-- pure external imports only\n",
+                "Statements/Main.lean": (
+                    "import Prelude\n"
+                    "def LemA : Prop := ∀ n : Nat, n = n\n"
+                    "def ThmB : Prop := ∀ n : Nat, n + 0 = n\n"
+                ),
+                "Routine/Glue.lean": "import Prelude\ntheorem add_zero_glue (n : Nat) : n + 0 = n := Nat.add_zero n\n",
+                "Proofs/B.lean": (
+                    "import Statements.Main\nimport Routine.Glue\n"
+                    "theorem main_cond (_hA : LemA) : ThmB := fun n => add_zero_glue n\n"
+                    "def not_a_theorem : ThmB := fun n => add_zero_glue n\n"
+                ),
+                "Contract.lean": "import Statements.Main\nimport Proofs.B\n",
+            }
+            for name, body in sources.items():
+                (root/name).write_text(body, encoding="utf-8")
+            env = os.environ.copy()
+            lake = audit_lean.select_lake(root, pin, env, sys.stderr, offline=True)
+            subprocess.run([*lake, "update"], cwd=root, env=env, check=True)
+
+            receipt = audit_lean.audit(SimpleNamespace(
+                package=root, contract="Contract.lean", expected="ThmB", declaration="main_cond",
+                target=["Proofs.B"], statements=["Statements"], routine=["Routine"], assumes=["LemA"],
+            ))
+            self.assertTrue(receipt["theorem_info"])
+            self.assertEqual(receipt["assumes"], ["LemA"])
+            self.assertEqual(receipt["routine"], ["Routine.Glue"])
+
+            # Non-theorem declarations (def) are rejected by the kernel .thmInfo check.
+            with self.assertRaisesRegex(ValueError, r"must be a Lean theorem \(\.thmInfo\), found def"):
+                audit_lean.audit(SimpleNamespace(
+                    package=root, contract="Contract.lean", expected="ThmB", declaration="not_a_theorem",
+                    target=["Proofs.B"], statements=["Statements"],
+                ))
+
+            # Assumed proposition outside Statements/ (e.g. True) is rejected.
+            with self.assertRaisesRegex(ValueError, r"assumed proposition True is defined in .*not a statement module"):
+                audit_lean.audit(SimpleNamespace(
+                    package=root, contract="Contract.lean", expected="ThmB", declaration="main_cond",
+                    target=["Proofs.B"], statements=["Statements"], assumes=["True"],
+                ))
 
 
 if __name__ == "__main__":
