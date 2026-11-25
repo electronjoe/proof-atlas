@@ -119,11 +119,41 @@ function proofView(c,view) {
   } else {
     const checks=el("div",null,"lean-checks");
     checks.append(el("strong",c.verification.label));
+    if(c.axiom_profile) checks.append(el("span",c.axiom_profile,"muted"));
     if(v.approval) checks.append(el("strong",v.approval));
     if(c.audit_log) checks.append(link("Declaration and axiom audit",c.audit_log));
     if(c.log) checks.append(link("Lean run log",c.log));
     if(v.remote && !v.evidence) checks.append(link(v.remote,v.url));
     pane.append(checks);
+    if(c.noncomputable_constants?.length){
+      const nc=el("p","Noncomputable definitions in statement: ","muted");
+      c.noncomputable_constants.forEach((name,idx)=>{
+        if(idx) nc.append(document.createTextNode(", "));
+        nc.append(el("code",name));
+      });
+      nc.append(document.createTextNode(". Check whether any paper claim of an explicit or computable algorithm is affected."));
+      pane.append(nc);
+    }
+    const thirdParty=(c.external_packages||[]).filter(p=>p.third_party);
+    if(thirdParty.length){
+      pane.append(el("h3","Third-party external dependencies"),el("p","This Lean package imports non-Mathlib external repositories.","muted"));
+      const list=el("ul");
+      for(const pkg of thirdParty){
+        const item=el("li");
+        item.append(el("code",pkg.name),document.createTextNode(" ("+(pkg.rev||"").slice(0,12)+")"+(pkg.url?" · "+pkg.url:"")));
+        list.append(item);
+      }
+      pane.append(list);
+    }
+    if(c.unfolded_signatures?.length){
+      const details=el("details");
+      details.append(el("summary","Notation-free Lean signatures (pp.notation false)"));
+      for(const sig of c.unfolded_signatures){
+        const heading=sig.name+" · "+sig.file+(sig.lines?" L"+sig.lines[0]:"")+(sig.noncomputable?" · noncomputable":"");
+        details.append(el("h4",heading),el("pre",sig.pp_no_notation));
+      }
+      pane.append(details);
+    }
     if(c.hypotheses){
       // The audit derived this proposition from the statement and checked the example proves it.
       const note=el("p","The hypotheses can hold. ","muted");

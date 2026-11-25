@@ -77,8 +77,44 @@ def render(data,secret=None,notice=""):
             parts.append('</aside>')
         return "".join(parts)+'</section>'
     def sources(items):
-        return ''.join(f'<details><summary>{esc(s["name"])} · {esc(s["file"])} L{s["lines"][0]}</summary>'
-                       f'<pre>{esc(s["text"])}</pre></details>' for s in items)
+        rendered = []
+        for s in items:
+            nc = " · noncomputable" if s.get("noncomputable") else ""
+            unfolded = (
+                '<details><summary>Notation-free Lean signature (pp.notation false)</summary>'
+                f'<pre>{esc(s["pp_no_notation"])}</pre></details>'
+                if s.get("pp_no_notation") else ""
+            )
+            rendered.append(
+                f'<details><summary>{esc(s["name"])} · {esc(s["file"])} L{s["lines"][0]}{nc}</summary>'
+                f'<pre>{esc(s["text"])}</pre>{unfolded}</details>'
+            )
+        return "".join(rendered)
+    def metadata_panel():
+        parts = []
+        if data.get("axiom_profile"):
+            parts.append(f'<p><strong>Axiom profile:</strong> {esc(data["axiom_profile"])}</p>')
+        if data.get("noncomputable_constants"):
+            names = ", ".join(f'<code>{esc(n)}</code>' for n in data["noncomputable_constants"])
+            parts.append(
+                f'<p><strong>Noncomputable definitions in statement:</strong> {names}. '
+                'If the paper claims an explicit construction, algorithm, or runtime bound, verify whether this affects the claim.</p>'
+            )
+        pkgs = data.get("external_packages") or []
+        third_party = [p for p in pkgs if p.get("third_party")]
+        if third_party:
+            items = "".join(
+                f'<li><code>{esc(p["name"])}</code> ({esc(p["rev"][:12])})'
+                + (f' · {esc(p["url"])}' if p.get("url") else "")
+                + '</li>'
+                for p in third_party
+            )
+            parts.append(
+                '<section><h2>Third-party external dependencies</h2>'
+                '<p>This Lean package depends on non-Mathlib external repositories. Review any definitions or lemmas imported from them.</p>'
+                f'<ul>{items}</ul></section>'
+            )
+        return "".join(parts)
     def columns(view):
         return ('<div class="columns"><section><h2>Paper theorem</h2>'+para(view["paper_reading"])+
                 para(view["paper_refs"])+'<details><summary>Original manuscript passage</summary><pre>'+esc(view["excerpt"])+'</pre></details></section>'
@@ -88,6 +124,7 @@ def render(data,secret=None,notice=""):
     if data.get("statement_checked") and not data["checked"]:
         body+='<p><strong>Statement drafted (proof in progress)</strong> · Lean checked the statement definitions; the proof is not closed yet.</p>'
     body+=para(notice)+para(data["assessment"])
+    body+=metadata_panel()
     body+=default_panel(data.get("defaults", []), v)
     if data["stronger_result"]:
         body+='<aside id="scope-note"><h2>Lean proves more</h2>'+para(data["stronger_result"])+'</aside>'

@@ -184,6 +184,10 @@ partial def proofAtlasDefaults (heads : Lean.NameSet) (e : Lean.Expr) (acc : Arr
   let env ← Lean.getEnv
   let local_ : Lean.NameSet := (__LOCAL__ : List String).foldl (fun s m => s.insert m.toName) {}
   let heads : Lean.NameSet := (__DEFAULTS__ : List String).foldl (fun s m => s.insert m.toName) {}
+  let ppNoNot (e : Lean.Expr) : Lean.CoreM String := do
+    let opts := (← Lean.getOptions).setBool `pp.notation false
+    Lean.withOptions (fun _ => opts) do
+      return toString (← (Lean.Meta.ppExpr e).run')
   let mut todo := #[(__ROOT__ : String).toName]
   let mut seen : Lean.NameSet := {}
   while !todo.isEmpty do
@@ -204,6 +208,10 @@ partial def proofAtlasDefaults (heads : Lean.NameSet) (e : Lean.Expr) (acc : Arr
     let range ← Lean.findDeclarationRanges? n
     let text := s!"{kind} {ci.levelParams} : {proofAtlasCanon ci.type}" ++
       (value.map (s!" := {proofAtlasCanon ·}")).getD ""
+    let ppType ← ppNoNot ci.type
+    let ppVal ← value.mapM ppNoNot
+    let ppNoNotation := ppType ++ (ppVal.map (s!" := {·}")).getD ""
+    let noncomp := Lean.isNoncomputable env n
     let mut uses : Array Lean.Json := #[]
     for (c, t) in proofAtlasDefaults heads ci.type ((value.map (proofAtlasDefaults heads · #[])).getD #[]) do
       let mut ty := []
@@ -213,6 +221,7 @@ partial def proofAtlasDefaults (heads : Lean.NameSet) (e : Lean.Expr) (acc : Arr
       uses := uses.push (Lean.Json.mkObj ([("construct", Lean.Json.str (toString c))] ++ ty))
     IO.println <| "PROOF-ATLAS-CONSTANT " ++ (Lean.Json.mkObj [("name", toString n),
       ("module", Lean.toJson (mod.map toString)), ("canonical", text), ("defaults", Lean.Json.arr uses),
+      ("noncomputable", Lean.toJson noncomp), ("pp_no_notation", Lean.Json.str ppNoNotation),
       ("lines", Lean.toJson (range.map fun r => #[r.range.pos.line, r.range.endPos.line]))]).compress
 '''
 
@@ -252,6 +261,56 @@ def default_meaning(use):
     return DEFAULT_VALUES.get(use["construct"], "")
 
 
+STD_MATHLIB_PACKAGES = {
+    "mathlib", "std", "batteries", "aesop", "qq", "cli",
+    "proofwidgets", "importgraph", "plausible", "leansearchclient", "checkdecls",
+}
+KNOWN_UPSTREAM_ORGS = re.compile(
+    r"^https?://github\.com/(?:leanprover|leanprover-community)/"
+    r"|^https?://github\.com/Siddhartha-Gadgil/LeanSearchClient(?:\.git)?/?$",
+    re.I,
+)
+
+
+def external_packages(root):
+    """List pinned external packages from lake-manifest.json, flagging non-Mathlib third-party repos."""
+    manifest = json.loads((root / "lake-manifest.json").read_bytes())
+    direct_names = set()
+    toml_path = root / "lakefile.toml"
+    if toml_path.is_file():
+        import tomllib
+        try:
+            config = tomllib.loads(toml_path.read_text(encoding="utf-8-sig"))
+            for req in config.get("require", []):
+                if isinstance(req, dict) and isinstance(req.get("name"), str):
+                    direct_names.add(req["name"])
+        except (OSError, ValueError):
+            pass
+    result = []
+    for pkg in sorted(manifest.get("packages", []), key=lambda item: item.get("name", "").casefold()):
+        name = pkg.get("name", "")
+        inherited = bool(pkg.get("inherited", False))
+        direct = (name in direct_names) if direct_names else (not inherited)
+        url = pkg.get("url", "")
+        rev = pkg.get("rev", "")
+        official = name.casefold() in STD_MATHLIB_PACKAGES and (not url or bool(KNOWN_UPSTREAM_ORGS.match(url)))
+        entry = dict(name=name, rev=rev, direct=direct, third_party=not official)
+        if url:
+            entry["url"] = url
+        result.append(entry)
+    return result
+
+
+def axiom_profile(axioms):
+    """Human-readable summary of a declaration's standard Lean axiom profile."""
+    if not axioms:
+        return "Constructive (0 axioms)"
+    ordered = sorted(axioms)
+    if "Classical.choice" in ordered:
+        return "Standard classical axioms (" + ", ".join(ordered) + ")"
+    return "Standard Lean axioms (" + ", ".join(ordered) + ")"
+
+
 def statement_record(lake, root, env, contract, expected):
     """Hash the expected proposition and every definition of this package it unfolds to.
 
@@ -272,7 +331,9 @@ def statement_record(lake, root, env, contract, expected):
     if result.returncode or not rows or rows[0]["name"] != expected:
         raise ValueError("Could not list the definitions behind the expected statement:\n" + output)
     constants = sorted((dict(name=row["name"], file=modules.get(row["module"], contract), lines=row["lines"],
-                             sha256=hashlib.sha256(row["canonical"].encode()).hexdigest()) for row in rows),
+                             sha256=hashlib.sha256(row["canonical"].encode()).hexdigest(),
+                             noncomputable=bool(row.get("noncomputable", False)),
+                             pp_no_notation=row.get("pp_no_notation", "")) for row in rows),
                        key=lambda c: c["name"])
     digest = hashlib.sha256("".join(f'{c["name"]} {c["sha256"]}\n' for c in constants).encode()).hexdigest()
     found = {(row["name"], use["construct"], use.get("type", "")): row for row in rows for use in row["defaults"]}
@@ -479,14 +540,18 @@ def audit(args):
         final = hash_paths(root, final_scope)
     if initial != final:
         raise ValueError("Package inputs changed during the audit; rerun on stable sources")
+    ext_pkgs = external_packages(root)
+    profile = axiom_profile(axioms)
     if statement_only:
         return dict(statement_only=True, contract=contract_path, expected=args.expected,
-                    toolchain=pin, axioms=axioms, targets=targets, input_scope="module-closure",
+                    toolchain=pin, axioms=axioms, axiom_profile=profile, external_packages=ext_pkgs,
+                    targets=targets, input_scope="module-closure",
                     checked_inputs=initial, statements=statements, lean_output=output.strip(),
                     statement=statement, defaults=defaults,
                     **({"hypotheses": hypotheses} if hypotheses else {}))
     return dict(declaration=declaration, contract=contract_path,
-                expected=args.expected, toolchain=pin, axioms=axioms,
+                expected=args.expected, toolchain=pin, axioms=axioms, axiom_profile=profile,
+                external_packages=ext_pkgs,
                 targets=targets, input_scope="module-closure" if scoped is not None else "full-package",
                 checked_inputs=initial, statements=statements, lean_output=output.strip(),
                 **({"statement": statement, "defaults": defaults} if statement else {}),

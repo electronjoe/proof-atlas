@@ -445,3 +445,74 @@ class StatementApproval(unittest.TestCase):
         drifted = self.packet()
         self.assertFalse(drifted["approved"])
         self.assertEqual(drifted["assessment"], "Comparison pending")
+
+    def test_weaker_conclusion_cannot_match_and_surfaces_metadata(self):
+        from review_web import render
+        path = self.root / "audit.json"
+        audit = json.loads(path.read_bytes())
+        audit["axioms"] = ["Classical.choice", "propext", "Quot.sound"]
+        audit["axiom_profile"] = "Standard classical axioms (Classical.choice, Quot.sound, propext)"
+        audit["external_packages"] = [
+            {"name": "mathlib", "rev": "a" * 40, "url": "https://github.com/leanprover-community/mathlib4",
+             "direct": True, "third_party": False},
+            {"name": "riemann-roch", "rev": "b" * 40, "url": "https://github.com/example/riemann-roch",
+             "direct": True, "third_party": True},
+        ]
+        for const in audit["statement"]["constants"]:
+            if const["name"] == "rate":
+                const["noncomputable"] = True
+                const["pp_no_notation"] = "Nat → Nat := fun n => HAdd.hAdd n 1"
+            else:
+                const["noncomputable"] = False
+                const["pp_no_notation"] = "Prop := GT.gt (rate 0) 0"
+        path.write_text(json.dumps(audit), encoding="utf-8")
+
+        # weaker conclusion is rejected when result == "match".
+        weaker_case = dict(case="C2: runtime bound", paper="O(n log n) algorithm", lean="Existence only (noncomputable)",
+                           why="Lean proves existence without runtime complexity.", kind="weaker conclusion")
+        bad_analysis = dict(summary="Omitted algorithmic bound.", scope="Existence only.",
+                            cases=[weaker_case], advice="Keep claim open until runtime bound is proved.",
+                            suggested_feedback="Should the runtime bound remain an open obligation?")
+        with self.assertRaisesRegex(ValueError, "weaker conclusion cannot be recorded as a match"):
+            self.compare("match", analysis=bad_analysis)
+
+        # Accepted with result == "difference"; keeps closed_results at 0 on dashboard.
+        self.compare("difference", analysis=bad_analysis, issue="Runtime bound omitted.",
+                     actor="Proof agent", next="Track runtime bound as an open subproof.")
+        pkt = self.packet()
+        self.assertTrue(pkt["disputed"])
+        self.assertEqual(pkt["noncomputable_constants"], ["rate"])
+        self.assertIn("Standard classical axioms", pkt["axiom_profile"])
+
+        # review-inputs --side lean carries noncomputable, pp_no_notation, external_packages, and axiom_profile.
+        script = Path(__file__).resolve().parents[1] / "scripts/atlas.py"
+        lean_side = json.loads(subprocess.check_output(
+            [sys.executable, str(script), "review-inputs", str(self.root), "t", "--side", "lean"], text=True))
+        self.assertEqual(lean_side["noncomputable_constants"], ["rate"])
+        self.assertIn("Standard classical axioms", lean_side["axiom_profile"])
+        self.assertEqual([p["name"] for p in lean_side["external_packages"] if p["third_party"]], ["riemann-roch"])
+        by_name = {s["name"]: s for s in lean_side["lean"]}
+        self.assertTrue(by_name["rate"]["noncomputable"])
+        self.assertIn("HAdd.hAdd", by_name["rate"]["pp_no_notation"])
+        self.assertIn("GT.gt", by_name["Statement"]["pp_no_notation"])
+
+        # Review HTML and built Explorer payload surface all Phase 2a metadata and weaker conclusion.
+        html_page = render(pkt).decode("utf-8")
+        self.assertIn("<small>weaker conclusion</small>", html_page)
+        self.assertIn("Noncomputable definitions in statement:", html_page)
+        self.assertIn("Third-party external dependencies", html_page)
+        self.assertIn("riemann-roch", html_page)
+        self.assertNotIn("mathlib4", html_page)
+        self.assertIn("Notation-free Lean signature (pp.notation false)", html_page)
+        self.assertIn("HAdd.hAdd", html_page)
+        self.assertIn("Standard classical axioms", html_page)
+
+        with redirect_stdout(io.StringIO()):
+            atlas.build(self.root)
+        dashboard = (self.root / "dist/progress.html").read_text(encoding="utf-8")
+        self.assertIn("0 of 1 stated results closed", dashboard)
+        self.assertIn("1 difference from the paper", dashboard)
+        explorer = (self.root / "dist/proofs/index.html").read_text(encoding="utf-8")
+        self.assertIn('"noncomputable_constants": ["rate"]', explorer)
+        self.assertIn('"unfolded_signatures":', explorer)
+        self.assertIn("riemann-roch", explorer)

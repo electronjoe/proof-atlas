@@ -42,7 +42,9 @@ During proof work, the queue can show “Statement drafted (proof in progress)�
 
 ## What am I being asked to decide?
 
-In “How the statements compare,” each row explains how the formal theorem relates to one case in the paper. For a classified comparison, the dashboard’s difference count links to the cases in the Paper view. For example, “other form” can mean the same bound uses a different index, while “restriction” means the Lean statement covers a narrower domain. Older comparisons say “not classified” until their cases are labeled.
+In “How the statements compare,” each row explains how the formal theorem relates to one case or numbered clause in the paper. For a classified comparison, the dashboard’s difference count links to the cases in the Paper view. For example, “other form” can mean the same bound uses a different index, “restriction” means the Lean statement covers a narrower domain, and “weaker conclusion” means Lean proves a coarser bound, omits a conclusion clause, or leaves an algorithmic, runtime, or explicitness claim unproved. A “weaker conclusion” cannot be marked as a match: the missing obligation stays tracked as an open subproof and leaves the parent claim open (“Subproofs checked”) until proved. Older comparisons say “not classified” until their cases are labeled.
+
+The review page and Lean view also show three statement metadata checks: the declaration’s axiom profile (constructive with zero axioms versus standard classical axioms), any `noncomputable` definitions referenced by the statement (so you can spot when an “explicit” or algorithmic claim relies on noncomputable choice), any non-Mathlib third-party external repositories in `lake-manifest.json`, and an expandable notation-free Lean signature (`pp.notation false`) beside each definition’s source code.
 
 Read “Scope of the conclusion” and “Agent recommendation” before deciding. When an assumption or endpoint is in doubt, the agent supplies wording you can use or edit when reporting the difference. Only your explicit decision records an author review.
 

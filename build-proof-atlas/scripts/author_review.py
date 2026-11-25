@@ -10,7 +10,7 @@ from pathlib import Path
 BADGE = "Author reviewed the theorem statement proved in Lean"
 ADVICE = {"match": "Recommend approval", "difference": "Report a difference", "unsure": "Hold approval for clarification"}
 # How each compared case relates to the paper. Every kind except "agrees" counts as a difference.
-KINDS = ("agrees", "added hypothesis", "restriction", "chosen reading", "other form", "stronger")
+KINDS = ("agrees", "added hypothesis", "restriction", "chosen reading", "other form", "stronger", "weaker conclusion")
 
 
 def differences(analysis):
@@ -32,6 +32,8 @@ def validate_analysis(analysis, result, require_kinds=False):
         raise ValueError("Explain at least one case with its paper claim, Lean claim and mathematical justification")
     if any(row.get("kind", KINDS[0]) not in KINDS or require_kinds and "kind" not in row for row in cases):
         raise ValueError("Give each case a kind: " + ", ".join(KINDS))
+    if result == "match" and any(row.get("kind") == "weaker conclusion" for row in cases):
+        raise ValueError("A weaker conclusion cannot be recorded as a match; use difference or unsure")
     if (result != "match" or "suggested_feedback" in analysis) and not present(analysis, ("suggested_feedback",)):
         raise ValueError("Supply suggested feedback the author can use to describe the difference or question")
 
@@ -68,7 +70,14 @@ def history(root, cid):
 
 def packet(root, project, claim, work, audit, comparison, events, checked, statement_checked=False):
     from atlas import statement_defaults
+    from audit_lean import axiom_profile as format_axiom_profile
     defaults = statement_defaults(audit) if checked or statement_checked else []
+    axiom_prof = ""
+    if audit and (checked or statement_checked) and "axioms" in audit:
+        axiom_prof = audit.get("axiom_profile") or format_axiom_profile(audit["axioms"])
+    ext_pkgs = list((audit or {}).get("external_packages") or []) if checked or statement_checked else []
+    noncomp = sorted(c["name"] for c in (audit or {}).get("statement", {}).get("constants", [])
+                     if c.get("noncomputable")) if checked or statement_checked else []
     keys = bindings(project, claim, audit)
     has_statement = bool((checked or statement_checked) and keys["statement"])
     current = comparison and comparison.get("bindings") == keys and has_statement
@@ -127,6 +136,7 @@ def packet(root, project, claim, work, audit, comparison, events, checked, state
         issue, actor, step = "", "Author (optional)", "Review the comparison whenever convenient."
     return dict(id=claim["id"], title=claim["title"], view=view, version=version,
                 token=digest([version, comparison, last.get("id"), checked, bool(statement_checked), defaults]), events=events, defaults=defaults,
+                axiom_profile=axiom_prof, external_packages=ext_pkgs, noncomputable_constants=noncomp,
                 checked=checked, statement_checked=bool(checked or statement_checked),
                 approved=approved, preapproved=preapproved, disputed=disputed,
                 ready=bool("analysis" in view and comp.get("result")=="match" and not disputed),
@@ -158,8 +168,13 @@ def exact_sources(root, work, audit):
             continue
         seen.add((c["file"],tuple(lines)))
         source = local(root, package + "/" + c["file"]).read_text(encoding="utf-8-sig").splitlines()
-        result.append(dict(name=c["name"], file=c["file"], lines=lines,
-                           text="\n".join(source[lines[0]-1:lines[1]])))
+        item = dict(name=c["name"], file=c["file"], lines=lines,
+                    text="\n".join(source[lines[0]-1:lines[1]]))
+        if c.get("noncomputable"):
+            item["noncomputable"] = True
+        if c.get("pp_no_notation"):
+            item["pp_no_notation"] = c["pp_no_notation"]
+        result.append(item)
     return result
 
 

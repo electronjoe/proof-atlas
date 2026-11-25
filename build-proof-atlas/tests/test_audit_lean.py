@@ -1,4 +1,5 @@
 """Offline integration regression. Set ELAN_TOOLCHAIN to an installed Lean pin."""
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +11,48 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import audit_lean
+
+
+class AuditMetadataHelpers(unittest.TestCase):
+    def test_axiom_profile_and_external_packages(self):
+        self.assertEqual(audit_lean.axiom_profile([]), "Constructive (0 axioms)")
+        self.assertEqual(audit_lean.axiom_profile(["propext", "Quot.sound"]),
+                         "Standard Lean axioms (Quot.sound, propext)")
+        self.assertEqual(audit_lean.axiom_profile(["propext", "Classical.choice", "Quot.sound"]),
+                         "Standard classical axioms (Classical.choice, Quot.sound, propext)")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "lakefile.toml").write_text(
+                'name = "Example"\n[[require]]\nname = "mathlib"\n[[require]]\nname = "customlib"\n',
+                encoding="utf-8",
+            )
+            manifest = {
+                "packagesDir": ".lake/packages",
+                "packages": [
+                    {"name": "mathlib", "type": "git", "rev": "a" * 40,
+                     "url": "https://github.com/leanprover-community/mathlib4.git", "inherited": False},
+                    {"name": "batteries", "type": "git", "rev": "b" * 40,
+                     "url": "https://github.com/leanprover-community/batteries", "inherited": True},
+                    {"name": "LeanSearchClient", "type": "git", "rev": "c" * 40,
+                     "url": "https://github.com/Siddhartha-Gadgil/LeanSearchClient", "inherited": True},
+                    {"name": "customlib", "type": "git", "rev": "d" * 40,
+                     "url": "https://github.com/example/customlib", "inherited": False},
+                ],
+            }
+            (root / "lake-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            pkgs = {p["name"]: p for p in audit_lean.external_packages(root)}
+            self.assertFalse(pkgs["mathlib"]["third_party"])
+            self.assertTrue(pkgs["mathlib"]["direct"])
+            self.assertFalse(pkgs["batteries"]["third_party"])
+            self.assertFalse(pkgs["LeanSearchClient"]["third_party"])
+            self.assertTrue(pkgs["customlib"]["third_party"])
+            self.assertTrue(pkgs["customlib"]["direct"])
+
+            # A forked mathlib from a non-upstream repo is still flagged as third-party.
+            manifest["packages"][0]["url"] = "https://github.com/untrusted/mathlib4.git"
+            (root / "lake-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            forked = {p["name"]: p for p in audit_lean.external_packages(root)}
+            self.assertTrue(forked["mathlib"]["third_party"])
 
 
 @unittest.skipUnless(os.environ.get("ELAN_TOOLCHAIN"), "requires an installed pinned Lean toolchain")
@@ -349,6 +392,57 @@ class AuditClosure(unittest.TestCase):
                 package=root, contract="Contract.lean", expected="Statement", declaration="main",
                 target=["Proofs.Main"], statements=["Statements"], witness="nonempty"))
             self.assertEqual(stmt["statement"]["sha256"], closed["statement"]["sha256"])
+
+    def test_statement_metadata_noncomputable_pp_and_axioms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pin = os.environ["ELAN_TOOLCHAIN"]
+            (root/"lean-toolchain").write_text(pin)
+            (root/"lakefile.toml").write_text('name = "Example"\n[[lean_lib]]\nname = "Statements"\n'
+                                              '[[lean_lib]]\nname = "Proofs"\n')
+            (root/"Statements").mkdir()
+            (root/"Proofs").mkdir()
+            sources = {
+                "Statements/Main.lean": (
+                    "def rate (n : Nat) : Nat := n + 1\n"
+                    "noncomputable def chosen (h : ∃ n : Nat, n > 0) : Nat := Classical.choose h\n"
+                    "def Statement : Prop := ∀ (h : ∃ n : Nat, n > 0), rate (chosen h) > chosen h\n"
+                    "def Constructive : Prop := ∀ n : Nat, rate n > n\n"
+                ),
+                "Proofs/Main.lean": (
+                    "import Statements.Main\n"
+                    "theorem main : Statement := fun h => Nat.lt_succ_self (chosen h)\n"
+                    "theorem constructive_main : Constructive := fun n => Nat.lt_succ_self n\n"
+                ),
+                "StatementContract.lean": "import Statements.Main\n",
+                "Contract.lean": "import Statements.Main\nimport Proofs.Main\n",
+            }
+            for name, body in sources.items():
+                (root/name).write_text(body, encoding="utf-8")
+            env = os.environ.copy()
+            lake = audit_lean.select_lake(root, pin, env, sys.stderr, offline=True)
+            subprocess.run([*lake, "update"], cwd=root, env=env, check=True)
+
+            stmt = audit_lean.audit(SimpleNamespace(
+                package=root, contract="StatementContract.lean", expected="Statement",
+                statements=["Statements"], statement_only=True))
+            closed = audit_lean.audit(SimpleNamespace(
+                package=root, contract="Contract.lean", expected="Statement", declaration="main",
+                target=["Proofs.Main"], statements=["Statements"]))
+            constructive = audit_lean.audit(SimpleNamespace(
+                package=root, contract="Contract.lean", expected="Constructive", declaration="constructive_main",
+                target=["Proofs.Main"], statements=["Statements"]))
+
+            self.assertEqual(stmt["statement"]["sha256"], closed["statement"]["sha256"])
+            by_name = {c["name"]: c for c in closed["statement"]["constants"]}
+            self.assertTrue(by_name["chosen"]["noncomputable"])
+            self.assertFalse(by_name["rate"]["noncomputable"])
+            self.assertIn("HAdd.hAdd", by_name["rate"]["pp_no_notation"])
+            self.assertIn("GT.gt", by_name["Statement"]["pp_no_notation"])
+            self.assertIn("Standard classical axioms", closed["axiom_profile"])
+            self.assertEqual(constructive["axiom_profile"], "Constructive (0 axioms)")
+            self.assertEqual(closed["external_packages"], [])
+            self.assertEqual(stmt["external_packages"], [])
 
 
 if __name__ == "__main__":

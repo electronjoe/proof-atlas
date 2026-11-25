@@ -415,6 +415,18 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         rd["sources"] = reviews.exact_sources(root,w,active_audit) if active_audit else []
         rd["witness"] = reviews.witness_source(root,w,active_audit) if active_audit else None
         entry["defaults"] = rd["defaults"]
+        if rd["axiom_profile"]:
+            entry["axiom_profile"] = rd["axiom_profile"]
+        if rd["external_packages"]:
+            entry["external_packages"] = rd["external_packages"]
+        if rd["noncomputable_constants"]:
+            entry["noncomputable_constants"] = rd["noncomputable_constants"]
+        unfolded = [
+            {k: s[k] for k in ("name", "file", "lines", "pp_no_notation", "noncomputable") if k in s}
+            for s in rd["sources"] if s.get("pp_no_notation")
+        ]
+        if unfolded:
+            entry["unfolded_signatures"] = unfolded
         review_entries.append(rd)
         atomic(output/reviews.review_url(cid),review_web.render(rd))
         entry["status"] = "correspondence under review" if rd["disputed"] else status
@@ -638,6 +650,12 @@ if __name__ == "__main__":
                 packet["defaults"] = data["defaults"]
                 if data.get("witness"):
                     packet["witness"] = data["witness"]
+                if data.get("axiom_profile"):
+                    packet["axiom_profile"] = data["axiom_profile"]
+                if data.get("noncomputable_constants"):
+                    packet["noncomputable_constants"] = data["noncomputable_constants"]
+                if data.get("external_packages"):
+                    packet["external_packages"] = data["external_packages"]
             if not args.side:
                 packet["reported_differences"] = [e["id"] for e in data["events"] if e["decision"]=="difference"]
             # This JSON is piped to independent readers, including on Windows legacy code pages.

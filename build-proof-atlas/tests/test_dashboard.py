@@ -92,6 +92,7 @@ class DashboardCompletion(unittest.TestCase):
 
             # Receipts without a default-value list render as before; with one, both views carry it.
             self.assertNotIn("Lean default values", (root/"dist"/atlas.reviews.review_url("t")).read_text(encoding="utf-8"))
+            self.assertIn("Constructive (0 axioms)", (root/"dist"/atlas.reviews.review_url("t")).read_text(encoding="utf-8"))
             audit["defaults"] = [{"constant": "gap", "file": "T.lean", "lines": [1, 1], "construct": "HSub.hSub", "type": "ℕ"}]
             (root / "audit.json").write_text(json.dumps(audit), encoding="utf-8")
             dashboard()
