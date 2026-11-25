@@ -183,6 +183,7 @@ class AuditMetadataHelpers(unittest.TestCase):
         ])
         self.assertEqual(parsed["reachable_local_theorems"], 3)
         self.assertEqual(parsed["reachable_local_defs"], 6)
+        self.assertEqual(parsed["_reachable_modules"], ["Custom.Extra", "Proofs.A", "Proofs.B", "Routine.Glue", "Statements.Main"])
 
         with self.assertRaisesRegex(ValueError, "Could not extract local constant closure"):
             audit_lean.parse_proof_closure("no markers\n", "Proofs.B.main", "Statements.ThmB")
@@ -704,6 +705,7 @@ class AuditClosure(unittest.TestCase):
                 "Proofs/B.lean": (
                     "import Statements.Main\nimport Routine.Glue\n"
                     "theorem main_cond (_hA : LemA) : ThmB := fun n => add_zero_glue n\n"
+                    "theorem main_assume_true (_h : True) : ThmB := fun n => add_zero_glue n\n"
                     "def not_a_theorem : ThmB := fun n => add_zero_glue n\n"
                 ),
                 "Contract.lean": "import Statements.Main\nimport Proofs.B\n",
@@ -737,7 +739,7 @@ class AuditClosure(unittest.TestCase):
             # Assumed proposition outside Statements/ (e.g. True) is rejected.
             with self.assertRaisesRegex(ValueError, r"assumed proposition True is defined in .*not a statement module"):
                 audit_lean.audit(SimpleNamespace(
-                    package=root, contract="Contract.lean", expected="ThmB", declaration="main_cond",
+                    package=root, contract="Contract.lean", expected="ThmB", declaration="main_assume_true",
                     target=["Proofs.B"], statements=["Statements"], assumes=["True"],
                 ))
 

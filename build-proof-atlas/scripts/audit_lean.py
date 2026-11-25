@@ -711,14 +711,17 @@ def parse_proof_closure(output, declaration, expected, statement_modules=()):
     used_theorems = set()
     used_statements = set()
     local_defs = set()
+    reachable_modules = set()
     seen = set()
     for row in rows:
         name = row.get("name", "")
+        mod = row.get("module")
+        if mod:
+            reachable_modules.add(mod)
         if not name or name in seen or is_compiler_aux(name):
             continue
         seen.add(name)
         kind = row.get("kind", "")
-        mod = row.get("module")
         is_prop = bool(row.get("is_prop", False))
         if kind == "theorem" and name != declaration:
             used_theorems.add(name)
@@ -735,6 +738,7 @@ def parse_proof_closure(output, declaration, expected, statement_modules=()):
         used_local_statements=ordered_statements,
         reachable_local_defs=len(local_defs),
         reachable_local_theorems=len(ordered_theorems),
+        _reachable_modules=sorted(reachable_modules),
     )
 
 
@@ -915,7 +919,13 @@ def audit(args):
     proof_closure = (proof_closure_record(lake, root, env, contract_path, declaration, args.expected,
                                           statement_modules=stmt_modules)
                      if (not statement_only and (scoped or statements)) else None)
-    checked_lean_loc = count_lean_loc(root, [p for p in initial if p.endswith(".lean")])
+    reachable_mods = proof_closure.pop("_reachable_modules", None) if proof_closure else None
+    if reachable_mods:
+        reachable_paths = [p for p in ("/".join(m.split(".")) + ".lean" for m in reachable_mods)
+                           if p in initial]
+        checked_lean_loc = count_lean_loc(root, reachable_paths or [p for p in initial if p.endswith(".lean")])
+    else:
+        checked_lean_loc = count_lean_loc(root, [p for p in initial if p.endswith(".lean")])
     if scoped is None:
         final = inputs(root)
     else:
@@ -972,8 +982,11 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, help="New evidence file to create on success")
     args = parser.parse_args()
     try:
+        if args.output and args.output.exists():
+            raise FileExistsError(f"Refusing to overwrite existing evidence file: {args.output}")
         data = json.dumps(audit(args), indent=2)+"\n"
         if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
             with args.output.open("x", encoding="utf-8") as out:
                 out.write(data)
         else:

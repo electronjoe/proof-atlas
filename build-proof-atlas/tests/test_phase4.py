@@ -671,6 +671,93 @@ class Phase4ManifestAndBacklog(unittest.TestCase):
             self.assertIn("Non-vacuity hypothesis witnesses are checked for 1/1 stated results.", m["latex"])
             self.assertIn("maintained locally", m["latex"])
 
+    def test_latex_escape_unicode_legacy_discrepancy_and_backlog_casing(self):
+        self.assertEqual(
+            atlas._latex_escape("D_FS ≤ D < D₀ and (log₂ 3)² at paper’s slope → 0"),
+            r"D\_FS $\le$ D < D$_0$ and (log$_2$ 3)$^2$ at paper's slope $\to$ 0",
+        )
+        self.assertEqual(
+            atlas._cap_first("prove 1 deferred Mathlib bridging lemma(s) and distill into Routine/"),
+            "Prove 1 deferred Mathlib bridging lemma(s) and distill into Routine/",
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+
+            def source(name, data):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                return {"path": name, "sha256": hashlib.sha256(data).hexdigest()}
+
+            tex = source("paper.tex", rb"\begin{theorem}\label{t}Endpoint theorem.\end{theorem}")
+            pdf = source("paper.pdf", b"%PDF-1.4\n")
+            stmt = source("lean/Statements/T.lean", b"def T : Prop := True\n")
+            prf = source("lean/Proofs/T.lean", b"import Statements.T\ntheorem main : T := trivial\n")
+            source("run.log", b"OK\n")
+            t_sha = hashlib.sha256(b"Statements.T").hexdigest()
+            audit = {
+                "expected": "Statements.T", "declaration": "Proofs.T.main",
+                "axioms": [], "axiom_profile": "Constructive (0 axioms)",
+                "toolchain": "leanprover/lean4:v4.33.1", "statements": ["Statements"],
+                "checked_inputs": {"Statements/T.lean": stmt["sha256"], "Proofs/T.lean": prf["sha256"]},
+                "statement": {
+                    "expected": "Statements.T",
+                    "sha256": hashlib.sha256(f"Statements.T {t_sha}\n".encode()).hexdigest(),
+                    "constants": [{"name": "Statements.T", "file": "Statements/T.lean", "lines": [1, 1], "sha256": t_sha}],
+                },
+                "hypotheses": {"declaration": "Examples.t_wit", "proposition": "True", "axioms": []},
+                "defaults": [],
+            }
+            source("evidence/t.json", json.dumps(audit).encode())
+            project = {
+                "schema_version": 1, "environments": ["theorem"], "edition": "v1",
+                "title": "Legacy Discrepancy Paper", "tex": [tex], "pdf": pdf,
+                "proof_work": {"mode": "paper", "profile": "thorough"},
+                "hosting": {"decision": "local"},
+                "work": {
+                    "t": {
+                        "status": "closed", "scope": "Endpoint scope.", "run_log": "run.log",
+                        "checked_inputs": {"lean/Statements/T.lean": stmt["sha256"], "lean/Proofs/T.lean": prf["sha256"]},
+                        "subproofs": [{"title": "Interior branch", "declaration": "Proofs.T.main", "status": "checked"}],
+                        "closure": {"package": "lean", "expected": "Statements.T", "declaration": "Proofs.T.main",
+                                    "audit": "evidence/t.json", "correspondence": "Interior branch."},
+                    }
+                },
+            }
+            (root / "project.json").write_text(json.dumps(project), encoding="utf-8")
+            pkt = review.get_packet(root, "t")
+            # Legacy comparison: result="unsure" with cases lacking per-case `kind`
+            legacy_comp = {
+                "t": {
+                    "bindings": pkt["view"]["bindings"],
+                    "result": "unsure",
+                    "actor": "Proof agent",
+                    "issue": "Lean assumes D < D₀ instead of D ≤ D₀.",
+                    "next": "Prove the D = D₀ endpoint or document the restriction.",
+                    "paper_reading": "Holds for D ≤ D₀.",
+                    "lean_reading": "Holds for D < D₀.",
+                    "paper_refs": "paper.tex, t",
+                    "lean_refs": "Statements.T",
+                    "analysis": {
+                        "summary": "Endpoint question.",
+                        "scope": "Interior only.",
+                        "cases": [{"case": "Endpoint", "paper": "D ≤ D₀", "lean": "D < D₀", "why": "Strict inequality."}],
+                        "advice": "Reconcile endpoint.",
+                        "suggested_feedback": "Check D = D₀.",
+                    },
+                }
+            }
+            (root / "comparisons.json").write_text(json.dumps(legacy_comp), encoding="utf-8")
+
+            m = atlas.manifest(root)
+            self.assertIn("Lean assumes D < D₀ instead of D ≤ D₀.", m["markdown"])
+            self.assertNotIn(".. *Next:*", m["markdown"])
+            self.assertIn(r"Lean assumes D < D$_0$ instead of D $\le$ D$_0$.", m["latex"])
+            p3 = {g["key"]: g["items"] for g in m["backlog"]["priorities"]}["weaker_or_noncomputable"]
+            self.assertEqual(len(p3), 1)
+            self.assertEqual(p3[0]["claim"], "t")
+            self.assertIn("D < D₀", p3[0]["open_discrepancy"])
+
 
 if __name__ == "__main__":
     unittest.main()

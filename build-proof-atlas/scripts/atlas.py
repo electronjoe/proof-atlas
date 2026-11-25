@@ -749,6 +749,11 @@ def summarize_records(records):
     return buckets
 
 
+def _cap_first(text):
+    """Uppercase only the leading character so names like Mathlib and Routine/ keep their casing."""
+    return text[:1].upper() + text[1:] if text else text
+
+
 def build_refinement_backlog(project, records):
     """Build the prioritized P1-P5 Open Shortcomings & Refinement Backlog."""
     profile = proof_work_profile(project)
@@ -796,7 +801,7 @@ def build_refinement_backlog(project, records):
                 action="Prove the assumed prerequisite(s) and re-run atlas.py assemble --audit.",
             ))
 
-        # Priority 3: Open weaker conclusion and/or unapproved noncomputable obligations.
+        # Priority 3: Open weaker conclusion, unapproved noncomputable obligations, and open discrepancies.
         weaker = [
             dict(case=row["case"], paper=row["paper"], lean=row["lean"], why=row["why"])
             for row in cases if row.get("kind") == "weaker conclusion"
@@ -804,11 +809,16 @@ def build_refinement_backlog(project, records):
         noncomp = list(rd.get("noncomputable_constants") or [])
         include_noncomp = bool(noncomp and (weaker or not rd.get("approved")))
         open_subs = [part["title"] for part in rec["entry"].get("subproofs", []) if part.get("status") != "checked"]
-        if weaker or include_noncomp:
+        open_discrepancy = (rd.get("issue") or "") if (rd.get("disputed") and not weaker) else ""
+        if weaker or include_noncomp or open_discrepancy:
             if weaker and include_noncomp:
                 action = "Prove the omitted weaker-conclusion clause(s) and verify whether noncomputable definitions affect algorithmic/explicitness claims."
             elif weaker:
                 action = "Prove the omitted weaker-conclusion clause(s) and close the remaining open subproof(s)."
+            elif open_discrepancy and include_noncomp:
+                action = "Resolve the open paper-to-Lean discrepancy and verify whether noncomputable definitions affect algorithmic/explicitness claims."
+            elif open_discrepancy:
+                action = rd.get("next") or "Resolve the open paper-to-Lean discrepancy and repeat the correspondence comparison."
             else:
                 action = "Verify whether noncomputable definitions affect any algorithmic or explicitness claim and record author review."
             p3.append(dict(
@@ -817,7 +827,8 @@ def build_refinement_backlog(project, records):
                 tier=tier,
                 weaker_conclusions=weaker,
                 noncomputable_constants=noncomp if include_noncomp else [],
-                open_subproofs=open_subs if weaker else [],
+                open_subproofs=open_subs if (weaker or open_discrepancy) else [],
+                **({"open_discrepancy": open_discrepancy} if open_discrepancy else {}),
                 action=action,
             ))
 
@@ -841,7 +852,7 @@ def build_refinement_backlog(project, records):
                 missing_witness=missing_witness,
                 witness_plan=rec["witness_plan"] if missing_witness else None,
                 unresolved_defaults=unres_defaults,
-                action=" and ".join(parts).capitalize() + ".",
+                action=_cap_first(" and ".join(parts)) + ".",
             ))
 
         # Priority 5: Deferred Mathlib bridging lemmas and undistilled exploratory proofs.
@@ -859,7 +870,7 @@ def build_refinement_backlog(project, records):
                 tier=tier,
                 deferred_bridging_lemmas=bridging,
                 undistilled=undistilled,
-                action=" and ".join(parts).capitalize() + ".",
+                action=_cap_first(" and ".join(parts)) + ".",
             ))
 
     groups = [
@@ -949,6 +960,8 @@ def render_backlog_section(backlog):
             elif group["key"] == "weaker_or_noncomputable":
                 if item["weaker_conclusions"]:
                     details.append("weaker conclusion: " + "; ".join(w["case"] for w in item["weaker_conclusions"]))
+                if item.get("open_discrepancy"):
+                    details.append("open discrepancy: " + item["open_discrepancy"])
                 if item["noncomputable_constants"]:
                     details.append("noncomputable: " + ", ".join(item["noncomputable_constants"]))
                 if item["open_subproofs"]:
@@ -1144,7 +1157,7 @@ def _collect_claim_states(root, project, claims, *, ci=None):
 
 
 def _latex_escape(text):
-    """Escape plain text for safe inclusion inside LaTeX prose or \\texttt{}."""
+    """Escape plain text and common Unicode math/punctuation symbols for pdfLaTeX safety."""
     replacements = {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -1156,6 +1169,39 @@ def _latex_escape(text):
         "}": r"\}",
         "~": r"\textasciitilde{}",
         "^": r"\textasciicircum{}",
+        "≤": r"$\le$",
+        "≥": r"$\ge$",
+        "≠": r"$\neq$",
+        "→": r"$\to$",
+        "←": r"$\leftarrow$",
+        "↔": r"$\leftrightarrow$",
+        "∀": r"$\forall$",
+        "∃": r"$\exists$",
+        "∧": r"$\land$",
+        "∨": r"$\lor$",
+        "¬": r"$\neg$",
+        "∈": r"$\in$",
+        "∉": r"$\notin$",
+        "⊆": r"$\subseteq$",
+        "×": r"$\times$",
+        "·": r"$\cdot$",
+        "∞": r"$\infty$",
+        "ℝ": r"$\mathbb{R}$",
+        "ℕ": r"$\mathbb{N}$",
+        "ℤ": r"$\mathbb{Z}$",
+        "ℚ": r"$\mathbb{Q}$",
+        "−": "-",
+        "–": "--",
+        "—": "---",
+        "’": "'",
+        "‘": "`",
+        "“": "``",
+        "”": "''",
+        "…": r"\ldots{}",
+        "₀": r"$_0$", "₁": r"$_1$", "₂": r"$_2$", "₃": r"$_3$", "₄": r"$_4$",
+        "₅": r"$_5$", "₆": r"$_6$", "₇": r"$_7$", "₈": r"$_8$", "₉": r"$_9$",
+        "⁰": r"$^0$", "¹": r"$^1$", "²": r"$^2$", "³": r"$^3$", "⁴": r"$^4$",
+        "⁵": r"$^5$", "⁶": r"$^6$", "⁷": r"$^7$", "⁸": r"$^8$", "⁹": r"$^9$",
     }
     return "".join(replacements.get(ch, ch) for ch in str(text))
 
@@ -1271,9 +1317,11 @@ def _collect_scope_caveats(records):
         tier = rec["tier"]
         rd = rec["rd"]
         analysis = rd["view"].get("analysis", {})
+        typed_non_agrees = False
         for row in analysis.get("cases", []):
             kind = row.get("kind")
             if kind and kind != "agrees":
+                typed_non_agrees = True
                 caveats.append(dict(
                     claim=cid,
                     reference=ref,
@@ -1288,6 +1336,15 @@ def _collect_scope_caveats(records):
                         or (rd.get("needs_author_confirmation") and kind in reviews.CONFIRMATION_KINDS)
                     ),
                 ))
+        if rd.get("disputed") and not typed_non_agrees and rd.get("issue"):
+            caveats.append(dict(
+                claim=cid,
+                reference=ref,
+                tier=tier,
+                kind="discrepancy",
+                result=rd.get("result") or "difference",
+                note=rd["issue"],
+            ))
         if rec["is_conditional"]:
             caveats.append(dict(
                 claim=cid,
@@ -1396,6 +1453,9 @@ def _render_manifest_latex(project, summary, caveats, backlog, pinned):
             caveat_bits.append(f"{ref} (author scope note: {_latex_escape(cav['note'])})")
         elif kind == "stronger_result":
             caveat_bits.append(f"{ref} (Lean proves stronger result: {_latex_escape(cav['note'])})")
+        elif kind == "discrepancy":
+            tag = "open question" if cav.get("result") == "unsure" else "open discrepancy"
+            caveat_bits.append(f"{ref} ({tag}: {_latex_escape(cav['note'])})")
         else:
             confirm_tag = "; awaits author confirmation" if cav.get("needs_author_confirmation") else ""
             caveat_bits.append(f"{ref} ({_latex_escape(kind)} on {_latex_escape(cav['case'])}{confirm_tag})")
@@ -1524,6 +1584,9 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
                 lines.append(f"- {ref} — **Author scope note**: {cav['note']}")
             elif kind == "stronger_result":
                 lines.append(f"- {ref} — **Lean proves more**: {cav['note']}")
+            elif kind == "discrepancy":
+                label = "Open question" if cav.get("result") == "unsure" else "Open discrepancy"
+                lines.append(f"- {ref} — **{label}**: {cav['note']}")
             else:
                 confirm = " *(Needs author confirmation)*" if cav.get("needs_author_confirmation") else ""
                 lines.append(
@@ -1553,6 +1616,8 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
                 elif group["key"] == "weaker_or_noncomputable":
                     if item["weaker_conclusions"]:
                         details.append("weaker conclusion: " + "; ".join(w["case"] for w in item["weaker_conclusions"]))
+                    if item.get("open_discrepancy"):
+                        details.append("open discrepancy: " + item["open_discrepancy"])
                     if item["noncomputable_constants"]:
                         details.append("noncomputable: " + ", ".join(f"`{n}`" for n in item["noncomputable_constants"]))
                     if item["open_subproofs"]:
@@ -1570,7 +1635,7 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
                         details.append("deferred bridging lemmas: " + "; ".join(item["deferred_bridging_lemmas"]))
                     if item["undistilled"]:
                         details.append("Exploratory proof (undistilled)")
-                suffix = f" — {'; '.join(details)}" if details else ""
+                suffix = f" — {'; '.join(details).rstrip('.')}" if details else ""
                 lines.append(f"- {ref}{suffix}. *Next:* {item['action']}")
             lines.append("")
 
@@ -1943,6 +2008,7 @@ def assemble(root, *, package=None, run_audit=False):
                 declaration=asm["declaration"], assumes=list(asm.get("assumes") or []),
                 name=asm.get("name"), statements=list(asm.get("statements") or ["Statements"]),
                 routine=list(asm.get("routine") or []), witness=asm.get("witness"),
+                witness_modules=list(asm.get("witness_modules") or []),
                 statement_modules=stmt_mods,
             )
         elif w.get("status") == "closed" and closure and closure.get("package"):
@@ -2095,10 +2161,18 @@ def assemble(root, *, package=None, run_audit=False):
                 contract_imports.append("Examples")
             for cid in topo:
                 spec = specs[cid]
-                if spec.get("witness") and "." in spec["witness"]:
-                    mod_guess = spec["witness"].rsplit(".", 1)[0]
-                    if (pkg_root / ("/".join(mod_guess.split(".")) + ".lean")).is_file():
-                        contract_imports.append(mod_guess)
+                for wmod in spec.get("witness_modules") or ():
+                    contract_imports.append(wmod)
+                if spec.get("witness"):
+                    resolved_wmod = False
+                    if "." in spec["witness"]:
+                        mod_guess = spec["witness"].rsplit(".", 1)[0]
+                        if (pkg_root / ("/".join(mod_guess.split(".")) + ".lean")).is_file():
+                            contract_imports.append(mod_guess)
+                            resolved_wmod = True
+                    if not resolved_wmod and not spec.get("witness_modules") and (pkg_root / "Examples").is_dir():
+                        for ex_file in sorted((pkg_root / "Examples").rglob("*.lean")):
+                            contract_imports.append(ex_file.relative_to(pkg_root).as_posix()[:-5].replace("/", "."))
             contract_text = "\n".join(f"import {m}" for m in sorted(set(contract_imports))) + "\n"
             atomic(pkg_root / contract_rel, contract_text.encode("utf-8"))
             ev_dir = root / "evidence"
@@ -2131,8 +2205,8 @@ def assemble(root, *, package=None, run_audit=False):
                 )
                 w["checked_inputs"] = {(Path(pkg) / k).as_posix(): v for k, v in audit_data["checked_inputs"].items()}
                 w.setdefault("scope", w["closure"]["correspondence"])
-                if not w.get("run_log"):
-                    log_rel = f"evidence/assembly-{ident_by_cid[cid]}.log"
+                log_rel = f"evidence/assembly-{ident_by_cid[cid]}.log"
+                if not w.get("run_log") or w.get("run_log") == log_rel:
                     atomic(root / log_rel, (audit_data.get("lean_output", "") + "\n").encode("utf-8"))
                     w["run_log"] = log_rel
                 has_open_subproofs = any(part.get("status") != "checked" for part in w.get("subproofs", []))
@@ -2140,6 +2214,8 @@ def assemble(root, *, package=None, run_audit=False):
                     w.pop("assumes", None)
                     if not has_open_subproofs:
                         w["status"] = "closed"
+                    elif w.get("status") == "conditional":
+                        w["status"] = "attempted"
                 else:
                     w["assumes"] = item["assumes_claims"]
                     w["status"] = "conditional"
