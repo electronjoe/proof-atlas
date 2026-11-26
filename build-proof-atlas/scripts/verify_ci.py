@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from atlas import generate_challenge_harness, lean_ci_level, local
 from audit_lean import (
     _pure_external_prelude,
-    audit,
+    audit_batch,
     axiom_report,
     import_headers,
     scan_lean_hygiene,
@@ -518,6 +518,8 @@ def verify(root, *, offline=False, level=None):
 
         pkg_claim_records = {}
         pkg_proof_modules = []
+        batch_items = []
+        batch_specs = []
 
         for label, work, prior, digest, statements, routine in group:
             print(f"Rechecking {label} ({prior['declaration']})", flush=True)
@@ -526,7 +528,8 @@ def verify(root, *, offline=False, level=None):
                 imports = import_headers(lake, [prior["contract"]], package, pkg_env)
                 targets = sorted(m for m in imports if (package / (m.replace(".", "/") + ".lean")).is_file())
             witness = (prior.get("hypotheses") or {}).get("declaration")
-            checked = audit(SimpleNamespace(
+            batch_items.append((label, work, prior, digest, statements, routine, targets))
+            batch_specs.append(SimpleNamespace(
                 package=package,
                 contract=prior["contract"],
                 target=targets,
@@ -538,6 +541,13 @@ def verify(root, *, offline=False, level=None):
                 witness=witness,
             ))
 
+        checked_list = audit_batch(package, batch_specs, lake=lake, env=pkg_env)
+        if len(checked_list) != len(batch_items):
+            raise ValueError(
+                f"Batched audit returned {len(checked_list)} receipts for {len(batch_items)} claims"
+            )
+
+        for (label, work, prior, digest, statements, routine, targets), checked in zip(batch_items, checked_list):
             # Full invariant parity assertions against local audit_lean.py guarantees.
             if not checked.get("theorem_info"):
                 raise ValueError(f"{label}: audited declaration is not a kernel theorem (.thmInfo)")

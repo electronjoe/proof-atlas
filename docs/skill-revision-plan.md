@@ -3,7 +3,7 @@
 **Authors / Reviewers:** Scott Moeller & Bhaskar Krishnamachari  
 **Date:** November 22, 2026 *(Revised November 26, 2026: 15-category longitudinal census, `TINA` architecture synthesis, and multi-resolution workflow)*  
 **Original RFC Baseline:** `proof-atlas` `main` (`build-proof-atlas` v0.10.0, PRs #1, #2, #3, #6) + PRs [#4](https://github.com/ANRGUSC/proof-atlas/pull/4) and [#5](https://github.com/ANRGUSC/proof-atlas/pull/5)  
-**Current Integration Branch (`skill-v2`):** Unified feature branch based on `upstream/main` (`ed1f562`, PRs #1–#8 merged) + Phases 2a, 2b, 2c, 3a, 4, Pilot Validation, and Phase 5 implemented directly on `skill-v2`  
+**Current Integration Branch (`skill-v2`):** Unified feature branch based on `upstream/main` (`ed1f562`, PRs #1–#8 merged) + Phases 2a, 2b, 2c, 3a, 4, Pilot Validation, Phase 5, and Phase 6 implemented directly on `skill-v2`  
 **Companion Evidence Base:**
 1. [`survey-lean-proofs-eng-arxiv`](https://github.com/electronjoe/survey-lean-proofs-eng-arxiv) (*How Are Engineering Papers Adopting Lean?*, Moeller & Krishnamachari, Nov 25, 2026: 12-mode failure taxonomy in `docs/proof-methods.md` + 15-category longitudinal census of **12,613** arXiv preprints across Nov 2025, May 2026, and Nov 2026 $\rightarrow$ **82** confirmed Lean papers, **27** Layer-A semantic audits, **23** offline clean-room Docker builds, and authoring-paradigm best practices).
 2. [`ANRGUSC/TINA`](https://github.com/ANRGUSC/TINA) (`papers/arxiv-v3/lean`, package `TinaV2`, moved from `papers/arxiv-v2/lean` on Nov 18, 2026: **34** verified claims / **162** `Expr`-audited step and main lemmas in **9,227** non-empty LoC, evaluated side-by-side against the surveyed `P4` cohort).
@@ -25,7 +25,7 @@
 | **Pilot Validation** | Full Lean 4.33.1 integration tests (`43/43` pass) + dogfooding `skill-v2` (`quick` → `thorough`, `assemble --audit`, `manifest`, `supplement.md`, kernel DAG) on compact live-Lean paper & `markov-block-hierarchy-proof-atlas` | — *(unified `skill-v2` branch)* | **Completed on `skill-v2`** |
 | **Phase 3b** | Opt-in TINA 1:1 step-lemma mirroring (`step_map` + compiled `Expr` `auditUses`) | — | **Not started** (P2) |
 | **Phase 5** | Full CI check parity in `verify_ci.py` + `kernels_checked`, mechanical hash-locked `Challenge.lean` / `Solution.lean` (`atlas.py challenge`), and opt-in `"paranoid"` CI (`hosting.lean_ci_level`, offline `unshare`, `Comparator` / `lean4checker` / Lean $\ge$ v4.35.0 `lake check --paranoid`) | — *(unified `skill-v2` branch)* | **Completed on `skill-v2`** |
-| **Phase 6** | Batched package build & verification (`audit_batch`) in `verify_ci.py` | — | **Not started** (P2) |
+| **Phase 6** | Batched package build & verification (`audit_batch`) in `verify_ci.py` | — *(unified `skill-v2` branch)* | **Completed on `skill-v2`** |
 
 ---
 
@@ -130,7 +130,7 @@ Evaluating [`ANRGUSC/TINA`](https://github.com/ANRGUSC/TINA) (`papers/arxiv-v3/l
 | **#5–#7 Static & Axiom Hygiene** | `--statements` isolation (#2), `#print axioms` + `axiom_profile` (#9), static escape-hatch & `Statements/` notation ban (#10), kernel `.thmInfo` check & `Routine/`/`Prelude.lean` isolation (Phase 2c), 100% CI check parity in `verify_ci.py` + `kernels_checked` in `lean-verification.json` (Phase 5). | Closed on `skill-v2` (including `Routine.Glue` module-name normalization and auto-enforced `Statements/`/`Prelude.lean` parity). | **Done (Phase 5)** |
 | **#8 Kernel Monoculture** | Honest-agent trust disclosure (#3), isolated `Statements/` `Prop` definitions (#2), mechanical hash-locked `Challenge.lean`/`Solution.lean` (`atlas.py challenge`), `hosting.lean_ci_level` (`standard` vs. `paranoid`), offline `unshare` workflow in `verify-lean.yml`, `Comparator` / `lean4checker --fresh` / Lean $\ge$ v4.35.0 `lake check --paranoid` (`nanoda`/`lean4lean`/`con-leche`), and `✓ Multi-kernel / Comparator` badge (Phase 5). | Closed on `skill-v2`. | **Done (Phase 5)** |
 | **#10 Proof Bloat & Step Drift** | *"Explanation, not machine-checked"* labels (#3), `Prelude.lean` + `Routine/` + ~8-cycle breaker guidance (Phase 2c), kernel-extracted claim DAG (`used_local_theorems`/`.Statement` vs. `reader.json`), proof size metrics (`reachable_local_defs`, `reachable_local_theorems`, `checked_lean_loc`), and post-closure distillation pass (Phase 3a). | Opt-in TINA 1:1 step-lemma `Expr` auditing (`step_map` + `auditUses`). | **Phase 3b** |
-| **#11 Verification Bottlenecks** | Scoped `transImports` targets, selective `--mathlib-module` cache fetch, narrow `Prelude.lean` + separable `Proofs/` (Phase 2c). | Sequential per-claim `lake --no-cache build` in `verify_ci.py` bottlenecks 30–80 claim repos. | **Phase 6** |
+| **#11 Verification Bottlenecks** | Scoped `transImports` targets, selective `--mathlib-module` cache fetch, narrow `Prelude.lean` + separable `Proofs/` (Phase 2c), batched per-package `audit_batch` (`lake --no-cache build <union-of-targets>`) in `audit_lean.py` and `verify_ci.py` (Phase 6). | Closed on `skill-v2`. | **Done (Phase 6)** |
 | **#12 Process Opacity** | Edition SHA-256 binding, `verify-lean.yml`, `lean-verification.json`, badge legend, deterministic `VERIFICATION.md` + LaTeX snippet via `atlas.py manifest` & `manuscript_edits.propose` (Phase 4). | Validated in Pilot. | **Pilot Validated** |
 
 ---
@@ -234,7 +234,7 @@ flowchart LR
 
 ---
 
-### Phase 6: Batched Verification for Large AI Repositories (`Layer C` — Mode #11)
+### Phase 6 *(Completed on `skill-v2`)*: Batched Verification for Large AI Repositories (`Layer C` — Mode #11)
 
 - **Goal:** Scale `verify_ci.py` and local re-audits cleanly to 50k–250k+ LoC repositories with 30–80 claims inside GitHub Actions' job window.
 - **Proposed Changes:**
@@ -254,7 +254,7 @@ flowchart LR
 | **Phase 3a** | Kernel claim-DAG edges, TINA `paper`/`lean`/`aligned`/`supplied` (`dist/supplement.md`), proof size metrics & distillation pass | Layer A/C (`Modes #2, #10`) | `audit_lean.py`, `atlas.py`, `author_review.py`, `review_web.py`, `graph.js`, `explorer.js`, `SKILL.md` | Medium | **Medium (P2)** | **Done on `skill-v2`** |
 | **Phase 3b** | Opt-in TINA 1:1 `step_map` + compiled `Expr` `auditUses` step verification | Layer C (`Mode #10`), Type (ii) | `audit_lean.py`, `atlas.py`, `SKILL.md` | Medium | **Medium (P2)** | **Not started** |
 | **Phase 5** | Full CI check parity + mechanical `Challenge.lean`/`Solution.lean` `Comparator` & multi-kernel `paranoid` CI tier | Layer B (`Mode #8`) | `hosting.py`, `verify_ci.py`, `audit_lean.py`, `atlas.py`, `verify-lean.yml`, `explorer.js`, `SKILL.md` | Med–Large | **Medium (P2)** | **Done on `skill-v2`** |
-| **Phase 6** | Batched package build & verification (`audit_batch`) in `verify_ci.py` | Layer C (`Mode #11`) | `audit_lean.py`, `verify_ci.py` | Small–Med | **Medium (P2)** | **Not started** |
+| **Phase 6** | Batched package build & verification (`audit_batch`) in `verify_ci.py` | Layer C (`Mode #11`) | `audit_lean.py`, `verify_ci.py`, `SKILL.md` | Small–Med | **Medium (P2)** | **Done on `skill-v2`** |
 
 ---
 
@@ -277,7 +277,7 @@ flowchart LR
 8. **Net-Positive `TINA` Architecture Merge — Retaining JSON Storage (Phases 2c, 3a/3b, 5):**  
    Adopt five proven `TinaV2` mechanisms inside Proof Atlas's existing JSON project/receipt architecture (avoiding a disruptive migration to SQLite `schema.sql`/`data.sql`): (i) separable per-claim conditional proofs (`(hX : Statements.X)`) + generated `Assembly.lean` and **`Conditional (assumes X)`** badge; (ii) narrow `Prelude.lean` + `Routine/` glue isolation + ~8-build-cycle stall circuit breaker; (iii) "two homes" provenance (`paper` vs. `supplied` / `supplement.md`) for unproved manuscript remarks/steps; (iv) kernel `.thmInfo` check + mechanical `Challenge.lean`/`Solution.lean` `Comparator` generation + full CI check parity in `verify_ci.py`; and (v) opt-in **Phase 3b** 1:1 step-lemma mirroring (`step_map` + compiled `Expr` `auditUses`).
 9. **Updated Execution Ordering (Unified `skill-v2` Branch):**  
-   Execute **Phases 0, 1, 2a, 2b, 2c, 3a, 4, Pilot Validation & Phase 5 (done on `skill-v2`) $\rightarrow$ Phases 3b and 6** directly on the unified `skill-v2` integration branch.
+   Execute **Phases 0, 1, 2a, 2b, 2c, 3a, 4, Pilot Validation, Phase 5 & Phase 6 (done on `skill-v2`) $\rightarrow$ Phase 3b** directly on the unified `skill-v2` integration branch.
 
 ---
 

@@ -264,9 +264,9 @@ class Phase5UnitTests(unittest.TestCase):
             }
             audit_calls = []
 
-            def fake_audit(args):
-                audit_calls.append(args)
-                return dict(prior, routine=["Routine.Glue"])
+            def fake_audit_batch(package, specs, *, lake=None, env=None):
+                audit_calls.extend(specs)
+                return [dict(prior, routine=["Routine.Glue"]) for _ in specs]
 
             fake_harness_ok = {
                 "verified": True, "challenge_sha256": "1" * 64, "solution_sha256": "2" * 64,
@@ -275,7 +275,7 @@ class Phase5UnitTests(unittest.TestCase):
 
             with patch.dict(os.environ, env_patch, clear=False), \
                  patch.object(verify_ci, "select_lake", return_value=["lake"]), \
-                 patch.object(verify_ci, "audit", side_effect=fake_audit), \
+                 patch.object(verify_ci, "audit_batch", side_effect=fake_audit_batch), \
                  patch.object(verify_ci, "verify_challenge_solution_lean", return_value=fake_harness_ok):
 
                 # 1. Paranoid mode fails closed when no independent checker is available.
@@ -318,21 +318,21 @@ class Phase5UnitTests(unittest.TestCase):
                 self.assertIn("lean", res["challenge_harness"])
 
                 # 3. Parity rejections: non-thmInfo, hygiene failure, witness mismatch, extra CI input.
-                with patch.object(verify_ci, "audit", return_value=dict(prior, theorem_info=False)):
+                with patch.object(verify_ci, "audit_batch", return_value=[dict(prior, theorem_info=False)]):
                     with self.assertRaisesRegex(ValueError, r"kernel theorem \(\.thmInfo\)"):
                         verify_ci.verify(root, offline=True, level="standard")
 
-                with patch.object(verify_ci, "audit", return_value=dict(prior, hygiene={"checked": True, "statements_checked": False})):
+                with patch.object(verify_ci, "audit_batch", return_value=[dict(prior, hygiene={"checked": True, "statements_checked": False})]):
                     with self.assertRaisesRegex(ValueError, "hygiene check did not cover"):
                         verify_ci.verify(root, offline=True, level="standard")
 
                 bad_hyp = dict(prior, hypotheses={"declaration": "wit", "proposition": "False", "axioms": []})
-                with patch.object(verify_ci, "audit", return_value=bad_hyp):
+                with patch.object(verify_ci, "audit_batch", return_value=[bad_hyp]):
                     with self.assertRaisesRegex(ValueError, "witness re-check differs"):
                         verify_ci.verify(root, offline=True, level="standard")
 
                 extra_in = dict(prior, checked_inputs={**checked_inputs, "Proofs/Hidden.lean": "9" * 64})
-                with patch.object(verify_ci, "audit", return_value=extra_in):
+                with patch.object(verify_ci, "audit_batch", return_value=[extra_in]):
                     with self.assertRaisesRegex(ValueError, "inputs absent from local receipt: Proofs/Hidden.lean"):
                         verify_ci.verify(root, offline=True, level="standard")
 

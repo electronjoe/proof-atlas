@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from types import SimpleNamespace
 
 from check_lean import select_lake, run
 
@@ -577,15 +578,24 @@ def axiom_profile(axioms):
     return "Standard Lean axioms (" + ", ".join(ordered) + ")"
 
 
-def statement_record(lake, root, env, contract, expected):
+def _local_lean_modules(root):
+    """Map local Lean module names to package-relative paths without hashing file contents."""
+    modules = {}
+    for directory, children, files in os.walk(root):
+        children[:] = [child for child in children if not child.startswith(".")]
+        for name in files:
+            if name.endswith(".lean"):
+                rel = (Path(directory) / name).relative_to(root).as_posix()
+                modules[rel[:-5].replace("/", ".")] = rel
+    return modules
+
+
+def statement_record(lake, root, env, contract, expected, *, local_modules=None):
     """Hash the expected proposition and every definition of this package it unfolds to.
 
     Also returns the default-value uses in those definitions and statements. They are
     outside the digest: they follow from the hashed constants."""
-    modules = {}
-    for path in inputs(root):
-        if path.endswith(".lean"):
-            modules[path[:-5].replace("/", ".")] = path
+    modules = _local_lean_modules(root) if local_modules is None else local_modules
     program = ("import Lean\n" + (root/contract).read_text(encoding="utf-8-sig") + "\n" +
                STATEMENT_QUERY.replace("__LOCAL__", json.dumps(sorted(modules))).replace("__ROOT__", json.dumps(expected))
                .replace("__DEFAULTS__", json.dumps(sorted(DEFAULT_VALUES))))
@@ -778,9 +788,9 @@ def parse_proof_closure(output, declaration, expected, statement_modules=()):
     )
 
 
-def proof_closure_record(lake, root, env, contract, declaration, expected, statement_modules=()):
+def proof_closure_record(lake, root, env, contract, declaration, expected, statement_modules=(), *, local_modules=None):
     """Walk the audited declaration's transitive local constant closure in Lean.Environment."""
-    modules = {path[:-5].replace("/", ".") for path in inputs(root) if path.endswith(".lean")}
+    modules = set(_local_lean_modules(root) if local_modules is None else local_modules)
     program = ("import Lean\n" + (root / contract).read_text(encoding="utf-8-sig") + "\n" +
                PROOF_CLOSURE_QUERY.replace("__LOCAL__", json.dumps(sorted(modules)))
                .replace("__DECL__", json.dumps(declaration)))
@@ -820,9 +830,9 @@ def axiom_report(output, declaration):
     return axioms
 
 
-def hypotheses_record(lake, root, env, contract, expected, witness):
+def hypotheses_record(lake, root, env, contract, expected, witness, *, local_modules=None):
     """Check that `witness` proves the hypotheses of `expected` can all hold, using standard axioms."""
-    modules = {path[:-5].replace("/", "."): path for path in inputs(root) if path.endswith(".lean")}
+    modules = _local_lean_modules(root) if local_modules is None else local_modules
     program = ("import Lean\n" + (root/contract).read_text(encoding="utf-8-sig") + "\n" +
                HYPOTHESES_QUERY.replace("__EXPECTED__", json.dumps(expected)).replace("__WITNESS__", json.dumps(witness)) +
                f"#print axioms {witness}\n")
@@ -856,18 +866,23 @@ def inputs(root):
     return result
 
 
-def audit(args):
-    root = args.package.resolve(strict=True)
-    contract = (root/args.contract).resolve(strict=True)
+def _normalize_audit_spec(spec, root):
+    """Validate and normalize one claim audit specification against package `root`."""
+    item = SimpleNamespace(**spec) if isinstance(spec, dict) else spec
+    spec_pkg = getattr(item, "package", None)
+    if spec_pkg is not None and Path(spec_pkg).resolve(strict=True) != root:
+        raise ValueError("All claims in audit_batch must belong to the same Lean package")
+    contract = (root / item.contract).resolve(strict=True)
     if not contract.is_relative_to(root) or contract.suffix != ".lean":
         raise ValueError("Keep the independent contract in the Lean package")
-    statement_only = bool(getattr(args, "statement_only", False))
-    declaration = getattr(args, "declaration", None)
-    witness = getattr(args, "witness", None)
-    targets = list(getattr(args, "target", None) or [])
-    statements = list(getattr(args, "statements", None) or [])
-    routine = list(getattr(args, "routine", None) or [])
-    assumes = list(getattr(args, "assumes", None) or [])
+    statement_only = bool(getattr(item, "statement_only", False))
+    declaration = getattr(item, "declaration", None)
+    witness = getattr(item, "witness", None)
+    targets = list(getattr(item, "target", None) or [])
+    statements = list(getattr(item, "statements", None) or [])
+    routine = list(getattr(item, "routine", None) or [])
+    assumes = list(getattr(item, "assumes", None) or [])
+    expected = item.expected
     if statement_only:
         if declaration:
             raise ValueError("--statement-only does not accept a proof declaration")
@@ -877,126 +892,314 @@ def audit(args):
             raise ValueError("--statement-only requires --statements")
     elif not declaration:
         raise ValueError("Supply a proof declaration, or pass --statement-only")
-    for name in (*([declaration] if declaration else []), args.expected, *assumes, *targets, *([witness] if witness else [])):
+    for name in (*([declaration] if declaration else []), expected, *assumes, *targets, *([witness] if witness else [])):
         if not re.fullmatch(r"[A-Za-z_][\w']*(?:\.[A-Za-z_][\w']*)*", name):
             raise ValueError("Expected a fully qualified Lean identifier")
-    pin = (root/"lean-toolchain").read_text(encoding="utf-8-sig").strip()
-    env = os.environ.copy()
-    env.update(ELAN_TOOLCHAIN=pin, GIT_ALLOW_PROTOCOL="file", MATHLIB_NO_CACHE_ON_UPDATE="1")
-    if not (root/"lake-manifest.json").is_file():
+    return dict(
+        contract=contract,
+        contract_path=contract.relative_to(root).as_posix(),
+        expected=expected,
+        declaration=declaration,
+        statement_only=statement_only,
+        witness=witness,
+        targets=targets,
+        statements=statements,
+        routine=routine,
+        assumes=assumes,
+    )
+
+
+def _resolve_default_targets(root):
+    """Return `defaultTargets` from `lakefile.toml` when present and non-empty, else None."""
+    toml_path = root / "lakefile.toml"
+    if not toml_path.is_file() or (root / "lakefile.lean").exists():
+        return None
+    import tomllib
+    try:
+        config = tomllib.loads(toml_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    defaults = config.get("defaultTargets")
+    if isinstance(defaults, list) and defaults and all(isinstance(t, str) and t for t in defaults):
+        return list(defaults)
+    return None
+
+
+def _build_union_targets(prepared):
+    """Compute the deduplicated union of explicit and contract `+` build targets."""
+    explicit_seen = set()
+    explicit_union = []
+    for item in prepared:
+        for target in item["targets"]:
+            if target not in explicit_seen:
+                explicit_seen.add(target)
+                explicit_union.append(target)
+    contract_seen = set()
+    contract_union = []
+    for item in prepared:
+        for target in item["extra_contract_targets"]:
+            mod = target[1:]
+            if mod not in explicit_seen and target not in contract_seen:
+                contract_seen.add(target)
+                contract_union.append(target)
+    return [*explicit_union, *contract_union]
+
+
+def audit_batch(package, specs, *, lake=None, env=None):
+    """Audit multiple claims in a single Lean package using one batched `lake --no-cache build`.
+
+    Validates per-claim `module_inputs`, pre-build SHA-256 input closures, `scan_lean_hygiene`,
+    and `Routine/`/`Prelude.lean` isolation for every claim up front; runs one
+    `lake --no-cache build <union-of-targets>` per package; executes all per-claim `.thmInfo`,
+    type, `#print axioms`, `Statements/` isolation, `statement.sha256`/defaults,
+    `proof_closure_record`, and `--witness` checks against the freshly built `.olean`s;
+    re-verifies post-check input closures and hashes; and returns per-claim receipts identical
+    to sequential `audit()` calls.
+    """
+    root = Path(package).resolve(strict=True)
+    spec_list = list(specs)
+    if not spec_list:
+        return []
+    normalized = [_normalize_audit_spec(spec, root) for spec in spec_list]
+    pin = (root / "lean-toolchain").read_text(encoding="utf-8-sig").strip()
+    run_env = os.environ.copy() if env is None else dict(env)
+    run_env.update(ELAN_TOOLCHAIN=pin, GIT_ALLOW_PROTOCOL="file", MATHLIB_NO_CACHE_ON_UPDATE="1")
+    if not (root / "lake-manifest.json").is_file():
         raise ValueError("Run initial package setup and keep the contract with the source files")
-    lake = select_lake(root, pin, env, sys.stderr, offline=True)
-    contract_path = contract.relative_to(root).as_posix()
-    scoped = None
-    build_targets = list(targets)
-    if build_targets or statements:
-        try:
-            closure, contract_targets = module_inputs(lake, root, env, targets, contract_path)
-        except (ImportError, KeyError, OSError, TypeError, ValueError) as exc:
-            if statements:
-                raise ValueError(f"Cannot verify statement independence: {exc}") from exc
-            print(f"Using full-package source hashes: {exc}", file=sys.stderr)
+    if lake is None:
+        lake = select_lake(root, pin, run_env, sys.stderr, offline=True)
+
+    # 1. Pre-build validation across all claims: module_inputs, SHA-256 closures, hygiene, Routine/Prelude.
+    pre_module_cache = {}
+    pre_routine_cache = {}
+    prepared = []
+    for item in normalized:
+        targets = item["targets"]
+        statements = item["statements"]
+        routine = item["routine"]
+        contract_path = item["contract_path"]
+        statement_only = item["statement_only"]
+
+        scoped = None
+        extra_contract_targets = []
+        build_targets = list(targets)
+        if build_targets or statements:
+            mkey = (tuple(targets), contract_path)
+            if mkey in pre_module_cache:
+                closure, contract_targets = pre_module_cache[mkey]
+                if build_targets or statement_only:
+                    scoped = set(closure)
+                    extra_contract_targets = [t for t in contract_targets if t[1:] not in targets]
+                    build_targets = [*targets, *extra_contract_targets]
+            else:
+                try:
+                    closure, contract_targets = module_inputs(lake, root, run_env, targets, contract_path)
+                except (ImportError, KeyError, OSError, TypeError, ValueError) as exc:
+                    if statements:
+                        raise ValueError(f"Cannot verify statement independence: {exc}") from exc
+                    print(f"Using full-package source hashes: {exc}", file=sys.stderr)
+                else:
+                    pre_module_cache[mkey] = (frozenset(closure), tuple(contract_targets))
+                    # A default build still hashes the whole package. Statement checks
+                    # need a verified module layout regardless of the build target.
+                    if build_targets or statement_only:
+                        scoped = set(closure)
+                        extra_contract_targets = [t for t in contract_targets if t[1:] not in targets]
+                        build_targets = [*targets, *extra_contract_targets]
+
+        initial = inputs(root) if scoped is None else hash_paths(root, scoped)
+        if contract_path not in initial or pin != (root / "lean-toolchain").read_text(encoding="utf-8-sig").strip():
+            raise ValueError("Missing contract or toolchain pin changed during audit setup")
+
+        # Static hygiene runs before `lake build` so compile-time side effects fail before elaboration.
+        stmt_files = statement_paths(root, statements) if statements else set()
+        if statements and "Prelude.lean" in initial:
+            stmt_files = set(stmt_files) | {"Prelude.lean"}
+        lean_files = sorted(p for p in initial if p.endswith(".lean"))
+        hygiene = scan_lean_hygiene(root, lean_files, stmt_files)
+
+        # Keep Routine/ glue isolated from Statements/ and Proofs/ before building.
+        rkey = (tuple(routine), tuple(lean_files))
+        if rkey not in pre_routine_cache:
+            pre_routine_cache[rkey] = tuple(check_routine(lake, root, run_env, routine, lean_files))
+        routine_modules = list(pre_routine_cache[rkey])
+
+        prepared.append(dict(
+            item,
+            scoped=scoped,
+            extra_contract_targets=extra_contract_targets,
+            build_targets=build_targets,
+            initial=initial,
+            hygiene=hygiene,
+            routine_modules=routine_modules,
+        ))
+
+    # 2. Single batched `lake --no-cache build <union-of-targets>` for the package.
+    union_targets = _build_union_targets(prepared)
+    needs_default = any(not item["build_targets"] for item in prepared)
+    if needs_default and union_targets:
+        default_targets = _resolve_default_targets(root)
+        if default_targets:
+            combined = list(default_targets)
+            default_set = set(default_targets)
+            for target in union_targets:
+                mod = target[1:] if target.startswith("+") else target
+                if target not in combined and mod not in default_set:
+                    combined.append(target)
+            run([*lake, "--no-cache", "build", *combined], root, run_env, sys.stderr)
         else:
-            # A default build still hashes the whole package. Statement checks
-            # need a verified module layout regardless of the build target.
-            if build_targets or statement_only:
-                scoped = closure
-                build_targets += [t for t in contract_targets if t[1:] not in targets]
-    initial = inputs(root) if scoped is None else hash_paths(root, scoped)
-    if contract_path not in initial or pin != (root/"lean-toolchain").read_text(encoding="utf-8-sig").strip():
-        raise ValueError("Missing contract or toolchain pin changed during audit setup")
-    # Static hygiene runs before `lake build` so compile-time side effects fail before elaboration.
-    stmt_files = statement_paths(root, statements) if statements else set()
-    if statements and "Prelude.lean" in initial:
-        stmt_files = set(stmt_files) | {"Prelude.lean"}
-    hygiene = scan_lean_hygiene(root, [p for p in initial if p.endswith(".lean")], stmt_files)
-    # Keep Routine/ glue isolated from Statements/ and Proofs/ before building.
-    routine_modules = check_routine(lake, root, env, routine, [p for p in initial if p.endswith(".lean")])
-    # The Lake build runner sends output to an actual file descriptor.
-    run([*lake, "--no-cache", "build", *build_targets], root, env, sys.stderr)
-    theorem_info = False
-    if statement_only:
-        program = (contract.read_text(encoding="utf-8-sig") + "\n" +
-                   f"example : Prop := {args.expected}\n#print axioms {args.expected}\n")
-        result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
-                                cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        output = result.stdout.decode("utf-8-sig", errors="replace")
-        if result.returncode or re.search(r"\bwarning:", output, re.I):
-            raise ValueError("Lean statement check did not pass cleanly:\n"+output)
-        axioms = axiom_report(output, args.expected)
+            run([*lake, "--no-cache", "build"], root, run_env, sys.stderr)
+            run([*lake, "--no-cache", "build", *union_targets], root, run_env, sys.stderr)
+    elif needs_default:
+        run([*lake, "--no-cache", "build"], root, run_env, sys.stderr)
     else:
-        claim_type = expected_claim_type(args.expected, assumes)
-        program = ("import Lean\n" + contract.read_text(encoding="utf-8-sig") + "\n" +
-                   f"example : {claim_type} := {declaration}\n#print axioms {declaration}\n" +
-                   DECL_KIND_QUERY.replace("__DECL__", json.dumps(declaration)))
-        result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
-                                cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        output = result.stdout.decode("utf-8-sig", errors="replace")
-        if result.returncode or re.search(r"\bwarning:", output, re.I):
-            raise ValueError("Lean contract check did not pass cleanly:\n"+output)
-        axioms = axiom_report(output, declaration)
-        theorem_info = theorem_info_report(output, declaration)
-    if witness:
-        hypotheses = hypotheses_record(lake, root, env, contract_path, args.expected, witness)
-    else:
-        hypotheses = None
-        print("Warning: no --witness was given, so nothing shows that the hypotheses of the expected "
-              "proposition can hold. See 'Show the hypotheses can hold' in SKILL.md.", file=sys.stderr)
-    stmt_modules = []
-    if statements:
-        stmt_modules = check_statements(lake, root, env, contract_path, args.expected, statements, assumes=assumes)
-    else:
-        print("Warning: no --statements path was given, so nothing checks that the expected proposition "
-              "and its definitions are independent of the proof modules. Older atlases keep working; "
-              "see 'Separate statements from proofs' in SKILL.md to migrate.", file=sys.stderr)
-    # A custom source layout can hide local definitions from the fingerprint.
-    statement, defaults = (statement_record(lake, root, env, contract_path, args.expected)
-                           if scoped or statements else (None, None))
-    proof_closure = (proof_closure_record(lake, root, env, contract_path, declaration, args.expected,
-                                          statement_modules=stmt_modules)
-                     if (not statement_only and (scoped or statements)) else None)
-    reachable_mods = proof_closure.pop("_reachable_modules", None) if proof_closure else None
-    if reachable_mods:
-        reachable_paths = [p for p in ("/".join(m.split(".")) + ".lean" for m in reachable_mods)
-                           if p in initial]
-        checked_lean_loc = count_lean_loc(root, reachable_paths or [p for p in initial if p.endswith(".lean")])
-    else:
-        checked_lean_loc = count_lean_loc(root, [p for p in initial if p.endswith(".lean")])
-    if scoped is None:
-        final = inputs(root)
-    else:
-        try:
-            final_scope, _ = module_inputs(lake, root, env, targets, contract_path)
-        except (KeyError, OSError, TypeError, ValueError) as exc:
-            raise ValueError(f"Could not confirm the dependency closure after the audit: {exc}") from exc
-        final = hash_paths(root, final_scope)
-    if initial != final:
-        raise ValueError("Package inputs changed during the audit; rerun on stable sources")
-    ext_pkgs = external_packages(root)
-    profile = axiom_profile(axioms)
-    if statement_only:
-        return dict(statement_only=True, contract=contract_path, expected=args.expected,
-                    toolchain=pin, axioms=axioms, axiom_profile=profile, external_packages=ext_pkgs,
-                    targets=targets, input_scope="module-closure",
-                    checked_inputs=initial, checked_lean_loc=checked_lean_loc,
-                    statements=statements, hygiene=hygiene,
-                    lean_output=output.strip(),
-                    statement=statement, defaults=defaults,
-                    **({"reachable_local_defs": len(statement["constants"])} if statement else {}),
-                    **({"routine": routine_modules} if routine_modules else {}),
-                    **({"hypotheses": hypotheses} if hypotheses else {}))
-    return dict(declaration=declaration, contract=contract_path,
-                expected=args.expected, toolchain=pin, axioms=axioms, axiom_profile=profile,
-                external_packages=ext_pkgs, theorem_info=theorem_info,
-                targets=targets, input_scope="module-closure" if scoped is not None else "full-package",
-                checked_inputs=initial, checked_lean_loc=checked_lean_loc,
-                statements=statements, hygiene=hygiene,
-                lean_output=output.strip(),
-                **({"assumes": assumes} if assumes else {}),
+        run([*lake, "--no-cache", "build", *union_targets], root, run_env, sys.stderr)
+
+    # 3. Per-claim Lean verification against the freshly built `.olean`s.
+    local_modules = _local_lean_modules(root)
+    checked_items = []
+    for item in prepared:
+        contract = item["contract"]
+        contract_path = item["contract_path"]
+        expected = item["expected"]
+        declaration = item["declaration"]
+        statement_only = item["statement_only"]
+        witness = item["witness"]
+        statements = item["statements"]
+        assumes = item["assumes"]
+        scoped = item["scoped"]
+        initial = item["initial"]
+
+        theorem_info = False
+        if statement_only:
+            program = (contract.read_text(encoding="utf-8-sig") + "\n" +
+                       f"example : Prop := {expected}\n#print axioms {expected}\n")
+            result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
+                                    cwd=root, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            output = result.stdout.decode("utf-8-sig", errors="replace")
+            if result.returncode or re.search(r"\bwarning:", output, re.I):
+                raise ValueError("Lean statement check did not pass cleanly:\n" + output)
+            axioms = axiom_report(output, expected)
+        else:
+            claim_type = expected_claim_type(expected, assumes)
+            program = ("import Lean\n" + contract.read_text(encoding="utf-8-sig") + "\n" +
+                       f"example : {claim_type} := {declaration}\n#print axioms {declaration}\n" +
+                       DECL_KIND_QUERY.replace("__DECL__", json.dumps(declaration)))
+            result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
+                                    cwd=root, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            output = result.stdout.decode("utf-8-sig", errors="replace")
+            if result.returncode or re.search(r"\bwarning:", output, re.I):
+                raise ValueError("Lean contract check did not pass cleanly:\n" + output)
+            axioms = axiom_report(output, declaration)
+            theorem_info = theorem_info_report(output, declaration)
+
+        if witness:
+            hypotheses = hypotheses_record(lake, root, run_env, contract_path, expected, witness,
+                                           local_modules=local_modules)
+        else:
+            hypotheses = None
+            print("Warning: no --witness was given, so nothing shows that the hypotheses of the expected "
+                  "proposition can hold. See 'Show the hypotheses can hold' in SKILL.md.", file=sys.stderr)
+
+        stmt_modules = []
+        if statements:
+            stmt_modules = check_statements(lake, root, run_env, contract_path, expected, statements, assumes=assumes)
+        else:
+            print("Warning: no --statements path was given, so nothing checks that the expected proposition "
+                  "and its definitions are independent of the proof modules. Older atlases keep working; "
+                  "see 'Separate statements from proofs' in SKILL.md to migrate.", file=sys.stderr)
+
+        # A custom source layout can hide local definitions from the fingerprint.
+        statement, defaults = (statement_record(lake, root, run_env, contract_path, expected,
+                                                local_modules=local_modules)
+                               if scoped or statements else (None, None))
+        proof_closure = (proof_closure_record(lake, root, run_env, contract_path, declaration, expected,
+                                              statement_modules=stmt_modules, local_modules=local_modules)
+                         if (not statement_only and (scoped or statements)) else None)
+        reachable_mods = proof_closure.pop("_reachable_modules", None) if proof_closure else None
+        if reachable_mods:
+            reachable_paths = [p for p in ("/".join(m.split(".")) + ".lean" for m in reachable_mods)
+                               if p in initial]
+            checked_lean_loc = count_lean_loc(root, reachable_paths or [p for p in initial if p.endswith(".lean")])
+        else:
+            checked_lean_loc = count_lean_loc(root, [p for p in initial if p.endswith(".lean")])
+
+        checked_items.append((item, dict(
+            axioms=axioms,
+            theorem_info=theorem_info,
+            output=output,
+            hypotheses=hypotheses,
+            statement=statement,
+            defaults=defaults,
+            proof_closure=proof_closure,
+            checked_lean_loc=checked_lean_loc,
+        )))
+
+    # 4. Re-verify post-check input closures and SHA-256 hashes for all claims (fresh from disk).
+    post_module_cache = {}
+    post_full_inputs = None
+    for item in prepared:
+        if item["scoped"] is None:
+            if post_full_inputs is None:
+                post_full_inputs = inputs(root)
+            final = post_full_inputs
+        else:
+            mkey = (tuple(item["targets"]), item["contract_path"])
+            if mkey not in post_module_cache:
+                try:
+                    final_scope, _ = module_inputs(lake, root, run_env, item["targets"], item["contract_path"])
+                except (KeyError, OSError, TypeError, ValueError) as exc:
+                    raise ValueError(f"Could not confirm the dependency closure after the audit: {exc}") from exc
+                post_module_cache[mkey] = final_scope
+            final = hash_paths(root, post_module_cache[mkey])
+        if item["initial"] != final:
+            raise ValueError("Package inputs changed during the audit; rerun on stable sources")
+
+    # 5. Assemble per-claim receipts identical to sequential `audit()`.
+    receipts = []
+    for item, chk in checked_items:
+        ext_pkgs = external_packages(root)
+        axioms = chk["axioms"]
+        profile = axiom_profile(axioms)
+        statement = chk["statement"]
+        defaults = chk["defaults"]
+        hypotheses = chk["hypotheses"]
+        proof_closure = chk["proof_closure"]
+        routine_modules = list(item["routine_modules"])
+        if item["statement_only"]:
+            receipts.append(dict(
+                statement_only=True, contract=item["contract_path"], expected=item["expected"],
+                toolchain=pin, axioms=axioms, axiom_profile=profile, external_packages=ext_pkgs,
+                targets=list(item["targets"]), input_scope="module-closure",
+                checked_inputs=dict(item["initial"]), checked_lean_loc=chk["checked_lean_loc"],
+                statements=list(item["statements"]), hygiene=dict(item["hygiene"]),
+                lean_output=chk["output"].strip(),
+                statement=statement, defaults=defaults,
+                **({"reachable_local_defs": len(statement["constants"])} if statement else {}),
+                **({"routine": routine_modules} if routine_modules else {}),
+                **({"hypotheses": hypotheses} if hypotheses else {}),
+            ))
+        else:
+            receipts.append(dict(
+                declaration=item["declaration"], contract=item["contract_path"],
+                expected=item["expected"], toolchain=pin, axioms=axioms, axiom_profile=profile,
+                external_packages=ext_pkgs, theorem_info=chk["theorem_info"],
+                targets=list(item["targets"]),
+                input_scope="module-closure" if item["scoped"] is not None else "full-package",
+                checked_inputs=dict(item["initial"]), checked_lean_loc=chk["checked_lean_loc"],
+                statements=list(item["statements"]), hygiene=dict(item["hygiene"]),
+                lean_output=chk["output"].strip(),
+                **({"assumes": list(item["assumes"])} if item["assumes"] else {}),
                 **({"routine": routine_modules} if routine_modules else {}),
                 **(proof_closure if proof_closure else {}),
                 **({"statement": statement, "defaults": defaults} if statement else {}),
-                **({"hypotheses": hypotheses} if hypotheses else {}))
+                **({"hypotheses": hypotheses} if hypotheses else {}),
+            ))
+    return receipts
+
+
+def audit(args):
+    return audit_batch(args.package, [args])[0]
 
 
 if __name__ == "__main__":
