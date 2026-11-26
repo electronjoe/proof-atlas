@@ -102,6 +102,16 @@ def render(data,secret=None,notice=""):
             extra = (f' · <a href="../{esc(data["supplement_url"])}">Read supplied proof in supplement.md</a>'
                      if b == "supplied" and data.get("supplement_url") else "")
             parts.append(f'<p><strong>Proof basis:</strong> {esc(label)} (<code>{esc(b)}</code>){extra}</p>')
+        sv = data.get("step_verification")
+        if sv and sv.get("verified") and sv.get("badge"):
+            supp_extra = (
+                f' · <a href="../{esc(data["supplement_url"])}">Read supplied steps in supplement.md</a>'
+                if sv.get("supplied_steps") and data.get("supplement_url") else ""
+            )
+            parts.append(
+                f'<p><strong>Step verification:</strong> {esc(sv["badge"])} '
+                f'({sv["paper_steps"]} verbatim paper / {sv["supplied_steps"]} supplied){supp_extra}</p>'
+            )
         metrics = data.get("proof_metrics")
         if metrics:
             bits = []
@@ -241,6 +251,9 @@ def queue(entries):
             parts.append(d["assessment"])
         if d.get("basis") == "supplied":
             parts.append("Proof supplied outside manuscript")
+        sv = d.get("step_verification")
+        if sv and sv.get("verified") and sv.get("badge"):
+            parts.append(sv["badge"])
         if d.get("needs_author_confirmation"):
             parts.append("Needs author confirmation")
         elif d.get("needs_author_confirmation_via"):

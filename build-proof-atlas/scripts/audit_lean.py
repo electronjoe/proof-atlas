@@ -737,9 +737,502 @@ partial def proofAtlasIsPropType : Lean.Expr → Bool
 
 
 _COMPILER_AUX_PART = re.compile(
-    r"^(?:_proof_\d+|_?match_\d+|_sunfold|_cstage\d+|_closed_\d+|_rarg|_boxed|_aux_\d+|_uniq|"
+    r"^(?:_proof_\d+(?:_\d+)*|_?match_\d+|_sunfold|_cstage\d+|_closed_\d+|_rarg|_boxed|_aux_\d+|_uniq|"
     r"eq_\d+|casesOn|recOn|brecOn|below|ibelow|noConfusion|noConfusionType|ctorIdx|sizeOf_spec)$"
 )
+
+STEP_ORIGINS = frozenset({"paper", "supplied"})
+STANDARD_AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound"})
+
+# Compiled-Expr step-lemma auditor (TINA `auditUses`): walks each declared step lemma and
+# the claim's main theorem in Lean.Environment, looking through compiler-generated auxiliaries
+# (_proof_1, match_1, etc.) and local unmapped helpers while stopping at declared sibling
+# step lemmas, .Statement constants, and forbidden calls to another claim's `main` theorem.
+STEP_AUDIT_QUERY = r'''
+partial def proofAtlasStepIsPropType : Lean.Expr → Bool
+  | .sort .zero => true
+  | .forallE _ _ b _ => proofAtlasStepIsPropType b
+  | .letE _ _ _ b _ => proofAtlasStepIsPropType b
+  | .mdata _ e => proofAtlasStepIsPropType e
+  | _ => false
+
+def proofAtlasStepIsStmtConst (stmtMods : Lean.NameSet) (mod : Option Lean.Name)
+    (n : Lean.Name) (ci : Lean.ConstantInfo) : Bool :=
+  if ci.isTheorem then false
+  else
+    let s := toString n
+    if s.endsWith ".Statement" then true
+    else
+      let inStmtMod := match mod with
+        | some m =>
+          let ms := toString m
+          stmtMods.contains m || ms == "Statements" || ms.startsWith "Statements."
+        | none => false
+      inStmtMod && proofAtlasStepIsPropType ci.type
+
+def proofAtlasStepLastPart (n : Lean.Name) : String :=
+  match n with
+  | .str _ s => s
+  | _ => ""
+
+def proofAtlasStepIsForbiddenMain (forbidden : Lean.NameSet) (declName mainDeclName root : Lean.Name)
+    (mod : Option Lean.Name) (n : Lean.Name) (ci : Lean.ConstantInfo) : Bool :=
+  if !ci.isTheorem then false
+  else if n == root then false
+  else if root == mainDeclName && (n == mainDeclName || n == declName) then false
+  else if forbidden.contains n then true
+  else if proofAtlasStepLastPart n == "main" then true
+  else
+    match mod with
+    | some m => toString m == "Assembly"
+    | none => false
+
+def proofAtlasDeclUsesConst (env : Lean.Environment) (local_ : Lean.NameSet)
+    (start target : Lean.Name) : Bool :=
+  if start == target then true
+  else Id.run do
+    let some rootCi := env.find? start | return false
+    let rootVal := rootCi.value? (allowOpaque := true)
+    let mut todo : Array Lean.Name :=
+      rootCi.type.getUsedConstants ++ (rootVal.map (·.getUsedConstants)).getD #[]
+    let mut seen : Lean.NameSet := ({} : Lean.NameSet).insert start
+    while !todo.isEmpty do
+      let n := todo.back!
+      todo := todo.pop
+      if n == target then return true
+      if seen.contains n then continue
+      seen := seen.insert n
+      let some ci := env.find? n | continue
+      let mod := (env.getModuleIdxFor? n).map (env.allImportedModuleNames[·]!)
+      unless mod.all local_.contains do continue
+      let val := ci.value? (allowOpaque := true)
+      todo := todo ++ ci.type.getUsedConstants ++ (val.map (·.getUsedConstants)).getD #[]
+    return false
+
+def proofAtlasAuditUses
+    (env : Lean.Environment)
+    (local_ stmtMods stepSet forbidden : Lean.NameSet)
+    (expectedName declName mainDeclName root : Lean.Name) :
+    Lean.CoreM (Array Lean.Name × Array Lean.Name × Array Lean.Name) := do
+  let some rootCi := env.find? root | throwError "unknown constant {root}"
+  let rootVal := rootCi.value? (allowOpaque := true)
+  let mut todo : Array Lean.Name :=
+    rootCi.type.getUsedConstants ++ (rootVal.map (·.getUsedConstants)).getD #[]
+  let mut seen : Lean.NameSet := ({} : Lean.NameSet).insert root
+  let mut usedSteps : Lean.NameSet := {}
+  let mut usedStmts : Lean.NameSet := {}
+  let mut forbiddenMains : Lean.NameSet := {}
+  while !todo.isEmpty do
+    let n := todo.back!
+    todo := todo.pop
+    if seen.contains n then continue
+    seen := seen.insert n
+    let some ci := env.find? n | continue
+    let mod := (env.getModuleIdxFor? n).map (env.allImportedModuleNames[·]!)
+    unless mod.all local_.contains do continue
+    if stepSet.contains n then
+      usedSteps := usedSteps.insert n
+      continue
+    if proofAtlasStepIsStmtConst stmtMods mod n ci then
+      if n != expectedName then
+        usedStmts := usedStmts.insert n
+      continue
+    if proofAtlasStepIsForbiddenMain forbidden declName mainDeclName root mod n ci then
+      forbiddenMains := forbiddenMains.insert n
+      continue
+    let val := ci.value? (allowOpaque := true)
+    todo := todo ++ ci.type.getUsedConstants ++ (val.map (·.getUsedConstants)).getD #[]
+  return (usedSteps.toArray, usedStmts.toArray, forbiddenMains.toArray)
+
+#eval show Lean.CoreM Unit from do
+  let env ← Lean.getEnv
+  let local_ : Lean.NameSet := (__LOCAL__ : List String).foldl (fun s m => s.insert m.toName) {}
+  let stmtMods : Lean.NameSet := (__STMT_MODS__ : List String).foldl (fun s m => s.insert m.toName) {}
+  let stepList : List Lean.Name := (__STEP_LEMMAS__ : List String).map String.toName
+  let stepSet : Lean.NameSet := stepList.foldl (fun s n => s.insert n) {}
+  let forbidden : Lean.NameSet := (__FORBIDDEN_MAINS__ : List String).foldl (fun s n => s.insert n.toName) {}
+  let declName := (__DECL__ : String).toName
+  let mainDeclName := (__MAIN_DECL__ : String).toName
+  let expectedName := (__EXPECTED__ : String).toName
+  let isThm (ci : Lean.ConstantInfo) : Bool :=
+    match ci with | .thmInfo _ => true | _ => false
+  for s in stepList do
+    let some ci := env.find? s | throwError "unknown step lemma {s}"
+    let mod := (env.getModuleIdxFor? s).map (env.allImportedModuleNames[·]!)
+    let range ← Lean.findDeclarationRanges? s
+    let axioms ← Lean.collectAxioms s
+    let (uSteps, uStmts, fMains) ←
+      proofAtlasAuditUses env local_ stmtMods stepSet forbidden expectedName declName mainDeclName s
+    IO.println <| "PROOF-ATLAS-STEP-AUDIT " ++ (Lean.Json.mkObj [
+      ("lemma", Lean.Json.str (toString s)),
+      ("theorem_info", Lean.toJson (isThm ci)),
+      ("module", Lean.toJson (mod.map toString)),
+      ("lines", Lean.toJson (range.map fun r => #[r.range.pos.line, r.range.endPos.line])),
+      ("axioms", Lean.toJson (axioms.map toString)),
+      ("used_steps", Lean.toJson (uSteps.map toString)),
+      ("used_statements", Lean.toJson (uStmts.map toString)),
+      ("forbidden_mains", Lean.toJson (fMains.map toString))
+    ]).compress
+  let some mainCi := env.find? mainDeclName | throwError "unknown main declaration {mainDeclName}"
+  let mainMod := (env.getModuleIdxFor? mainDeclName).map (env.allImportedModuleNames[·]!)
+  let mainAxioms ← Lean.collectAxioms mainDeclName
+  let declUsesMain := proofAtlasDeclUsesConst env local_ declName mainDeclName
+  let (mSteps, mStmts, mForbidden) ←
+    proofAtlasAuditUses env local_ stmtMods stepSet forbidden expectedName declName mainDeclName mainDeclName
+  IO.println <| "PROOF-ATLAS-MAIN-AUDIT " ++ (Lean.Json.mkObj [
+    ("declaration", Lean.Json.str (toString declName)),
+    ("main_declaration", Lean.Json.str (toString mainDeclName)),
+    ("theorem_info", Lean.toJson (isThm mainCi)),
+    ("decl_uses_main", Lean.toJson declUsesMain),
+    ("module", Lean.toJson (mainMod.map toString)),
+    ("axioms", Lean.toJson (mainAxioms.map toString)),
+    ("used_steps", Lean.toJson (mSteps.map toString)),
+    ("used_statements", Lean.toJson (mStmts.map toString)),
+    ("forbidden_mains", Lean.toJson (mForbidden.map toString))
+  ]).compress
+'''
+
+
+_LEAN_IDENT_RE = re.compile(r"[A-Za-z_][\w']*(?:\.[A-Za-z_][\w']*)*")
+
+
+def load_step_map(raw, root=None):
+    """Load a step_map specification from a dict, list, or JSON file path."""
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, (str, Path)):
+        candidate = Path(raw)
+        if not candidate.is_file() and root is not None and not candidate.is_absolute():
+            candidate = Path(root) / candidate
+        if not candidate.is_file():
+            raise ValueError(f"Step map file not found: {raw}")
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8-sig"))
+        except ValueError as exc:
+            raise ValueError(f"Invalid JSON in step map {raw}: {exc}") from exc
+    raise ValueError("step_map must be a JSON file path, object, or list of steps")
+
+
+def step_map_digest(normalized):
+    """Compute canonical SHA-256 digest of the Lean-relevant step_map structure."""
+    payload = {
+        "main_declaration": normalized["main_declaration"],
+        "main_deps": sorted(normalized["main_deps"]) if normalized.get("main_deps") is not None else None,
+        "steps": [
+            {"id": s["id"], "lemma": s["lemma"], "step_deps": sorted(s["step_deps"])}
+            for s in normalized["steps"]
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def normalize_step_map(raw, *, declaration=None, root=None):
+    """Validate and normalize a claim's 1:1 step_map specification."""
+    data = load_step_map(raw, root=root)
+    if isinstance(data, list):
+        data = {"steps": data}
+    if not isinstance(data, dict):
+        raise ValueError("step_map must be a JSON object or list of step objects")
+    raw_steps = data.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ValueError("step_map requires a non-empty 'steps' list")
+
+    main_decl = data.get("main_declaration") or declaration
+    if main_decl is not None:
+        if not isinstance(main_decl, str) or not _LEAN_IDENT_RE.fullmatch(main_decl):
+            raise ValueError(f"step_map main_declaration must be a fully qualified Lean identifier: {main_decl!r}")
+
+    forbidden_mains = []
+    raw_forbidden = data.get("forbidden_mains") or []
+    if not isinstance(raw_forbidden, list):
+        raise ValueError("step_map forbidden_mains must be a list of Lean identifiers")
+    for name in raw_forbidden:
+        if not isinstance(name, str) or not _LEAN_IDENT_RE.fullmatch(name):
+            raise ValueError(f"step_map forbidden_mains entry must be a fully qualified Lean identifier: {name!r}")
+        if name not in forbidden_mains:
+            forbidden_mains.append(name)
+
+    seen_ids = set()
+    seen_lemmas = {}
+    prelim = []
+    for idx, item in enumerate(raw_steps):
+        if not isinstance(item, dict):
+            raise ValueError(f"step_map steps[{idx}] must be an object")
+        sid = item.get("id")
+        if not isinstance(sid, str) or not sid.strip():
+            raise ValueError(f"step_map steps[{idx}] requires a non-empty string 'id'")
+        sid = sid.strip()
+        if sid in seen_ids:
+            raise ValueError(f"Duplicate step id in step_map: {sid}")
+        seen_ids.add(sid)
+
+        lemma = item.get("lemma")
+        if not isinstance(lemma, str) or not _LEAN_IDENT_RE.fullmatch(lemma):
+            raise ValueError(f"step_map step '{sid}' requires a fully qualified Lean identifier 'lemma'")
+        if lemma in seen_lemmas:
+            raise ValueError(
+                f"Duplicate Lean lemma '{lemma}' in step_map (used by '{seen_lemmas[lemma]}' and '{sid}'); "
+                "step_map requires a 1:1 binding"
+            )
+        if main_decl and lemma == main_decl:
+            raise ValueError(f"step_map step '{sid}' lemma '{lemma}' cannot be the claim's main declaration")
+        if declaration and lemma == declaration:
+            raise ValueError(f"step_map step '{sid}' lemma '{lemma}' cannot be the audited declaration")
+        seen_lemmas[lemma] = sid
+
+        origin = item.get("origin")
+        if origin is not None:
+            if not isinstance(origin, str) or origin not in STEP_ORIGINS:
+                raise ValueError(f"step_map step '{sid}' origin must be 'paper' or 'supplied', got {origin!r}")
+
+        raw_deps = item.get("step_deps", [])
+        if raw_deps is None:
+            raw_deps = []
+        if not isinstance(raw_deps, list) or not all(isinstance(d, str) and d.strip() for d in raw_deps):
+            raise ValueError(f"step_map step '{sid}' step_deps must be a list of non-empty step IDs")
+
+        entry = dict(id=sid, lemma=lemma, raw_deps=[d.strip() for d in raw_deps])
+        if origin is not None:
+            entry["origin"] = origin
+        for opt in ("tex", "tex_file", "title", "text"):
+            if opt in item and item[opt] is not None:
+                if not isinstance(item[opt], str):
+                    raise ValueError(f"step_map step '{sid}' field '{opt}' must be a string")
+                entry[opt] = item[opt]
+        prelim.append(entry)
+
+    def resolve_ref(ref, who):
+        if ref in seen_ids:
+            return ref
+        if ref in seen_lemmas:
+            return seen_lemmas[ref]
+        raise ValueError(f"step_map {who} references unknown step '{ref}'")
+
+    steps = []
+    deps_graph = {}
+    for entry in prelim:
+        sid = entry["id"]
+        resolved_deps = []
+        for dep in entry["raw_deps"]:
+            target = resolve_ref(dep, f"step '{sid}' step_deps")
+            if target == sid:
+                raise ValueError(f"step_map step '{sid}' cannot depend on itself")
+            if target not in resolved_deps:
+                resolved_deps.append(target)
+        deps_graph[sid] = resolved_deps
+        clean = {k: v for k, v in entry.items() if k != "raw_deps"}
+        clean["step_deps"] = resolved_deps
+        steps.append(clean)
+
+    # Detect cycles in declared step_deps before invoking Lean.
+    state = {}
+    def dfs(node):
+        st = state.get(node, 0)
+        if st == 1:
+            raise ValueError(f"Cyclic step_deps detected in step_map involving '{node}'")
+        if st == 2:
+            return
+        state[node] = 1
+        for dep in deps_graph[node]:
+            dfs(dep)
+        state[node] = 2
+
+    for sid in deps_graph:
+        dfs(sid)
+
+    main_deps = None
+    if "main_deps" in data and data["main_deps"] is not None:
+        raw_mdeps = data["main_deps"]
+        if not isinstance(raw_mdeps, list) or not all(isinstance(d, str) and d.strip() for d in raw_mdeps):
+            raise ValueError("step_map main_deps must be a list of step IDs")
+        main_deps = []
+        for dep in raw_mdeps:
+            target = resolve_ref(dep.strip(), "main_deps")
+            if target not in main_deps:
+                main_deps.append(target)
+
+    normalized = dict(
+        main_declaration=main_decl,
+        main_deps=main_deps,
+        forbidden_mains=forbidden_mains,
+        steps=steps,
+    )
+    normalized["step_map_sha256"] = step_map_digest(normalized)
+    return normalized
+
+
+def parse_step_audit(output, normalized_step_map, declaration, local_modules=None):
+    """Parse STEP_AUDIT_QUERY output and enforce exact step_deps and forbidden-main invariants."""
+    step_rows = [json.loads(line.split(" ", 1)[1]) for line in output.splitlines()
+                 if line.startswith("PROOF-ATLAS-STEP-AUDIT ")]
+    main_rows = [json.loads(line.split(" ", 1)[1]) for line in output.splitlines()
+                 if line.startswith("PROOF-ATLAS-MAIN-AUDIT ")]
+    if len(main_rows) != 1 or len(step_rows) != len(normalized_step_map["steps"]):
+        raise ValueError(f"Could not complete compiled-Expr step audit for {declaration}:\n" + output)
+
+    modules = local_modules or {}
+    main_row = main_rows[0]
+    main_decl = normalized_step_map["main_declaration"] or declaration
+    if not main_row.get("theorem_info"):
+        raise ValueError(f"Step-audited main declaration {main_decl} must be a Lean theorem (.thmInfo)")
+    if not main_row.get("decl_uses_main"):
+        raise ValueError(
+            f"Audited declaration {declaration} does not use step-mapped main declaration {main_decl}"
+        )
+    extra_main_axioms = sorted(set(main_row.get("axioms") or []) - STANDARD_AXIOMS)
+    if extra_main_axioms:
+        raise ValueError(f"{main_decl} uses additional axioms: {', '.join(extra_main_axioms)}")
+    if main_row.get("forbidden_mains"):
+        bad = ", ".join(sorted(main_row["forbidden_mains"]))
+        raise ValueError(
+            f"Main declaration {main_decl} directly calls another claim's main theorem(s): {bad}. "
+            "Take upstream claim statements as explicit hypotheses instead."
+        )
+
+    lemma_to_id = {s["lemma"]: s["id"] for s in normalized_step_map["steps"]}
+    id_order = {s["id"]: idx for idx, s in enumerate(normalized_step_map["steps"])}
+    rows_by_lemma = {r["lemma"]: r for r in step_rows}
+
+    verified_steps = []
+    verified_graph = {}
+    for step in normalized_step_map["steps"]:
+        sid = step["id"]
+        lemma = step["lemma"]
+        row = rows_by_lemma.get(lemma)
+        if not row:
+            raise ValueError(f"Missing step audit result for step '{sid}' ({lemma})")
+        if not row.get("theorem_info"):
+            raise ValueError(f"Step '{sid}' declaration {lemma} must be a Lean theorem (.thmInfo)")
+        axioms = sorted(row.get("axioms") or [])
+        extra_ax = sorted(set(axioms) - STANDARD_AXIOMS)
+        if extra_ax:
+            raise ValueError(f"Step '{sid}' ({lemma}) uses additional axioms: {', '.join(extra_ax)}")
+        if row.get("forbidden_mains"):
+            bad = ", ".join(sorted(row["forbidden_mains"]))
+            raise ValueError(
+                f"Step '{sid}' ({lemma}) directly calls another claim's main theorem(s): {bad}. "
+                "Take upstream claim statements as explicit hypotheses instead."
+            )
+
+        declared_deps = list(step["step_deps"])
+        used_deps = sorted(
+            {lemma_to_id[u] for u in (row.get("used_steps") or []) if u in lemma_to_id},
+            key=lambda s: id_order[s],
+        )
+        declared_set = set(declared_deps)
+        used_set = set(used_deps)
+        undeclared = sorted(used_set - declared_set, key=lambda s: id_order[s])
+        unused = sorted(declared_set - used_set, key=lambda s: id_order[s])
+        if undeclared or unused:
+            problems = []
+            if undeclared:
+                u_str = ", ".join(f"{s} ({next(x['lemma'] for x in normalized_step_map['steps'] if x['id'] == s)})" for s in undeclared)
+                problems.append(f"uses undeclared step lemma(s): {u_str}")
+            if unused:
+                n_str = ", ".join(f"{s} ({next(x['lemma'] for x in normalized_step_map['steps'] if x['id'] == s)})" for s in unused)
+                problems.append(f"declares unused step dependency(ies): {n_str}")
+            raise ValueError(f"Step '{sid}' ({lemma}) dependency mismatch: " + "; ".join(problems))
+
+        verified_graph[sid] = used_deps
+        mod = row.get("module")
+        step_rec = dict(
+            id=sid,
+            lemma=lemma,
+            module=mod,
+            theorem_info=True,
+            axioms=axioms,
+            declared_deps=declared_deps,
+            used_deps=used_deps,
+            used_statements=sorted(set(row.get("used_statements") or [])),
+        )
+        if mod and mod in modules:
+            step_rec["file"] = modules[mod]
+        if row.get("lines"):
+            step_rec["lines"] = row["lines"]
+        if "origin" in step:
+            step_rec["origin"] = step["origin"]
+        verified_steps.append(step_rec)
+
+    main_used_steps = sorted(
+        {lemma_to_id[u] for u in (main_row.get("used_steps") or []) if u in lemma_to_id},
+        key=lambda s: id_order[s],
+    )
+    if normalized_step_map.get("main_deps") is not None:
+        declared_main = list(normalized_step_map["main_deps"])
+        undeclared_m = sorted(set(main_used_steps) - set(declared_main), key=lambda s: id_order[s])
+        unused_m = sorted(set(declared_main) - set(main_used_steps), key=lambda s: id_order[s])
+        if undeclared_m or unused_m:
+            problems = []
+            if undeclared_m:
+                problems.append("uses undeclared step lemma(s): " + ", ".join(undeclared_m))
+            if unused_m:
+                problems.append("declares unused main_deps: " + ", ".join(unused_m))
+            raise ValueError(f"Main declaration {main_decl} step dependency mismatch: " + "; ".join(problems))
+
+    if not main_used_steps:
+        raise ValueError(
+            f"Main declaration {main_decl} does not use any declared step lemma from step_map"
+        )
+
+    # Every declared step lemma must participate in the proof of main_decl (no dead/orphan steps).
+    reachable = set()
+    stack = list(main_used_steps)
+    while stack:
+        cur = stack.pop()
+        if cur in reachable:
+            continue
+        reachable.add(cur)
+        stack.extend(verified_graph.get(cur, ()))
+    orphans = [s["id"] for s in normalized_step_map["steps"] if s["id"] not in reachable]
+    if orphans:
+        raise ValueError(
+            f"Step lemma(s) declared in step_map are not used in the proof of {main_decl}: {', '.join(orphans)}"
+        )
+
+    result = dict(
+        verified=True,
+        declaration=declaration,
+        main_declaration=main_decl,
+        main_steps=main_used_steps,
+        main_statements=sorted(set(main_row.get("used_statements") or [])),
+        forbidden_mains_checked=True,
+        step_count=len(verified_steps),
+        steps=verified_steps,
+        step_map_sha256=normalized_step_map["step_map_sha256"],
+    )
+    if normalized_step_map.get("main_deps") is not None:
+        result["main_deps_declared"] = list(normalized_step_map["main_deps"])
+    if normalized_step_map.get("forbidden_mains"):
+        result["forbidden_mains"] = list(normalized_step_map["forbidden_mains"])
+    return result
+
+
+def step_audit_record(lake, root, env, contract, declaration, expected, normalized_step_map,
+                      statement_modules=(), *, local_modules=None):
+    """Run compiled-Expr `auditUses` over all declared step lemmas and the claim's main theorem."""
+    modules = _local_lean_modules(root) if local_modules is None else local_modules
+    main_decl = normalized_step_map["main_declaration"] or declaration
+    step_lemmas = [s["lemma"] for s in normalized_step_map["steps"]]
+    program = (
+        "import Lean\n"
+        + (root / contract).read_text(encoding="utf-8-sig")
+        + "\n"
+        + STEP_AUDIT_QUERY
+        .replace("__LOCAL__", json.dumps(sorted(modules)))
+        .replace("__STMT_MODS__", json.dumps(sorted(statement_modules or ())))
+        .replace("__STEP_LEMMAS__", json.dumps(step_lemmas))
+        .replace("__FORBIDDEN_MAINS__", json.dumps(list(normalized_step_map.get("forbidden_mains") or [])))
+        .replace("__DECL__", json.dumps(declaration))
+        .replace("__MAIN_DECL__", json.dumps(main_decl))
+        .replace("__EXPECTED__", json.dumps(expected))
+    )
+    result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
+                            cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = result.stdout.decode("utf-8-sig", errors="replace")
+    if result.returncode:
+        raise ValueError(f"Compiled-Expr step audit failed for {declaration}:\n" + output)
+    return parse_step_audit(output, normalized_step_map, declaration, local_modules=modules)
 
 
 def is_compiler_aux(name):
@@ -882,12 +1375,15 @@ def _normalize_audit_spec(spec, root):
     statements = list(getattr(item, "statements", None) or [])
     routine = list(getattr(item, "routine", None) or [])
     assumes = list(getattr(item, "assumes", None) or [])
+    raw_step_map = getattr(item, "step_map", None)
     expected = item.expected
     if statement_only:
         if declaration:
             raise ValueError("--statement-only does not accept a proof declaration")
         if assumes:
             raise ValueError("--statement-only does not accept --assumes")
+        if raw_step_map is not None:
+            raise ValueError("--statement-only does not accept --step-map")
         if not statements:
             raise ValueError("--statement-only requires --statements")
     elif not declaration:
@@ -895,6 +1391,8 @@ def _normalize_audit_spec(spec, root):
     for name in (*([declaration] if declaration else []), expected, *assumes, *targets, *([witness] if witness else [])):
         if not re.fullmatch(r"[A-Za-z_][\w']*(?:\.[A-Za-z_][\w']*)*", name):
             raise ValueError("Expected a fully qualified Lean identifier")
+    step_map = (normalize_step_map(raw_step_map, declaration=declaration, root=root)
+                if raw_step_map is not None else None)
     return dict(
         contract=contract,
         contract_path=contract.relative_to(root).as_posix(),
@@ -906,6 +1404,7 @@ def _normalize_audit_spec(spec, root):
         statements=statements,
         routine=routine,
         assumes=assumes,
+        step_map=step_map,
     )
 
 
@@ -1116,6 +1615,10 @@ def audit_batch(package, specs, *, lake=None, env=None):
         proof_closure = (proof_closure_record(lake, root, run_env, contract_path, declaration, expected,
                                               statement_modules=stmt_modules, local_modules=local_modules)
                          if (not statement_only and (scoped or statements)) else None)
+        step_audit = (step_audit_record(lake, root, run_env, contract_path, declaration, expected,
+                                        item["step_map"], statement_modules=stmt_modules,
+                                        local_modules=local_modules)
+                      if (not statement_only and item["step_map"] is not None) else None)
         reachable_mods = proof_closure.pop("_reachable_modules", None) if proof_closure else None
         if reachable_mods:
             reachable_paths = [p for p in ("/".join(m.split(".")) + ".lean" for m in reachable_mods)
@@ -1132,6 +1635,7 @@ def audit_batch(package, specs, *, lake=None, env=None):
             statement=statement,
             defaults=defaults,
             proof_closure=proof_closure,
+            step_audit=step_audit,
             checked_lean_loc=checked_lean_loc,
         )))
 
@@ -1192,6 +1696,7 @@ def audit_batch(package, specs, *, lake=None, env=None):
                 **({"assumes": list(item["assumes"])} if item["assumes"] else {}),
                 **({"routine": routine_modules} if routine_modules else {}),
                 **(proof_closure if proof_closure else {}),
+                **({"step_audit": chk["step_audit"]} if chk["step_audit"] else {}),
                 **({"statement": statement, "defaults": defaults} if statement else {}),
                 **({"hypotheses": hypotheses} if hypotheses else {}),
             ))
@@ -1218,6 +1723,8 @@ if __name__ == "__main__":
     parser.add_argument("--assumes", action="append", default=[],
                         help="Expected proposition in Statements/ assumed as a hypothesis by a conditional proof (repeatable in binder order)")
     parser.add_argument("--witness", help="Declaration proving that the hypotheses of the expected proposition can all hold")
+    parser.add_argument("--step-map", dest="step_map", type=Path,
+                        help="JSON file mapping structured proof steps 1:1 to Lean step lemmas and declared step_deps")
     parser.add_argument("--output", type=Path, help="New evidence file to create on success")
     args = parser.parse_args()
     try:

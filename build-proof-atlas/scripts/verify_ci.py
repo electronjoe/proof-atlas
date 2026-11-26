@@ -11,7 +11,16 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
-from atlas import generate_challenge_harness, lean_ci_level, local
+from atlas import (
+    STEP_VERIFIED_PAPER_BADGE,
+    STEP_VERIFIED_SUPPLIED_BADGE,
+    collect_other_claim_declarations,
+    generate_challenge_harness,
+    lean_ci_level,
+    load_bound_tex_sources,
+    local,
+    resolve_claim_step_map,
+)
 from audit_lean import (
     _pure_external_prelude,
     audit_batch,
@@ -32,6 +41,7 @@ PARITY_CHECKS = (
     "assembly_assumptions",
     "statement_sha256",
     "witness_recheck",
+    "step_map_audit",
 )
 KNOWN_PARANOID_KERNELS = ("nanoda", "lean4lean", "con-leche")
 
@@ -365,6 +375,16 @@ def run_paranoid_checkers(package, pkg_harness, toolchain, proof_modules, env, l
 
 def _collect_packages(root, project, ci_level):
     """Validate project.json closures and group closed claims by Lean package."""
+    materials = json.loads(local(root, project["reader"]).read_text(encoding="utf-8-sig")) if project.get("reader") else {}
+    notes = materials.get("claims", {})
+    tex_sources = None
+
+    def get_tex_sources():
+        nonlocal tex_sources
+        if tex_sources is None:
+            tex_sources = load_bound_tex_sources(root, project)
+        return tex_sources
+
     packages = {}
     for label, work in project.get("work", {}).items():
         status = work.get("status")
@@ -413,10 +433,52 @@ def _collect_packages(root, project, ci_level):
                 raise ValueError(
                     f"{label}: local receipt witness ({prior_witness}) does not match declared assembly witness ({asm_spec['witness']})"
                 )
+        note = notes.get(label, {})
+        has_raw_step_map = (
+            work.get("step_map") is not None
+            or asm_spec.get("step_map") is not None
+            or note.get("step_map") is not None
+        )
+        step_map_info = None
+        if has_raw_step_map:
+            default_main = asm_spec.get("declaration") or closure["declaration"]
+            step_map_info = resolve_claim_step_map(
+                root, label, work, note, get_tex_sources(), default_main=default_main,
+            )
+            if prior.get("step_audit"):
+                if prior["step_audit"].get("verified") is not True:
+                    raise ValueError(f"{label}: local receipt has unverified step_audit")
+                if prior["step_audit"].get("step_map_sha256") != step_map_info["step_map_sha256"]:
+                    raise ValueError(
+                        f"{label}: step_map changed since the local audit receipt; rerun audit_lean.py --step-map"
+                    )
+        elif prior.get("step_audit"):
+            prior_sa = prior["step_audit"]
+            if prior_sa.get("verified") is not True:
+                raise ValueError(f"{label}: local receipt has unverified step_audit")
+            raw_steps = prior_sa.get("steps") or []
+            if not raw_steps or any(s.get("origin") != "supplied" for s in raw_steps):
+                raise ValueError(
+                    f"{label}: local receipt has step_audit, but no step_map is configured on work[{label}] "
+                    "or reader.json to verify verbatim TeX provenance of paper steps"
+                )
+            step_map_info = dict(
+                source=None,
+                main_declaration=prior_sa.get("main_declaration") or prior["declaration"],
+                main_deps=prior_sa.get("main_deps_declared"),
+                forbidden_mains=list(prior_sa.get("forbidden_mains") or []),
+                step_map_sha256=prior_sa["step_map_sha256"],
+                steps=[
+                    dict(id=s["id"], lemma=s["lemma"], step_deps=list(s.get("declared_deps") or []), origin="supplied")
+                    for s in raw_steps
+                ],
+                paper_step_count=0,
+                supplied_step_count=len(raw_steps),
+            )
         statements = _resolve_ci_statements(package, prior, ci_level, label)
         routine = _resolve_ci_routine(package, prior)
         packages.setdefault(package, []).append(
-            (label, work, prior, hashlib.sha256(raw).hexdigest(), statements, routine)
+            (label, work, prior, hashlib.sha256(raw).hexdigest(), statements, routine, step_map_info)
         )
     return packages
 
@@ -438,7 +500,7 @@ def prepare_project(root, *, level=None):
     ci_level = level or lean_ci_level(project)
     packages = _collect_packages(root, project, ci_level)
     for package, group in packages.items():
-        prepare(package, [prior for _, _, prior, _, _, _ in group])
+        prepare(package, [prior for _, _, prior, _, _, _, _ in group])
     return sorted(p.relative_to(root).as_posix() for p in packages)
 
 
@@ -509,7 +571,7 @@ def verify(root, *, offline=False, level=None):
 
     for package, group in packages.items():
         if not offline:
-            prepare(package, [prior for _, _, prior, _, _, _ in group])
+            prepare(package, [prior for _, _, prior, _, _, _, _ in group])
         pin, pkg_env = _package_env(package)
         lake = select_lake(package, pin, pkg_env, sys.stderr, offline=True)
         # Always enforce Prelude.lean pure-external isolation when Prelude.lean exists in the package.
@@ -521,14 +583,27 @@ def verify(root, *, offline=False, level=None):
         batch_items = []
         batch_specs = []
 
-        for label, work, prior, digest, statements, routine in group:
+        for label, work, prior, digest, statements, routine, step_map_info in group:
             print(f"Rechecking {label} ({prior['declaration']})", flush=True)
             targets = prior.get("targets")
             if not targets:
                 imports = import_headers(lake, [prior["contract"]], package, pkg_env)
                 targets = sorted(m for m in imports if (package / (m.replace(".", "/") + ".lean")).is_file())
             witness = (prior.get("hypotheses") or {}).get("declaration")
-            batch_items.append((label, work, prior, digest, statements, routine, targets))
+            step_map_arg = None
+            if step_map_info is not None:
+                other_decls = collect_other_claim_declarations(project, label)
+                merged_forbidden = _dedup_ordered([*step_map_info["forbidden_mains"], *other_decls])
+                step_map_arg = dict(
+                    main_declaration=step_map_info["main_declaration"] or prior["declaration"],
+                    main_deps=step_map_info["main_deps"],
+                    forbidden_mains=merged_forbidden,
+                    steps=[
+                        {k: v for k, v in s.items() if k in ("id", "lemma", "step_deps", "origin")}
+                        for s in step_map_info["steps"]
+                    ],
+                )
+            batch_items.append((label, work, prior, digest, statements, routine, targets, step_map_info))
             batch_specs.append(SimpleNamespace(
                 package=package,
                 contract=prior["contract"],
@@ -539,6 +614,7 @@ def verify(root, *, offline=False, level=None):
                 routine=routine,
                 assumes=[],
                 witness=witness,
+                step_map=step_map_arg,
             ))
 
         checked_list = audit_batch(package, batch_specs, lake=lake, env=pkg_env)
@@ -547,7 +623,7 @@ def verify(root, *, offline=False, level=None):
                 f"Batched audit returned {len(checked_list)} receipts for {len(batch_items)} claims"
             )
 
-        for (label, work, prior, digest, statements, routine, targets), checked in zip(batch_items, checked_list):
+        for (label, work, prior, digest, statements, routine, targets, step_map_info), checked in zip(batch_items, checked_list):
             # Full invariant parity assertions against local audit_lean.py guarantees.
             if not checked.get("theorem_info"):
                 raise ValueError(f"{label}: audited declaration is not a kernel theorem (.thmInfo)")
@@ -590,6 +666,25 @@ def verify(root, *, offline=False, level=None):
                         or (set(chk_hyp.get("axioms", [])) - STANDARD_AXIOMS)):
                     raise ValueError(f"{label}: witness re-check differs from the local receipt")
 
+            step_meta = {}
+            if step_map_info is not None or prior.get("step_audit"):
+                chk_sa = checked.get("step_audit")
+                if not chk_sa or chk_sa.get("verified") is not True:
+                    raise ValueError(f"{label}: compiled-Expr step audit did not pass in CI")
+                if step_map_info is not None and chk_sa.get("step_map_sha256") != step_map_info["step_map_sha256"]:
+                    raise ValueError(f"{label}: CI step_map_sha256 differs from project step_map")
+                if prior.get("step_audit") and chk_sa.get("step_map_sha256") != prior["step_audit"].get("step_map_sha256"):
+                    raise ValueError(f"{label}: CI step_map_sha256 differs from local receipt")
+                supplied_count = step_map_info["supplied_step_count"] if step_map_info is not None else len(chk_sa.get("steps") or [])
+                paper_count = step_map_info["paper_step_count"] if step_map_info is not None else 0
+                step_meta = dict(
+                    step_map_sha256=chk_sa["step_map_sha256"],
+                    step_count=chk_sa["step_count"],
+                    paper_steps=paper_count,
+                    supplied_steps=supplied_count,
+                    step_badge=(STEP_VERIFIED_SUPPLIED_BADGE if supplied_count > 0 else STEP_VERIFIED_PAPER_BADGE),
+                )
+
             pkg_proof_modules.extend(targets)
             pkg_claim_records[label] = dict(
                 audit_sha256=digest,
@@ -604,6 +699,7 @@ def verify(root, *, offline=False, level=None):
                 assumes=[],
                 statement_sha256=fingerprint,
                 hypotheses=(checked.get("hypotheses") or {}).get("proposition"),
+                **step_meta,
             )
 
         pkg_kernels = ["lean-kernel"]

@@ -27,6 +27,8 @@ BASIS_LABELS = {
     "supplied": "Proof supplied outside manuscript",
 }
 SUPPLIED_BADGE = "Lean checked (proof supplied outside manuscript)"
+STEP_VERIFIED_PAPER_BADGE = "Step-verified (paper)"
+STEP_VERIFIED_SUPPLIED_BADGE = "Step-verified (with supplied steps)"
 EDGE_GROUNDING_LABELS = {
     "both": "Used in both paper & Lean proof",
     "paper_only": "Paper-only dependency",
@@ -236,6 +238,7 @@ def _ci_claim_status(audit, receipt_bytes, ci, cid):
             and all(record.get(k) == audit.get(k) for k in ("expected", "declaration", "toolchain"))
             and (not audit.get("statement") or record.get("statement_sha256") == audit["statement"]["sha256"])
             and (not audit.get("hypotheses") or record.get("hypotheses") == audit["hypotheses"]["proposition"])
+            and (not audit.get("step_audit") or record.get("step_map_sha256") == audit["step_audit"].get("step_map_sha256"))
             and set(record.get("axioms", [])) == set(audit.get("axioms", []))
             and record.get("theorem_info") is not False
             and not record.get("assumes")):
@@ -461,6 +464,227 @@ def supplement_anchor(cid):
     return slug or "claim"
 
 
+def load_bound_tex_sources(root, project):
+    """Load SHA-256-verified manuscript TeX sources with normalized LF newlines."""
+    sources = []
+    for source in project.get("tex", []):
+        text = read_source(root, source).decode("utf-8-sig").replace("\r\n", "\n")
+        sources.append((source["path"], text))
+    return sources
+
+
+def collect_other_claim_declarations(project, exclude_cid):
+    """Return sorted Lean declarations belonging to other claims in project.json."""
+    decls = set()
+    for other_cid, other_w in (project.get("work") or {}).items():
+        if other_cid == exclude_cid or not isinstance(other_w, dict):
+            continue
+        for holder in (other_w.get("closure"), other_w.get("assembly")):
+            if isinstance(holder, dict) and isinstance(holder.get("declaration"), str) and holder["declaration"].strip():
+                decls.add(holder["declaration"].strip())
+    return sorted(decls)
+
+
+def resolve_claim_step_map(root, cid, work, note, tex_sources, *, default_main=None):
+    """Load, normalize, and verify structured Lamport step provenance against bound TeX sources."""
+    import audit_lean
+
+    raw = None
+    if isinstance(work, dict) and work.get("step_map") is not None:
+        raw = work["step_map"]
+    elif isinstance(work, dict) and isinstance(work.get("assembly"), dict) and work["assembly"].get("step_map") is not None:
+        raw = work["assembly"]["step_map"]
+    elif isinstance(note, dict) and note.get("step_map") is not None:
+        raw = note["step_map"]
+    if raw is None:
+        return None
+
+    source_rel = None
+    if isinstance(raw, str):
+        source_rel = raw
+        path = local(root, raw)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{cid}: could not load step_map '{raw}': {exc}") from exc
+    elif isinstance(raw, (dict, list)):
+        data = raw
+    else:
+        raise ValueError(f"{cid}: step_map must be a project-relative JSON path, object, or list")
+
+    try:
+        normalized = audit_lean.normalize_step_map(data, declaration=default_main, root=root)
+    except ValueError as exc:
+        raise ValueError(f"{cid}: {exc}") from exc
+
+    tex_by_path = dict(tex_sources)
+    paper_count = 0
+    supplied_count = 0
+    enriched_steps = []
+    for step in normalized["steps"]:
+        sid = step["id"]
+        origin = step.get("origin")
+        if origin not in audit_lean.STEP_ORIGINS:
+            raise ValueError(
+                f"{cid}: step '{sid}' must declare origin 'paper' or 'supplied' for Lamport step provenance"
+            )
+        enriched = dict(step)
+        if origin == "paper":
+            tex_excerpt = step.get("tex")
+            if not isinstance(tex_excerpt, str) or not tex_excerpt.strip():
+                raise ValueError(
+                    f"{cid}: step '{sid}' has origin 'paper' and must supply a non-empty verbatim 'tex' substring"
+                )
+            needle = tex_excerpt.replace("\r\n", "\n")
+            req_file = step.get("tex_file")
+            matched_file = None
+            matched_line = None
+            if req_file:
+                if req_file not in tex_by_path:
+                    raise ValueError(
+                        f"{cid}: step '{sid}' tex_file '{req_file}' is not a bound TeX source in project.json"
+                    )
+                pos = tex_by_path[req_file].find(needle)
+                if pos >= 0:
+                    matched_file = req_file
+                    matched_line = tex_by_path[req_file].count("\n", 0, pos) + 1
+            else:
+                for path_str, content in tex_sources:
+                    pos = content.find(needle)
+                    if pos >= 0:
+                        matched_file = path_str
+                        matched_line = content.count("\n", 0, pos) + 1
+                        break
+            if matched_file is None:
+                raise ValueError(
+                    f"{cid}: step '{sid}' has origin 'paper' but its 'tex' excerpt is not a verbatim "
+                    "substring of the bound TeX sources"
+                )
+            enriched["tex"] = needle
+            enriched["tex_file"] = matched_file
+            enriched["tex_line"] = matched_line
+            enriched["tex_verified"] = True
+            paper_count += 1
+        else:
+            enriched["tex_verified"] = False
+            supplied_count += 1
+        enriched_steps.append(enriched)
+
+    return dict(
+        source=source_rel,
+        main_declaration=normalized["main_declaration"],
+        main_deps=normalized["main_deps"],
+        forbidden_mains=normalized["forbidden_mains"],
+        step_map_sha256=normalized["step_map_sha256"],
+        steps=enriched_steps,
+        paper_step_count=paper_count,
+        supplied_step_count=supplied_count,
+    )
+
+
+def evaluate_step_verification(cid, step_map, audit, *, proof_checked=False, changed=False):
+    """Combine verified step_map provenance with the audit receipt's compiled-Expr step_audit."""
+    step_audit = (audit or {}).get("step_audit")
+    if step_map is None and not step_audit:
+        return None
+
+    if step_audit is not None:
+        if step_audit.get("verified") is not True:
+            raise ValueError(f"{cid}: audit receipt contains an unverified step_audit record")
+        if step_map is None:
+            raw_steps = step_audit.get("steps") or []
+            if not raw_steps or any(s.get("origin") != "supplied" for s in raw_steps):
+                raise ValueError(
+                    f"{cid}: audit receipt has step_audit, but no step_map is configured on work[{cid}] "
+                    "or reader.json to verify verbatim TeX provenance of paper steps"
+                )
+            is_verified = bool(proof_checked and not changed)
+            steps = [
+                dict(
+                    id=s["id"],
+                    lemma=s["lemma"],
+                    step_deps=list(s.get("declared_deps") or []),
+                    used_deps=list(s.get("used_deps") or []),
+                    used_statements=list(s.get("used_statements") or []),
+                    origin="supplied",
+                    tex_verified=False,
+                    module=s.get("module"),
+                    file=s.get("file"),
+                    lines=s.get("lines"),
+                    axioms=list(s.get("axioms") or []),
+                    theorem_info=bool(s.get("theorem_info", True)),
+                )
+                for s in raw_steps
+            ]
+            return dict(
+                verified=is_verified,
+                badge=STEP_VERIFIED_SUPPLIED_BADGE if is_verified else None,
+                mode="with_supplied" if is_verified else None,
+                step_count=len(steps),
+                paper_steps=0,
+                supplied_steps=len(steps),
+                declaration=step_audit.get("declaration"),
+                main_declaration=step_audit.get("main_declaration"),
+                main_steps=list(step_audit.get("main_steps") or []),
+                main_statements=list(step_audit.get("main_statements") or []),
+                step_map_sha256=step_audit.get("step_map_sha256"),
+                steps=steps,
+            )
+
+        if step_audit.get("step_map_sha256") != step_map["step_map_sha256"]:
+            raise ValueError(
+                f"{cid}: step_map changed since the recorded Lean step audit; rerun audit_lean.py --step-map"
+            )
+        audit_by_id = {s["id"]: s for s in (step_audit.get("steps") or [])}
+        merged_steps = []
+        for s in step_map["steps"]:
+            aud = audit_by_id.get(s["id"], {})
+            merged = dict(s)
+            merged["used_deps"] = list(aud.get("used_deps") or [])
+            merged["used_statements"] = list(aud.get("used_statements") or [])
+            merged["axioms"] = list(aud.get("axioms") or [])
+            merged["theorem_info"] = bool(aud.get("theorem_info", False))
+            if aud.get("module"):
+                merged["module"] = aud["module"]
+            if aud.get("file"):
+                merged["file"] = aud["file"]
+            if aud.get("lines"):
+                merged["lines"] = aud["lines"]
+            merged_steps.append(merged)
+
+        is_verified = bool(proof_checked and not changed)
+        supplied_count = step_map["supplied_step_count"]
+        mode = ("with_supplied" if supplied_count > 0 else "paper") if is_verified else None
+        badge = ((STEP_VERIFIED_SUPPLIED_BADGE if supplied_count > 0 else STEP_VERIFIED_PAPER_BADGE)
+                 if is_verified else None)
+        return dict(
+            verified=is_verified,
+            badge=badge,
+            mode=mode,
+            step_count=len(merged_steps),
+            paper_steps=step_map["paper_step_count"],
+            supplied_steps=supplied_count,
+            declaration=step_audit.get("declaration"),
+            main_declaration=step_audit.get("main_declaration"),
+            main_steps=list(step_audit.get("main_steps") or []),
+            main_statements=list(step_audit.get("main_statements") or []),
+            step_map_sha256=step_map["step_map_sha256"],
+            steps=merged_steps,
+        )
+
+    return dict(
+        verified=False,
+        badge=None,
+        mode=None,
+        step_count=len(step_map["steps"]),
+        paper_steps=step_map["paper_step_count"],
+        supplied_steps=step_map["supplied_step_count"],
+        main_declaration=step_map["main_declaration"],
+        step_map_sha256=step_map["step_map_sha256"],
+        steps=list(step_map["steps"]),
+    )
+
+
 def ground_claim_dependencies(claims, records, paper_edges):
     """Cross-reference kernel-extracted Lean constant closures against reader.json dependencies.
 
@@ -617,9 +841,14 @@ def ground_claim_dependencies(claims, records, paper_edges):
     return grounded_edges, per_claim, counts
 
 
+def _has_supplied_steps(rec):
+    sv = rec.get("step_verification")
+    return bool(sv and sv.get("supplied_steps", 0) > 0)
+
+
 def render_supplement_markdown(project, records):
-    """Generate dist/supplement.md for claims whose proofs were supplied outside the manuscript."""
-    supplied = [rec for rec in records if rec.get("basis") == "supplied"]
+    """Generate dist/supplement.md for claims with basis='supplied' or Lean-supplied proof steps."""
+    supplied = [rec for rec in records if rec.get("basis") == "supplied" or _has_supplied_steps(rec)]
     if not supplied:
         return None
     lines = [
@@ -631,10 +860,10 @@ def render_supplement_markdown(project, records):
         lines.append(f"- **Authors:** {', '.join(project['authors'])}")
     lines.extend([
         "",
-        "> **Two Homes Provenance Note:** The claims collected in this supplement are stated in the manuscript "
-        "without a written proof (for example, unproved remarks, skipped steps, or omitted derivations). "
-        "Their proofs were supplied and checked in Lean outside the manuscript PDF so readers never mistake "
-        "a Lean-supplied argument for text present in the paper.",
+        "> **Two Homes Provenance Note:** The claims and intermediate steps collected in this supplement are stated in "
+        "the manuscript without a complete written proof (for example, unproved remarks, skipped steps, or Lean-supplied "
+        "intermediate steps in a step-verified proof). Their proofs were supplied and checked in Lean outside the "
+        "manuscript PDF so readers never mistake a Lean-supplied argument for text present in the paper.",
         "",
         "## Summary of Supplied Proofs",
         "",
@@ -658,17 +887,37 @@ def render_supplement_markdown(project, records):
         ax = rec["rd"].get("axiom_profile") or "—"
         sha = ((rec.get("audit") or {}).get("statement") or {}).get("sha256")
         sha_cell = f"`{sha[:12]}`" if sha else "—"
-        lines.append(f"| {ref} | {rec['tier']} | {res_labels[rec['resolution']]} | {decl_cell} | {ax} | {sha_cell} |")
+        sv = rec.get("step_verification")
+        if rec.get("basis") == "supplied":
+            status_cell = res_labels[rec["resolution"]]
+            if sv and sv.get("verified") and sv.get("badge"):
+                status_cell += f" · {sv['badge']}"
+        elif sv and sv.get("verified") and sv.get("badge"):
+            status_cell = f"{sv['badge']} ({sv['supplied_steps']}/{sv['step_count']} supplied steps)"
+        else:
+            count = (sv or {}).get("supplied_steps", 0)
+            status_cell = f"Supplied proof steps ({count})"
+        lines.append(f"| {ref} | {rec['tier']} | {status_cell} | {decl_cell} | {ax} | {sha_cell} |")
 
     for rec in supplied:
         c = rec["claim"]
         cid = c["id"]
         entry = rec["entry"]
         audit = rec.get("audit") or {}
+        sv = rec.get("step_verification")
+        is_full_supplied = rec.get("basis") == "supplied"
         anchor = supplement_anchor(cid)
         heading_text = (f"{entry['reference']} — {c['title']} (`{cid}`)"
                         if c.get("title") and c["title"] != cid
                         else f"{entry['reference']} (`{cid}`)")
+        if is_full_supplied:
+            badge_line = res_labels[rec["resolution"]]
+            if sv and sv.get("verified") and sv.get("badge"):
+                badge_line += f" · {sv['badge']}"
+        elif sv and sv.get("verified") and sv.get("badge"):
+            badge_line = sv["badge"]
+        else:
+            badge_line = "Supplied proof steps (awaiting Lean step audit)"
         lines.extend([
             "",
             f'<a id="{anchor}"></a>',
@@ -676,9 +925,17 @@ def render_supplement_markdown(project, records):
             "",
             f"- **Manuscript source:** `{c['file']}`, line {c['line']}"
             + (f" (PDF page {entry['page']})" if entry.get("page") else ""),
-            f"- **Verification badge:** {res_labels[rec['resolution']]}",
-            f"- **Proof basis:** `supplied` ({BASIS_LABELS['supplied']})",
+            f"- **Verification badge:** {badge_line}",
         ])
+        if is_full_supplied:
+            lines.append(f"- **Proof basis:** `supplied` ({BASIS_LABELS['supplied']})")
+        elif rec.get("basis"):
+            lines.append(f"- **Proof basis:** `{rec['basis']}` ({BASIS_LABELS.get(rec['basis'], rec['basis'])})")
+        if sv and sv.get("supplied_steps"):
+            lines.append(
+                f"- **Structured step provenance:** {sv['paper_steps']} verbatim paper step(s), "
+                f"{sv['supplied_steps']} supplied step(s)"
+            )
         decl = audit.get("declaration") or (rec["work"].get("closure") or {}).get("declaration")
         exp = audit.get("expected") or (rec["work"].get("closure") or {}).get("expected")
         if decl:
@@ -706,28 +963,40 @@ def render_supplement_markdown(project, records):
             c["excerpt"].rstrip("\n"),
             "```",
             "",
-            "### Supplied Proof",
-            "",
         ])
-        has_written = False
-        if entry.get("summary"):
-            lines.append(f"**Summary:** {entry['summary']}")
-            lines.append("")
-            has_written = True
-        if entry.get("sketch"):
-            lines.append(f"**Proof idea:** {entry['sketch']}")
-            lines.append("")
-            has_written = True
-        if entry.get("steps"):
-            lines.append(entry["steps"].rstrip("\n"))
-            lines.append("")
-            has_written = True
-        elif entry.get("structured"):
-            lines.append(entry["structured"].rstrip("\n"))
-            lines.append("")
-            has_written = True
-        if not has_written:
-            lines.append("_No prose or Lamport proof steps have been written yet; inspect the checked Lean proof declaration in the atlas._")
+        if is_full_supplied:
+            lines.extend(["### Supplied Proof", ""])
+            has_written = False
+            if entry.get("summary"):
+                lines.append(f"**Summary:** {entry['summary']}")
+                lines.append("")
+                has_written = True
+            if entry.get("sketch"):
+                lines.append(f"**Proof idea:** {entry['sketch']}")
+                lines.append("")
+                has_written = True
+            if entry.get("steps"):
+                lines.append(entry["steps"].rstrip("\n"))
+                lines.append("")
+                has_written = True
+            elif entry.get("structured"):
+                lines.append(entry["structured"].rstrip("\n"))
+                lines.append("")
+                has_written = True
+            if not has_written and not (sv and sv.get("supplied_steps")):
+                lines.append("_No prose or Lamport proof steps have been written yet; inspect the checked Lean proof declaration in the atlas._")
+                lines.append("")
+        if sv and sv.get("supplied_steps"):
+            lines.extend(["### Supplied Proof Steps (Outside Manuscript)", ""])
+            for step in sv["steps"]:
+                if step.get("origin") != "supplied":
+                    continue
+                heading = f"**Step `{step['id']}`**" + (f" — {step['title']}" if step.get("title") else "")
+                deps = ", ".join(f"`{d}`" for d in step.get("step_deps") or []) or "none"
+                loc = f" (`{step['file']}` L{step['lines'][0]})" if step.get("file") and step.get("lines") else ""
+                lines.append(f"- {heading} · Lean lemma `{step['lemma']}`{loc} · `step_deps`: {deps}")
+                if step.get("text"):
+                    lines.append(f"  {step['text'].strip()}")
             lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
@@ -745,6 +1014,8 @@ def _empty_bucket():
         machine_verified=0,
         author_reviewed=0,
         supplied_proof=0,
+        step_verified_paper=0,
+        step_verified_with_supplied=0,
     )
 
 
@@ -766,6 +1037,8 @@ def summarize_records(records):
         machine_ok = bool(rec["machine_verified"])
         approved = bool(rd.get("approved"))
         supplied = bool(res == "unconditionally_closed" and rec["entry"].get("basis") == "supplied")
+        sv = rec.get("step_verification")
+        step_mode = sv.get("mode") if (sv and sv.get("verified")) else None
         targets = (buckets["conjectures"],) if tier == "conjecture" else (buckets[tier], buckets["all_results"])
         for b in targets:
             b["total"] += 1
@@ -782,6 +1055,10 @@ def summarize_records(records):
                 b["author_reviewed"] += 1
             if supplied:
                 b["supplied_proof"] += 1
+            if step_mode == "paper":
+                b["step_verified_paper"] += 1
+            elif step_mode == "with_supplied":
+                b["step_verified_with_supplied"] += 1
     return buckets
 
 
@@ -1045,6 +1322,7 @@ def _collect_claim_states(root, project, claims, *, ci=None):
     edges = materials.get("dependencies", [])
     comparisons = reviews.read(root / "comparisons.json", {})
     profile = proof_work_profile(project)
+    tex_sources = load_bound_tex_sources(root, project)
 
     prereqs_by_cid = {c["id"]: set() for c in claims}
     for edge in edges:
@@ -1108,7 +1386,17 @@ def _collect_claim_states(root, project, claims, *, ci=None):
             entry["distilled"] = distilled
         if undistilled:
             entry["undistilled"] = True
-        supp_url = f"supplement.md#{supplement_anchor(cid)}" if basis == "supplied" else ""
+        default_main = ((w.get("assembly") or {}).get("declaration")
+                        or (w.get("closure") or {}).get("declaration")
+                        or (audit or {}).get("declaration"))
+        step_map = resolve_claim_step_map(root, cid, w, m, tex_sources, default_main=default_main)
+        step_verif = evaluate_step_verification(
+            cid, step_map, audit, proof_checked=(checked or is_conditional), changed=changed,
+        )
+        if step_verif is not None:
+            entry["step_verification"] = step_verif
+        has_supp_entry = basis == "supplied" or bool(step_verif and step_verif.get("supplied_steps", 0) > 0)
+        supp_url = f"supplement.md#{supplement_anchor(cid)}" if has_supp_entry else ""
         subproofs = []
         for part in w.get("subproofs", []):
             state = part["status"]
@@ -1124,7 +1412,7 @@ def _collect_claim_states(root, project, claims, *, ci=None):
             conditional=is_conditional,
             assumes=[item["reference"] for item in assumed_items] if is_conditional else (),
             basis=basis, proof_metrics=metrics, distilled=distilled, undistilled=undistilled,
-            supplement_url=supp_url,
+            supplement_url=supp_url, step_verification=step_verif,
         )
         rd["witness"] = reviews.witness_source(root, w, audit) if audit else None
         machine_verified = False
@@ -1144,6 +1432,7 @@ def _collect_claim_states(root, project, claims, *, ci=None):
             basis=basis,
             proof_metrics=metrics,
             distilled=distilled,
+            step_verification=step_verif,
             resolution=res,
             checked=checked,
             is_conditional=is_conditional,
@@ -1468,6 +1757,22 @@ def _render_manifest_latex(project, summary, caveats, backlog, pinned):
             f"For {total_supplied} claim{'s' if total_supplied != 1 else ''} stated without a complete manuscript proof, "
             "Lean supplies the derivation outside the PDF (collected in \\texttt{supplement.md})."
         )
+    sv_paper = a["step_verified_paper"] + conj["step_verified_paper"]
+    sv_supp = a["step_verified_with_supplied"] + conj["step_verified_with_supplied"]
+    if sv_paper or sv_supp:
+        sv_total = sv_paper + sv_supp
+        parts = []
+        if sv_paper:
+            parts.append(f"{sv_paper} matching verbatim manuscript steps (\\texttt{{{_latex_escape(STEP_VERIFIED_PAPER_BADGE)}}})")
+        if sv_supp:
+            parts.append(
+                f"{sv_supp} with Lean-supplied intermediate steps collected in \\texttt{{supplement.md}} "
+                f"(\\texttt{{{_latex_escape(STEP_VERIFIED_SUPPLIED_BADGE)}}})"
+            )
+        sentences.append(
+            f"At the proof-body level, {sv_total} claim{'s are' if sv_total != 1 else ' is'} 1:1 step-verified via "
+            "compiled \\texttt{Expr} auditing (" + "; ".join(parts) + ")."
+        )
 
     # Verification tier (CI vs local-only).
     if a["machine_verified"]:
@@ -1749,13 +2054,17 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
         )
 
     supplied_recs = [rec for rec in records if rec.get("basis") == "supplied"]
-    if supplied_recs:
+    supplied_step_recs = [
+        rec for rec in records
+        if rec.get("basis") != "supplied" and _has_supplied_steps(rec)
+    ]
+    if supplied_recs or supplied_step_recs:
         lines.extend([
             "",
             "## Supplied Proofs (Outside Manuscript)",
             "",
-            "The following claims are stated in the manuscript without a written proof (or with skipped steps); "
-            "their Lean-checked proofs are supplied outside the manuscript PDF"
+            "The following claims are stated in the manuscript without a complete written proof (or include "
+            "Lean-supplied intermediate steps); their Lean-checked derivations are supplied outside the manuscript PDF"
             + (" and collected in [`supplement.md`](supplement.md)." if has_supplement else "."),
             "",
         ])
@@ -1768,6 +2077,35 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
                     or (rec["work"].get("closure") or {}).get("declaration") or "")
             decl_bit = f" — `{decl}`" if decl else ""
             lines.append(f"- {ref} ({rec['tier']}) — {badge}{decl_bit}")
+        for rec in supplied_step_recs:
+            cid = rec["claim"]["id"]
+            ref = f"**{rec['entry']['reference']}** (`{cid}`)"
+            sv = rec["step_verification"]
+            badge = sv["badge"] if sv.get("verified") else "Supplied proof steps (awaiting Lean step audit)"
+            lines.append(
+                f"- {ref} ({rec['tier']}) — {badge} ({sv['supplied_steps']}/{sv['step_count']} step(s) supplied outside manuscript)"
+            )
+
+    step_verified_recs = [
+        rec for rec in records
+        if (rec.get("step_verification") or {}).get("verified")
+    ]
+    if step_verified_recs:
+        lines.extend([
+            "",
+            "## Step-Level Verification (1:1 Expr Audit)",
+            "",
+            "| Claim | Badge | Steps (Paper / Supplied) | Main declaration | Step Map SHA-256 |",
+            "| :--- | :--- | :---: | :--- | :--- |",
+        ])
+        for rec in step_verified_recs:
+            cid = rec["claim"]["id"]
+            ref = f"{rec['entry']['reference']} (`{cid}`)"
+            sv = rec["step_verification"]
+            counts_cell = f"{sv['step_count']} ({sv['paper_steps']} paper / {sv['supplied_steps']} supplied)"
+            main_cell = f"`{sv['main_declaration']}`" if sv.get("main_declaration") else "—"
+            sha_cell = f"`{sv['step_map_sha256'][:12]}`" if sv.get("step_map_sha256") else "—"
+            lines.append(f"| {ref} | {sv['badge']} | {counts_cell} | {main_cell} | {sha_cell} |")
 
     metrics_recs = [rec for rec in records if rec.get("proof_metrics") or rec.get("distilled") is not None]
     if metrics_recs:
@@ -2038,6 +2376,9 @@ def assemble(root, *, package=None, run_audit=False):
     by_id = {c["id"]: c for c in claims}
     order = p.get("claim_order") or [c["id"] for c in claims]
     work = p.get("work", {})
+    materials = json.loads(local(root, p["reader"]).read_text(encoding="utf-8-sig")) if p.get("reader") else {}
+    notes = materials.get("claims", {})
+    tex_sources = load_bound_tex_sources(root, p)
 
     expected_by_cid = {}
     stmt_modules_by_cid = {}
@@ -2250,6 +2591,23 @@ def assemble(root, *, package=None, run_audit=False):
             for item in claim_reports:
                 cid = item["claim"]
                 spec = specs[cid]
+                resolved_sm = resolve_claim_step_map(
+                    root, cid, work.get(cid, {}), notes.get(cid, {}), tex_sources,
+                    default_main=spec["declaration"],
+                )
+                step_map_arg = None
+                if resolved_sm is not None:
+                    other_decls = collect_other_claim_declarations(p, cid)
+                    merged_forbidden = list(dict.fromkeys([*resolved_sm["forbidden_mains"], *other_decls]))
+                    step_map_arg = dict(
+                        main_declaration=resolved_sm["main_declaration"] or spec["declaration"],
+                        main_deps=resolved_sm["main_deps"],
+                        forbidden_mains=merged_forbidden,
+                        steps=[
+                            {k: v for k, v in s.items() if k in ("id", "lemma", "step_deps", "origin")}
+                            for s in resolved_sm["steps"]
+                        ],
+                    )
                 audit_data = audit_lean.audit(SimpleNamespace(
                     package=pkg_root,
                     contract=contract_rel,
@@ -2260,6 +2618,7 @@ def assemble(root, *, package=None, run_audit=False):
                     routine=spec["routine"],
                     assumes=item["assumes_expected"],
                     witness=spec["witness"],
+                    step_map=step_map_arg,
                     statement_only=False,
                 ))
                 ev_rel = f"evidence/assembly-{ident_by_cid[cid]}.json"
@@ -2575,6 +2934,7 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
     closed_results = 0
     conditional_results = 0
     profile = proof_work_profile(p)
+    tex_sources = load_bound_tex_sources(root, p)
     prereqs_by_cid = {c["id"]: set() for c in claims}
     for edge in edges:
         prereqs_by_cid[edge["claim"]].add(edge["prerequisite"])
@@ -2658,13 +3018,24 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
             entry["distilled"] = distilled
         if undistilled:
             entry["undistilled"] = True
-        supp_url = f"supplement.md#{supplement_anchor(cid)}" if basis == "supplied" else ""
+        default_main = ((w.get("assembly") or {}).get("declaration")
+                        or (w.get("closure") or {}).get("declaration")
+                        or (active_audit or {}).get("declaration"))
+        step_map = resolve_claim_step_map(root, cid, w, m, tex_sources, default_main=default_main)
+        step_verif = evaluate_step_verification(
+            cid, step_map, active_audit, proof_checked=(checked or is_conditional), changed=bool(changed),
+        )
+        if step_verif is not None:
+            entry["step_verification"] = step_verif
+        has_supp_entry = basis == "supplied" or bool(step_verif and step_verif.get("supplied_steps", 0) > 0)
+        supp_url = f"supplement.md#{supplement_anchor(cid)}" if has_supp_entry else ""
         rd = reviews.packet(root,p,c,w,active_audit,comparisons.get(cid),reviews.history(root,cid),
                             checked,statement_checked,
                             conditional=is_conditional,
                             assumes=[item["reference"] for item in assumed_items] if is_conditional else (),
                             basis=basis, proof_metrics=metrics, distilled=distilled,
-                            undistilled=undistilled, supplement_url=supp_url)
+                            undistilled=undistilled, supplement_url=supp_url,
+                            step_verification=step_verif)
         rd["page"] = entry.get("page")
         rd["sources"] = reviews.exact_sources(root,w,active_audit) if active_audit else []
         rd["witness"] = reviews.witness_source(root,w,active_audit) if active_audit else None
@@ -2727,6 +3098,14 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         if basis == "supplied":
             verification["supplied"] = True
             verification["supplement_url"] = supp_url
+        if step_verif and step_verif.get("verified"):
+            verification["step_verified"] = True
+            verification["step_badge"] = step_verif["badge"]
+            verification["step_mode"] = step_verif["mode"]
+            verification["step_count"] = step_verif["step_count"]
+            verification["supplied_step_count"] = step_verif["supplied_steps"]
+            if step_verif["supplied_steps"] > 0 and supp_url:
+                verification.setdefault("supplement_url", supp_url)
         if is_conditional:
             verification["conditional"] = True
             verification["assumes"] = assumed_items
@@ -2771,7 +3150,7 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         built_records.append(dict(
             claim=c, entry=entry, work=w, note=m, rd=rd, audit=active_audit,
             tier=tier, basis=basis, proof_metrics=metrics, distilled=distilled,
-            supplement_url=supp_url,
+            supplement_url=supp_url, step_verification=step_verif,
             resolution=res, checked=checked, is_conditional=is_conditional,
             has_parts=has_parts, changed=bool(changed), assumed_items=assumed_items,
             unresolved_defaults=unres_defaults, deferred_bridging_lemmas=bridging,
@@ -2832,6 +3211,10 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         badge = f' · <a href="{url}?view=lean">{esc(label)}</a>'
         if rec["basis"] == "supplied" and rec["supplement_url"]:
             badge += f' · <a href="{esc(rec["supplement_url"])}">Supplied proof</a>'
+        if verification.get("step_verified") and verification.get("step_badge"):
+            badge += f' · <a class="verified-badge" href="{url}?view=lamport">&#10003; {esc(verification["step_badge"])}</a>'
+            if verification.get("supplied_step_count") and rec["supplement_url"] and rec["basis"] != "supplied":
+                badge += f' · <a href="{esc(rec["supplement_url"])}">Supplied steps</a>'
         if (checked or is_conditional) and not entry.get("hypotheses"):
             badge += f' · {NO_EXAMPLE}'
         if rec["unresolved_defaults"]:
@@ -2946,6 +3329,8 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         extras = []
         if v.get("evidence") and v.get("supplied"):
             extras.append(f'<a class="status" href="{esc(v.get("supplement_url", "supplement.md"))}">Proof supplied outside manuscript</a>')
+        if v.get("step_verified") and v.get("step_badge"):
+            extras.append(f'<a class="verified-badge" href="{link}?view=lamport">✓ {esc(v["step_badge"])}</a>')
         if v.get("needs_author_confirmation"):
             extras.append(f'<a class="status" href="{esc(v["review_url"])}">Needs author confirmation</a>')
         elif v.get("needs_author_confirmation_via"):

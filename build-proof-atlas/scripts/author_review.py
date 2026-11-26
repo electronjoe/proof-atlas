@@ -79,7 +79,7 @@ def history(root, cid):
 
 def packet(root, project, claim, work, audit, comparison, events, checked, statement_checked=False,
            *, conditional=False, assumes=(), basis=None, proof_metrics=None,
-           distilled=None, undistilled=False, supplement_url=""):
+           distilled=None, undistilled=False, supplement_url="", step_verification=None):
     from atlas import statement_defaults
     from audit_lean import axiom_profile as format_axiom_profile
     has_audit = bool(checked or conditional or statement_checked)
@@ -174,6 +174,7 @@ def packet(root, project, claim, work, audit, comparison, events, checked, state
                 basis=basis, proof_metrics=proof_metrics,
                 distilled=distilled, undistilled=bool(undistilled),
                 supplement_url=supplement_url,
+                step_verification=step_verification,
                 approved=approved, preapproved=preapproved, disputed=disputed,
                 needs_author_confirmation=needs_author_confirmation,
                 needs_author_confirmation_via=[],
@@ -232,8 +233,9 @@ def witness_source(root, work, audit):
 
 def get_packet(root, cid):
     from atlas import (
-        _is_undistilled, claim_basis, current_statement_audit, extract_proof_metrics,
-        local, manuscript_claims, proof_work_profile, read_source, supplement_anchor,
+        _is_undistilled, claim_basis, current_statement_audit, evaluate_step_verification,
+        extract_proof_metrics, load_bound_tex_sources, local, manuscript_claims,
+        proof_work_profile, read_source, resolve_claim_step_map, supplement_anchor,
     )
     project = read(root/"project.json", {})
     read_source(root,project["pdf"])
@@ -263,10 +265,20 @@ def get_packet(root, cid):
     undistilled = _is_undistilled(cid, work, profile, checked, conditional)
     distilled = work.get("distilled") if isinstance(work.get("distilled"), bool) else None
     metrics = extract_proof_metrics(audit)
-    supp_url = f"supplement.md#{supplement_anchor(cid)}" if basis == "supplied" else ""
+    tex_sources = load_bound_tex_sources(root, project)
+    default_main = ((work.get("assembly") or {}).get("declaration")
+                    or (work.get("closure") or {}).get("declaration")
+                    or (audit or {}).get("declaration"))
+    step_map = resolve_claim_step_map(root, cid, work, note, tex_sources, default_main=default_main)
+    step_verif = evaluate_step_verification(
+        cid, step_map, audit, proof_checked=(checked or conditional), changed=False,
+    )
+    has_supp_entry = basis == "supplied" or bool(step_verif and step_verif.get("supplied_steps", 0) > 0)
+    supp_url = f"supplement.md#{supplement_anchor(cid)}" if has_supp_entry else ""
     data = packet(root,project,claim,work,audit,comp,history(root,cid),checked,statement_checked,
                   conditional=conditional,assumes=assumes,basis=basis,proof_metrics=metrics,
-                  distilled=distilled,undistilled=undistilled,supplement_url=supp_url)
+                  distilled=distilled,undistilled=undistilled,supplement_url=supp_url,
+                  step_verification=step_verif)
     data["page"] = work.get("page") or note.get("page")
     data["sources"] = exact_sources(root,work,audit)
     data["witness"] = witness_source(root,work,audit)

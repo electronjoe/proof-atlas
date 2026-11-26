@@ -63,6 +63,7 @@ function fillList(selected) {
       a.append(el("small","✓ "+(c.verification.remote || "Machine verified on GitHub"),"verified-badge"));
       if(c.verification.supplied) a.append(el("small","Proof supplied outside manuscript"));
     } else a.append(el("small", [c.verification.label, c.verification.remote].filter(Boolean).join(" · ")));
+    if(c.verification.step_verified && c.verification.step_badge) a.append(el("small","✓ "+c.verification.step_badge,"verified-badge"));
     if(c.verification.needs_author_confirmation || c.verification.needs_author_confirmation_via?.length) a.append(el("small","Needs author confirmation"));
     if(c.verification.approval) a.append(el("small",c.verification.approval,c.verification.approved?"approval approved":"approval"));
     if(c.id===selected) a.setAttribute("aria-current","page");
@@ -113,6 +114,12 @@ function proofView(c,view) {
     marks.append(el("span","✓ "+v.label,"status"),link(v.approval,v.review_url,"approval approved"));
     pane.append(marks);
   }
+  if(v.step_verified && v.step_badge){
+    const stepBar=el("div",null,"lean-checks");
+    stepBar.append(link("✓ "+v.step_badge,route(c.id,"lamport"),"verified-badge"));
+    if(v.supplied_step_count > 0 && v.supplement_url) stepBar.append(link("Supplied steps in supplement.md",v.supplement_url));
+    pane.append(stepBar);
+  }
   if(v.evidence){
     const proof=el("div",null,"lean-checks");
     proof.append(link("✓ "+v.remote,v.url,"verified-badge"));
@@ -132,7 +139,14 @@ function proofView(c,view) {
   }
   pane.append(tabs);
   // Only the Lean view is tied to the checked proof; the readable views are written separately.
-  if(view==="english" || view==="lamport") pane.append(el("p","Explanation, not machine-checked. The Lean view shows what Lean checked.","unchecked-note"));
+  if(view==="english") pane.append(el("p","Explanation, not machine-checked. The Lean view shows what Lean checked.","unchecked-note"));
+  else if(view==="lamport"){
+    if(c.step_verification?.verified){
+      pane.append(el("p","1:1 step dependency graph and Lean lemma bindings are kernel-checked ("+c.step_verification.badge+"); step prose remains an explanation.","unchecked-note"));
+    } else {
+      pane.append(el("p","Explanation, not machine-checked. The Lean view shows what Lean checked.","unchecked-note"));
+    }
+  }
   if(view==="english") {
     pane.append(el("h3","What the claim says"),rich(c.summary || "An English summary is pending. The manuscript view contains the source statement."));
     pane.append(el("h3",c.kind==="conjecture"?"Open question":"High-level proof sketch"),rich(c.sketch || (c.kind==="conjecture"?"The manuscript presents this as a conjecture.":"A proof sketch has yet to be recorded.")));
@@ -159,6 +173,45 @@ function proofView(c,view) {
       if(c.basis==="supplied") bLine.append(link("Read in supplement.md", v.supplement_url || "supplement.md"));
       pane.append(bLine);
     }
+    if(c.step_verification?.steps?.length){
+      const sv=c.step_verification;
+      const statusLine=el("p",null,"muted");
+      if(sv.verified && sv.badge){
+        statusLine.append(el("span","✓ "+sv.badge,"verified-badge"),
+          document.createTextNode(" · "+sv.paper_steps+" verbatim paper / "+sv.supplied_steps+" supplied step(s)"));
+      } else {
+        statusLine.append(document.createTextNode("Draft 1:1 step map (awaiting Lean --step-map audit) · "+sv.paper_steps+" verbatim paper / "+sv.supplied_steps+" supplied step(s)"));
+      }
+      if(sv.supplied_steps > 0 && v.supplement_url){
+        statusLine.append(document.createTextNode(" · "), link("Open supplement.md", v.supplement_url));
+      }
+      pane.append(el("h3","Structured Lamport steps"), statusLine);
+      for(const s of sv.steps){
+        const box=el("div",null,"proof-step");
+        const heading=s.id+(s.title?" · "+s.title:"");
+        box.append(el("strong",heading));
+        const prov=el("p",null,"muted");
+        if(s.origin==="paper"){
+          const loc=s.tex_file?(s.tex_file+(s.tex_line?" L"+s.tex_line:"")):"";
+          prov.append(document.createTextNode("Origin: Paper (verbatim TeX verified"+(loc?", "+loc:"")+")"));
+        } else {
+          prov.append(document.createTextNode("Origin: Supplied outside manuscript"));
+          if(v.supplement_url) prov.append(document.createTextNode(" · "), link("supplement.md", v.supplement_url));
+        }
+        prov.append(document.createTextNode(" · Lean lemma: "), el("code",s.lemma));
+        if(s.file && s.lines) prov.append(document.createTextNode(" ("+s.file+" L"+s.lines[0]+")"));
+        const deps=(s.used_deps || s.step_deps || []);
+        prov.append(document.createTextNode(" · step_deps: "+(deps.length?deps.join(", "):"none")));
+        box.append(prov);
+        if(s.text) box.append(rich(s.text));
+        if(s.tex){
+          const d=el("details");
+          d.append(el("summary","Verbatim TeX excerpt"), el("pre",s.tex));
+          box.append(d);
+        }
+        pane.append(box);
+      }
+    }
     if(c.steps){
       pane.append(el("p",c.origin || "Structured proof","muted"));
       if(c.source_url && /^https?:\/\//.test(c.source_url)) pane.append(link("Source companion and mapping ledger",c.source_url));
@@ -168,11 +221,12 @@ function proofView(c,view) {
         else pane.append(rich(line));
       }
     }
-    if(c.structured){const note=el("details");note.open=!c.steps;note.append(el("summary","Pilot supplement"),el("pre",c.structured));pane.append(note);}
-    if(!c.steps && !c.structured) pane.append(el("p",c.kind==="conjecture"?"This conjecture has no recorded proof.":"No structured argument has been imported yet."));
+    if(c.structured){const note=el("details");note.open=!c.steps && !c.step_verification?.steps?.length;note.append(el("summary","Pilot supplement"),el("pre",c.structured));pane.append(note);}
+    if(!c.steps && !c.structured && !c.step_verification?.steps?.length) pane.append(el("p",c.kind==="conjecture"?"This conjecture has no recorded proof.":"No structured argument has been imported yet."));
   } else {
     const checks=el("div",null,"lean-checks");
     checks.append(el("strong",c.verification.label));
+    if(v.step_verified && v.step_badge) checks.append(el("span","✓ "+v.step_badge,"verified-badge"));
     if(c.axiom_profile) checks.append(el("span",c.axiom_profile,"muted"));
     if(v.approval) checks.append(el("strong",v.approval));
     if(c.audit_log) checks.append(link("Declaration and axiom audit",c.audit_log));
@@ -242,6 +296,26 @@ function proofView(c,view) {
       if(m.reachable_local_defs!==undefined) bits.push(m.reachable_local_defs+" reachable local defs");
       if(m.reachable_local_theorems!==undefined) bits.push(m.reachable_local_theorems+" reachable local theorems");
       if(bits.length) pane.append(el("p","Proof size: "+bits.join(" · "),"muted"));
+    }
+    if(c.step_verification?.verified){
+      const sv=c.step_verification;
+      pane.append(el("h3","1:1 Step-Lemma Expr Audit"));
+      const summaryLine=el("p",sv.badge+" · "+sv.step_count+" step(s) ("+sv.paper_steps+" paper, "+sv.supplied_steps+" supplied) · main: ","muted");
+      summaryLine.append(el("code",sv.main_declaration || ""));
+      if(sv.main_steps?.length) summaryLine.append(document.createTextNode(" (uses "+sv.main_steps.join(", ")+")"));
+      if(sv.step_map_sha256) summaryLine.append(document.createTextNode(" · sha256: "), el("code",sv.step_map_sha256.slice(0,12)));
+      pane.append(summaryLine);
+      const list=el("ul");
+      for(const s of sv.steps){
+        const item=el("li");
+        item.append(el("strong",s.id), document.createTextNode(" ["+s.origin+"] · "), el("code",s.lemma));
+        if(s.file && s.lines) item.append(document.createTextNode(" ("+s.file+" L"+s.lines[0]+")"));
+        const deps=s.used_deps || s.step_deps || [];
+        item.append(document.createTextNode(" · step_deps: "+(deps.length?deps.join(", "):"none")));
+        if(s.used_statements?.length) item.append(document.createTextNode(" · statements: "), el("code",s.used_statements.join(", ")));
+        list.append(item);
+      }
+      pane.append(list);
     }
     if(c.lean_dependencies){
       const ld=c.lean_dependencies;
