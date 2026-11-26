@@ -284,9 +284,10 @@ flowchart LR
 ## 7. Pilot Validation Record (November 26, 2026)
 
 ### 7.1 Full Lean 4 Integration Suite (`ELAN_TOOLCHAIN=leanprover/lean4:v4.33.1`)
-- Provisioned pinned `leanprover/lean4:v4.33.1` via `elan` and ran the entire `build-proof-atlas/tests` suite with all 10 `AuditClosure` Lean integration tests enabled (**43/43 tests passed, 0 skipped**).
+- Provisioned pinned `leanprover/lean4:v4.33.1` via `elan` and ran the entire `build-proof-atlas/tests` suite with all 10 `AuditClosure` Lean integration tests enabled (**43/43 tests passed, 0 skipped** at the pre-Phase 5/6/3b pilot checkpoint).
 - All Lean 4.33.1 metaprogramming queries (`STATEMENT_QUERY`, `HYPOTHESES_QUERY`, `DECL_KIND_QUERY`, `PROOF_CLOSURE_QUERY`, `check_statements`, `check_routine`, and `scan_lean_hygiene`) elaborated and executed cleanly.
 - Fixed a test fixture in `test_conditional_assumes_routine_prelude_and_thminfo` (`main_assume_true (_h : True) : ThmB`) so that contract type-checking passes and `check_statements`'s rejection of external `--assumes` propositions (`True` in `Init.Prelude`) is directly exercised.
+- **Final pre-PR verification (after Phases 5, 6, and 3b):** Re-ran the complete `build-proof-atlas/tests` suite under `ELAN_TOOLCHAIN=leanprover/lean4:v4.33.1`, including the live-Lean Phase 5 (`verify_ci.py` parity + `Challenge.lean`/`Solution.lean` + paranoid flow), Phase 6 (`audit_batch`), and Phase 3b (compiled-`Expr` `auditUses` `step_map` verification) integration tests: **59/59 tests passed, 0 skipped**.
 
 ### 7.2 Live-Lean End-to-End Dogfooding & Legacy Compatibility
 1. **Compact Multi-Claim Live-Lean Pilot (`quick` $\rightarrow$ `thorough`):**

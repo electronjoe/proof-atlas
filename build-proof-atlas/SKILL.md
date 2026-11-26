@@ -2,7 +2,7 @@
 name: build-proof-atlas
 description: Build or resume a source-linked proof atlas from a theory paper, open a four-view Proof Atlas explorer and a live progress dashboard, and expose the distinction between paper claims, proof attempts and checked results.
 metadata:
-  version: "0.10.0"
+  version: "0.11.0"
 ---
 
 # Build a Proof Atlas
