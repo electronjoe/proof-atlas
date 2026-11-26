@@ -60,7 +60,7 @@ function fillList(selected) {
     const a=link("",route(c.id),"claim-choice");
     a.append(el("small",c.reference+" · "+tLabel),el("span",c.title));
     if(c.verification.evidence) {
-      a.append(el("small","✓ Machine verified on GitHub","verified-badge"));
+      a.append(el("small","✓ "+(c.verification.remote || "Machine verified on GitHub"),"verified-badge"));
       if(c.verification.supplied) a.append(el("small","Proof supplied outside manuscript"));
     } else a.append(el("small", [c.verification.label, c.verification.remote].filter(Boolean).join(" · ")));
     if(c.verification.needs_author_confirmation || c.verification.needs_author_confirmation_via?.length) a.append(el("small","Needs author confirmation"));
@@ -116,6 +116,7 @@ function proofView(c,view) {
   if(v.evidence){
     const proof=el("div",null,"lean-checks");
     proof.append(link("✓ "+v.remote,v.url,"verified-badge"));
+    if(v.paranoid && v.kernels_checked?.length) proof.append(el("span","Kernels: "+v.kernels_checked.join(", "),"muted"));
     proof.append(link("Verification record · "+v.commit.slice(0,7),v.evidence));
     if(v.artifact){
       const download=link("GitHub artifact (sign-in required)",v.artifact);

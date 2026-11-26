@@ -19,6 +19,7 @@ NO_EXAMPLE = "No checked example shows the hypotheses can hold"
 HEADLINE_KINDS = frozenset({"theorem", "corollary", "proposition"})
 MANIFEST_EDIT_KEY = "manifest-verification-scope"
 PROOF_BASES = frozenset({"paper", "lean", "aligned", "supplied"})
+LEAN_CI_LEVELS = frozenset({"standard", "paranoid"})
 BASIS_LABELS = {
     "paper": "Follows paper proof",
     "lean": "Lean-only proof route",
@@ -197,6 +198,14 @@ def proof_work_description(project, claims, *, closed_results=None):
     return text
 
 
+def lean_ci_level(project):
+    """Return the configured Lean CI verification level ('standard' default or 'paranoid')."""
+    level = (project.get("hosting") or {}).get("lean_ci_level", "standard")
+    if not isinstance(level, str) or level not in LEAN_CI_LEVELS:
+        raise ValueError("hosting.lean_ci_level must be 'standard' or 'paranoid'")
+    return level
+
+
 def github_verification(project, receipt_path, commit):
     if not receipt_path or project.get("hosting", {}).get("lean_ci") != "enabled":
         return None
@@ -207,7 +216,34 @@ def github_verification(project, receipt_path, commit):
             or repository.casefold() != ("https://github.com/" + data["repository"]).casefold()
             or not all(type(data.get(k)) is int and data[k] > 0 for k in ("run_id", "attempt"))):
         return None
+    if "ci_level" in data and data["ci_level"] not in LEAN_CI_LEVELS:
+        return None
+    if "kernels_checked" in data:
+        kc = data["kernels_checked"]
+        if not isinstance(kc, list) or not all(isinstance(k, str) and k.strip() for k in kc):
+            return None
     return data
+
+
+def _ci_claim_status(audit, receipt_bytes, ci, cid):
+    """Validate a claim's CI receipt entry and return (verified, paranoid_verified, kernels, ci_level)."""
+    if not ci or not audit or receipt_bytes is None:
+        return False, False, [], None
+    record = ci.get("claims", {}).get(cid)
+    if not isinstance(record, dict):
+        return False, False, [], None
+    if not (record.get("audit_sha256") == hashlib.sha256(receipt_bytes).hexdigest()
+            and all(record.get(k) == audit.get(k) for k in ("expected", "declaration", "toolchain"))
+            and (not audit.get("statement") or record.get("statement_sha256") == audit["statement"]["sha256"])
+            and (not audit.get("hypotheses") or record.get("hypotheses") == audit["hypotheses"]["proposition"])
+            and set(record.get("axioms", [])) == set(audit.get("axioms", []))
+            and record.get("theorem_info") is not False
+            and not record.get("assumes")):
+        return False, False, [], None
+    kernels = list(record.get("kernels_checked") or ci.get("kernels_checked") or ["lean-kernel"])
+    level = ci.get("ci_level", "standard")
+    paranoid_verified = (level == "paranoid" and any(k != "lean-kernel" for k in kernels))
+    return True, paranoid_verified, kernels, level
 
 
 def manuscript_claims(root, p):
@@ -1092,14 +1128,8 @@ def _collect_claim_states(root, project, claims, *, ci=None):
         )
         rd["witness"] = reviews.witness_source(root, w, audit) if audit else None
         machine_verified = False
-        if checked and project.get("hosting", {}).get("lean_ci") == "enabled" and ci and receipt_bytes is not None:
-            record = ci.get("claims", {}).get(cid)
-            if (record and record.get("audit_sha256") == hashlib.sha256(receipt_bytes).hexdigest()
-                    and all(record.get(k) == audit.get(k) for k in ("expected", "declaration", "toolchain"))
-                    and (not audit.get("statement") or record.get("statement_sha256") == audit["statement"]["sha256"])
-                    and (not audit.get("hypotheses") or record.get("hypotheses") == audit["hypotheses"]["proposition"])
-                    and set(record.get("axioms", [])) == set(audit.get("axioms", []))):
-                machine_verified = True
+        if checked and project.get("hosting", {}).get("lean_ci") == "enabled":
+            machine_verified, _, _, _ = _ci_claim_status(audit, receipt_bytes, ci, cid)
 
         res = claim_resolution(checked, is_conditional, rd["disputed"], has_parts)
         entry["resolution"] = res
@@ -1286,6 +1316,18 @@ def _collect_pinned_metadata(root, project, records, ci):
     ci_commit = ci["commit"] if ci else ""
     ci_run_url = (f"{repo_url}/actions/runs/{ci['run_id']}/attempts/{ci['attempt']}"
                   if ci and repo_url else "")
+    ci_level = ci.get("ci_level", "standard") if ci else None
+    kernels_checked = []
+    if ci:
+        seen_k = []
+        for k in (ci.get("kernels_checked") or ["lean-kernel"]):
+            if k not in seen_k:
+                seen_k.append(k)
+        for rec_ci in (ci.get("claims") or {}).values():
+            for k in (rec_ci.get("kernels_checked") or []):
+                if k not in seen_k:
+                    seen_k.append(k)
+        kernels_checked = seen_k
 
     return dict(
         toolchains=sorted(toolchains),
@@ -1303,6 +1345,9 @@ def _collect_pinned_metadata(root, project, records, ci):
         repository_url=repo_url,
         hosting_decision=hosting.get("decision", "pending"),
         lean_ci=hosting.get("lean_ci", "not configured"),
+        lean_ci_level=lean_ci_level(project),
+        ci_level=ci_level,
+        kernels_checked=kernels_checked,
         ci_commit=ci_commit,
         ci_run_url=ci_run_url,
     )
@@ -1426,11 +1471,21 @@ def _render_manifest_latex(project, summary, caveats, backlog, pinned):
 
     # Verification tier (CI vs local-only).
     if a["machine_verified"]:
-        ci_note = (
-            f"Of {a['unconditionally_closed']} unconditionally closed results, "
-            f"{a['machine_verified']} {'was' if a['machine_verified'] == 1 else 'were'} "
-            f"independently rebuilt in GitHub Actions CI"
-        )
+        paranoid_ci = (pinned.get("ci_level") == "paranoid"
+                       and any(k != "lean-kernel" for k in pinned.get("kernels_checked") or []))
+        if paranoid_ci:
+            kernels_tex = ", ".join(f"\\texttt{{{_latex_escape(k)}}}" for k in pinned["kernels_checked"])
+            ci_note = (
+                f"Of {a['unconditionally_closed']} unconditionally closed results, "
+                f"{a['machine_verified']} {'was' if a['machine_verified'] == 1 else 'were'} "
+                f"independently rebuilt and re-verified in GitHub Actions paranoid CI (kernels: {kernels_tex})"
+            )
+        else:
+            ci_note = (
+                f"Of {a['unconditionally_closed']} unconditionally closed results, "
+                f"{a['machine_verified']} {'was' if a['machine_verified'] == 1 else 'were'} "
+                f"independently rebuilt in GitHub Actions CI"
+            )
         if pinned["ci_commit"]:
             ci_note += f" at commit \\texttt{{{_latex_escape(pinned['ci_commit'][:12])}}}"
         ci_note += "."
@@ -1534,9 +1589,16 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
     if pinned["repository_url"] and pinned["repository_url"] != pinned["atlas_url"]:
         lines.append(f"- **Repository:** {pinned['repository_url']}")
     if pinned["ci_run_url"]:
-        lines.append(f"- **GitHub Actions CI run:** {pinned['ci_run_url']} (`{pinned['ci_commit']}`)")
+        kernels_md = ", ".join(f"`{k}`" for k in (pinned.get("kernels_checked") or ["lean-kernel"]))
+        lines.append(
+            f"- **GitHub Actions CI run:** {pinned['ci_run_url']} (`{pinned['ci_commit']}`) "
+            f"· level: `{pinned.get('ci_level') or 'standard'}` · kernels: {kernels_md}"
+        )
     else:
-        lines.append(f"- **Verification tier:** Local Lean audit (`lean_ci`: `{pinned['lean_ci']}`)")
+        lines.append(
+            f"- **Verification tier:** Local Lean audit (`lean_ci`: `{pinned['lean_ci']}`, "
+            f"`lean_ci_level`: `{pinned['lean_ci_level']}`)"
+        )
 
     show_supplied = any(b["supplied_proof"] for b in summary.values())
     lines.extend(["", "## Verification Summary", ""])
@@ -1842,6 +1904,7 @@ def review_work(root, labels=(), *, require_ci=False, ci_receipt=None):
     selected = list(dict.fromkeys(labels or [c["id"] for c in claims]))
     selected_set = set(selected)
     report = {"scope": project.get("proof_work"), "profile": proof_work_profile(project),
+              "lean_ci_level": lean_ci_level(project),
               "agent_tasks": [], "author_questions": [],
               "conditional_claims": [],
               "uncommitted_delivery_files": [], "ci_pending": [], "witness_search": {}}
@@ -1888,9 +1951,16 @@ def review_work(root, labels=(), *, require_ci=False, ci_receipt=None):
         if require_ci and work.get("status")=="closed":
             evidence = (ci or {}).get("claims", {}).get(cid, {})
             digest = hashlib.sha256(local(root,work["closure"]["audit"]).read_bytes()).hexdigest()
-            if not packet["checked"] or evidence.get("audit_sha256")!=digest or (
-                    packet["view"]["bindings"]["statement"] and
-                    evidence.get("statement_sha256")!=packet["view"]["bindings"]["statement"]):
+            need_paranoid = lean_ci_level(project) == "paranoid"
+            claim_kernels = list(evidence.get("kernels_checked") or (ci or {}).get("kernels_checked") or [])
+            paranoid_ok = (not need_paranoid or (
+                (ci or {}).get("ci_level") == "paranoid"
+                and any(k != "lean-kernel" for k in claim_kernels)
+            ))
+            if (not packet["checked"] or evidence.get("audit_sha256")!=digest
+                    or not paranoid_ok
+                    or (packet["view"]["bindings"]["statement"] and
+                        evidence.get("statement_sha256")!=packet["view"]["bindings"]["statement"])):
                 report["ci_pending"].append(cid)
     book, edits = manuscript_edits.inventory(root)
     for key,item in edits.items():
@@ -2233,6 +2303,239 @@ def assemble(root, *, package=None, run_audit=False):
     return report
 
 
+def _parse_local_imports_from_source(pkg_root, rel_path):
+    """Extract local Lean module imports from a package-relative source file without invoking Lake."""
+    import audit_lean
+    text = audit_lean.strip_lean_comments_and_strings((pkg_root / rel_path).read_text(encoding="utf-8-sig"))
+    mods = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*(?:(?:public|private|meta)\s+)*import\s+([A-Za-z_][\w']*(?:\.[A-Za-z_][\w']*)*)\b", line)
+        if m:
+            mod = m.group(1)
+            if (pkg_root / ("/".join(mod.split(".")) + ".lean")).is_file():
+                mods.append(mod)
+    return mods
+
+
+def _lakefile_has_libs(pkg_root, names):
+    """Return True if lakefile.toml declares every named [[lean_lib]]."""
+    toml_path = pkg_root / "lakefile.toml"
+    if not toml_path.is_file():
+        return False
+    import tomllib
+    try:
+        config = tomllib.loads(toml_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    declared = {lib.get("name") for lib in config.get("lean_lib", []) if isinstance(lib, dict)}
+    return set(names) <= declared
+
+
+def generate_challenge_harness(root, *, package=None, write=True, check_only=False):
+    """Mechanically generate hash-locked Challenge.lean and Solution.lean for closed claims.
+
+    Challenge.lean imports ONLY isolated Statements/ modules (verified free of `sorry` and
+    escape hatches) and declares each closed claim target as `theorem <name> : _root_.<expected> := by sorry`.
+    Solution.lean imports Statements/ plus Assembly/Proofs and proves the identical theorem
+    names and types via `_root_.<declaration>`.
+    """
+    import audit_lean
+
+    p = json.loads((root / "project.json").read_text(encoding="utf-8-sig"))
+    claims = manuscript_claims(root, p)
+    by_id = {c["id"]: c for c in claims}
+    order = p.get("claim_order") or [c["id"] for c in claims]
+    work = p.get("work", {})
+
+    pkg_claims = {}
+    for cid in order:
+        if cid not in by_id:
+            continue
+        w = work.get(cid, {})
+        if w.get("status") != "closed":
+            continue
+        closure = w.get("closure") or {}
+        pkg = closure.get("package")
+        if not pkg:
+            raise ValueError(f"{cid}: closed claim is missing closure.package")
+        if package and pkg != package:
+            continue
+        if not closure.get("audit") or not closure.get("expected") or not closure.get("declaration"):
+            raise ValueError(f"{cid}: closed claim is missing audit, expected, or declaration")
+        prior = json.loads(local(root, closure["audit"]).read_bytes())
+        if prior.get("assumes") or w.get("assumes"):
+            raise ValueError(f"{cid}: closed claim cannot carry unresolved conditional assumptions")
+        pkg_claims.setdefault(pkg, []).append((cid, w, closure, prior))
+
+    if not pkg_claims:
+        raise ValueError("No closed claims found to generate Challenge.lean / Solution.lean")
+
+    report = {"packages": {}}
+    for pkg, items in sorted(pkg_claims.items()):
+        pkg_root = local(root, pkg)
+        stmt_paths = []
+        for _, w, _, prior in items:
+            for sp in prior.get("statements") or (w.get("assembly") or {}).get("statements") or []:
+                if sp not in stmt_paths:
+                    stmt_paths.append(sp)
+        if not stmt_paths:
+            if (pkg_root / "Statements").is_dir():
+                stmt_paths = ["Statements"]
+            elif (pkg_root / "Statements.lean").is_file():
+                stmt_paths = ["Statements.lean"]
+            else:
+                raise ValueError(
+                    f"{pkg}: Challenge.lean generation requires isolated Statements/ modules "
+                    "(pass --statements Statements when auditing claims)"
+                )
+
+        stmt_files = sorted(audit_lean.statement_paths(pkg_root, stmt_paths))
+        if not stmt_files:
+            raise ValueError(f"{pkg}: no .lean files found under statement paths: {', '.join(stmt_paths)}")
+        hygiene_files = list(stmt_files)
+        hygiene_stmt_set = set(stmt_files)
+        if (pkg_root / "Prelude.lean").is_file():
+            hygiene_files.append("Prelude.lean")
+            hygiene_stmt_set.add("Prelude.lean")
+        audit_lean.scan_lean_hygiene(pkg_root, hygiene_files, hygiene_stmt_set)
+        audit_lean.scan_no_sorry(pkg_root, stmt_files)
+
+        allowed_stmt_modules = {f[:-5].replace("/", ".") for f in stmt_files}
+        stmt_digests = {f: hashlib.sha256((pkg_root / f).read_bytes()).hexdigest() for f in stmt_files}
+        statements_sha256 = hashlib.sha256(
+            "".join(f"{f} {h}\n" for f, h in sorted(stmt_digests.items())).encode("utf-8")
+        ).hexdigest()
+
+        used_names = set()
+        challenge_imports = set()
+        solution_imports = set()
+        challenge_decls = []
+        solution_decls = []
+        targets_meta = []
+
+        for cid, w, closure, prior in items:
+            expected = closure["expected"]
+            declaration = closure["declaration"]
+            asm_name = (w.get("assembly") or {}).get("name")
+            name = asm_name if (asm_name and asm_name not in used_names) else _lean_ident(cid, used_names)
+            used_names.add(name)
+
+            claim_stmt_mods = []
+            for mod in (w.get("assembly") or {}).get("statement_modules") or []:
+                if mod not in claim_stmt_mods:
+                    claim_stmt_mods.append(mod)
+            if not claim_stmt_mods:
+                for const in (prior.get("statement") or {}).get("constants") or []:
+                    if const.get("name") == expected and const.get("file", "").endswith(".lean"):
+                        mod = const["file"][:-5].replace("/", ".")
+                        if mod not in claim_stmt_mods:
+                            claim_stmt_mods.append(mod)
+            if not claim_stmt_mods:
+                if "Statements" in allowed_stmt_modules:
+                    claim_stmt_mods = ["Statements"]
+                else:
+                    claim_stmt_mods = sorted(allowed_stmt_modules)
+            for mod in claim_stmt_mods:
+                if mod not in allowed_stmt_modules:
+                    raise ValueError(
+                        f"{cid}: statement module {mod} is outside isolated Statements/ ({', '.join(stmt_paths)})"
+                    )
+                challenge_imports.add(mod)
+                solution_imports.add(mod)
+
+            proof_mods = []
+            if declaration.startswith("Assembly.") and (pkg_root / "Assembly.lean").is_file():
+                proof_mods.append("Assembly")
+            else:
+                for t in prior.get("targets") or []:
+                    if t not in proof_mods and (pkg_root / ("/".join(t.split(".")) + ".lean")).is_file():
+                        proof_mods.append(t)
+                asm_mod = (w.get("assembly") or {}).get("module")
+                if not proof_mods and asm_mod and (pkg_root / ("/".join(asm_mod.split(".")) + ".lean")).is_file():
+                    proof_mods.append(asm_mod)
+                if not proof_mods and prior.get("contract") and (pkg_root / prior["contract"]).is_file():
+                    for mod in _parse_local_imports_from_source(pkg_root, prior["contract"]):
+                        if mod not in allowed_stmt_modules and mod not in proof_mods:
+                            proof_mods.append(mod)
+            if not proof_mods:
+                raise ValueError(f"{cid}: could not determine proof module(s) for Solution.lean ({declaration})")
+            solution_imports.update(proof_mods)
+
+            stmt_sha = (prior.get("statement") or {}).get("sha256") or ""
+            doc_sha = f" (statement SHA-256: `{stmt_sha}`)" if stmt_sha else ""
+            doc = f"/-- Claim `{cid}`: `{expected}`{doc_sha} -/"
+            challenge_decls.append(f"{doc}\ntheorem {name} : _root_.{expected} := by sorry")
+            solution_decls.append(f"{doc}\ntheorem {name} : _root_.{expected} :=\n  _root_.{declaration}")
+            targets_meta.append(dict(
+                claim=cid,
+                name=name,
+                theorem=f"ProofAtlasChallenge.{name}",
+                expected=expected,
+                declaration=declaration,
+                statement_sha256=stmt_sha or None,
+                proof_modules=sorted(set(proof_mods)),
+            ))
+
+        header = (
+            "/- Generated by Proof Atlas (`atlas.py challenge`). Do not edit by hand.\n"
+            f"   Statements digest (SHA-256): {statements_sha256}\n"
+            f"   Targets: {len(targets_meta)} -/\n"
+        )
+        challenge_text = (
+            header
+            + "\n".join(f"import {m}" for m in sorted(challenge_imports))
+            + "\n\nnamespace ProofAtlasChallenge\n\n"
+            + "\n\n".join(challenge_decls)
+            + "\n\nend ProofAtlasChallenge\n"
+        )
+        solution_text = (
+            header
+            + "\n".join(f"import {m}" for m in sorted(solution_imports))
+            + "\n\nnamespace ProofAtlasChallenge\n\n"
+            + "\n\n".join(solution_decls)
+            + "\n\nend ProofAtlasChallenge\n"
+        )
+        challenge_bytes = challenge_text.encode("utf-8")
+        solution_bytes = solution_text.encode("utf-8")
+        challenge_path = pkg_root / "Challenge.lean"
+        solution_path = pkg_root / "Solution.lean"
+
+        if check_only:
+            for label_name, path_obj, expected_bytes in (
+                ("Challenge.lean", challenge_path, challenge_bytes),
+                ("Solution.lean", solution_path, solution_bytes),
+            ):
+                if not path_obj.is_file():
+                    raise ValueError(f"{pkg}: missing {label_name}; run `atlas.py challenge` to generate it")
+                if path_obj.read_bytes() != expected_bytes:
+                    raise ValueError(
+                        f"{pkg}: committed {label_name} differs from the hash-locked generated harness; "
+                        "regenerate with `atlas.py challenge`"
+                    )
+        elif write:
+            atomic(challenge_path, challenge_bytes)
+            atomic(solution_path, solution_bytes)
+
+        report["packages"][pkg] = dict(
+            challenge_file=(Path(pkg) / "Challenge.lean").as_posix(),
+            solution_file=(Path(pkg) / "Solution.lean").as_posix(),
+            challenge_sha256=hashlib.sha256(challenge_bytes).hexdigest(),
+            solution_sha256=hashlib.sha256(solution_bytes).hexdigest(),
+            statements_sha256=statements_sha256,
+            statements_paths=stmt_paths,
+            statements_files=stmt_digests,
+            challenge_imports=sorted(challenge_imports),
+            solution_imports=sorted(solution_imports),
+            namespace="ProofAtlasChallenge",
+            lakefile_configured=_lakefile_has_libs(pkg_root, ("Challenge", "Solution")),
+            targets=targets_meta,
+            _challenge_bytes=challenge_bytes,
+            _solution_bytes=solution_bytes,
+        )
+
+    return report
+
+
 def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
     p = json.loads((root / "project.json").read_text(encoding="utf-8-sig"))
     ci = github_verification(p, ci_receipt, commit)
@@ -2436,15 +2739,15 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         if checked and p.get("hosting", {}).get("lean_ci") == "enabled":
             verification["remote"] = "No GitHub verification for this revision"
             verification["url"] = p["hosting"]["repository"] + "/actions/workflows/verify-lean.yml"
-            record = ci["claims"].get(cid) if ci else None
-            if (record and record.get("audit_sha256") == hashlib.sha256(receipt).hexdigest()
-                    and all(record.get(k) == audit[k] for k in ("expected", "declaration", "toolchain"))
-                    and (not audit.get("statement") or record.get("statement_sha256") == audit["statement"]["sha256"])
-                    and (not audit.get("hypotheses") or record.get("hypotheses") == audit["hypotheses"]["proposition"])
-                    and set(record["axioms"]) == set(audit["axioms"])):
-                verification.update(remote="Machine verified on GitHub",
+            ci_ok, paranoid_ok, rec_kernels, rec_ci_level = _ci_claim_status(audit, receipt, ci, cid)
+            if ci_ok:
+                remote_label = "Multi-kernel / Comparator" if paranoid_ok else "Machine verified on GitHub"
+                verification.update(remote=remote_label,
                                     url=f'{p["hosting"]["repository"]}/actions/runs/{ci["run_id"]}/attempts/{ci["attempt"]}',
-                                    commit=ci["commit"], evidence="logs/lean-verification.json")
+                                    commit=ci["commit"], evidence="logs/lean-verification.json",
+                                    ci_level=rec_ci_level, kernels_checked=rec_kernels)
+                if paranoid_ok:
+                    verification["paranoid"] = True
                 if artifact_id and artifact_id > 0:
                     verification["artifact"] = f'{p["hosting"]["repository"]}/actions/runs/{ci["run_id"]}/artifacts/{artifact_id}'
         entry["verification"] = verification
@@ -2560,6 +2863,8 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
             badge += f' · <a href="{reviews.review_url(cid)}#author-scope">Author’s scope note</a>'
         if "evidence" in verification:
             badge += f' <a class="verified-badge" href="{esc(verification["url"])}">&#10003; {esc(verification["remote"])}</a>'
+            if verification.get("paranoid") and verification.get("kernels_checked"):
+                badge += f' · Kernels: {esc(", ".join(verification["kernels_checked"]))}'
             badge += f' · <a href="{esc(verification["evidence"])}">Verification record</a>'
             if "artifact" in verification:
                 badge += (f' · <a href="{esc(verification["artifact"])}" data-artifact-record="{esc(verification["evidence"])}">'
@@ -2698,11 +3003,11 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["build", "assemble", "manifest", "approve", "review", "review-inputs","compare","review-work"])
+    parser.add_argument("operation", choices=["build", "assemble", "challenge", "manifest", "approve", "review", "review-inputs","compare","review-work"])
     parser.add_argument("project", type=Path)
     parser.add_argument("claims", nargs="*", help="approve: claim labels (default: every closed claim awaiting approval)")
     parser.add_argument("--by", help="approve: the author approving the statements. Only the author runs approve")
-    parser.add_argument("--package", help="assemble: limit Assembly.lean generation to one project-relative Lean package")
+    parser.add_argument("--package", help="assemble/challenge: limit generation to one project-relative Lean package")
     parser.add_argument("--audit", action="store_true", help="assemble: audit each assembled claim and update project.json")
     parser.add_argument("--ci-receipt", type=Path, help="Evidence downloaded from the trusted Lean workflow")
     parser.add_argument("--commit", help="Git revision being rendered")
@@ -2711,7 +3016,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--side",choices=["paper","lean"],help="Limit the independent reader to one source")
     parser.add_argument("--readings",type=Path,help="Agent comparison record for one claim")
-    parser.add_argument("--check",action="store_true",help="review-work: exit nonzero for pending agent tasks or requested CI evidence")
+    parser.add_argument("--check",action="store_true",help="review-work/challenge: exit nonzero for pending work or mismatched Challenge/Solution files")
     parser.add_argument("--require-ci",action="store_true",help="review-work: verify receipt coverage for the current checkout commit")
     parser.add_argument("--format",choices=["text","markdown","latex","json"],default="text",help="manifest: output format printed to stdout")
     parser.add_argument("--propose-edit",action="store_true",help="manifest: propose a synchronized manuscript-edits.json entry with the LaTeX scope snippet")
@@ -2724,6 +3029,18 @@ if __name__ == "__main__":
         if args.operation == "assemble":
             report = assemble(args.project.resolve(), package=args.package, run_audit=args.audit)
             print(json.dumps(report, ensure_ascii=False, indent=2))
+        elif args.operation == "challenge":
+            report = generate_challenge_harness(
+                args.project.resolve(), package=args.package,
+                write=not args.check, check_only=args.check,
+            )
+            cleaned = {
+                "packages": {
+                    pkg: {k: v for k, v in info.items() if not k.startswith("_")}
+                    for pkg, info in report["packages"].items()
+                }
+            }
+            print(json.dumps(cleaned, ensure_ascii=False, indent=2))
         elif args.operation == "manifest":
             result = manifest(
                 args.project.resolve(),

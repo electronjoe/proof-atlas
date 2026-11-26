@@ -24,8 +24,42 @@ jobs:
           curl --fail --silent --show-error --location https://elan.lean-lang.org/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
           sh "$RUNNER_TEMP/elan-init.sh" -y --no-modify-path --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      - name: Build proof modules and type-check each claim against its statement
+      - name: Detect Lean CI verification level
+        id: ci_level
+        run: |
+          level=$(python3 -c 'import json; h=json.load(open("project.json")).get("hosting",{}); print(h.get("lean_ci_level","standard"))')
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+      - name: Build proof modules and type-check each claim against its statement (standard)
+        if: steps.ci_level.outputs.level != 'paranoid'
         run: python3 tools/proof-atlas/scripts/verify_ci.py "$RUNNER_TEMP/lean-verification.json"
+      - name: Fetch locked dependencies, Mathlib cache, and paranoid checkers
+        if: steps.ci_level.outputs.level == 'paranoid'
+        run: |
+          python3 tools/proof-atlas/scripts/verify_ci.py --prepare-only
+          python3 tools/proof-atlas/scripts/verify_ci.py --install-paranoid-tools "$RUNNER_TEMP/paranoid-bin"
+          echo "$RUNNER_TEMP/paranoid-bin" >> "$GITHUB_PATH"
+      - name: Run offline paranoid verification (Challenge/Solution + Comparator / lean4checker / multi-kernel)
+        if: steps.ci_level.outputs.level == 'paranoid'
+        run: |
+          if unshare -rn true 2>/dev/null; then
+            PROOF_ATLAS_NETWORK_ISOLATED=1 unshare -rn \
+              python3 tools/proof-atlas/scripts/verify_ci.py --offline "$RUNNER_TEMP/lean-verification.json"
+          elif sudo -n unshare -n true 2>/dev/null; then
+            sudo -n unshare -n -- sudo -n -u "$USER" env \
+              "PATH=$PATH" \
+              "HOME=$HOME" \
+              "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" \
+              "GITHUB_SHA=$GITHUB_SHA" \
+              "GITHUB_RUN_ID=$GITHUB_RUN_ID" \
+              "GITHUB_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" \
+              "LEAN_NUM_THREADS=$LEAN_NUM_THREADS" \
+              "MATHLIB_NO_CACHE_ON_UPDATE=$MATHLIB_NO_CACHE_ON_UPDATE" \
+              "PROOF_ATLAS_NETWORK_ISOLATED=1" \
+              python3 tools/proof-atlas/scripts/verify_ci.py --offline "$RUNNER_TEMP/lean-verification.json"
+          else
+            echo "Network-isolated namespace unavailable on this runner; refusing to run paranoid CI with network access." >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: lean-verification-${{ github.sha }}-${{ github.run_attempt }}

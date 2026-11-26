@@ -112,6 +112,8 @@ def main():
     actions.add_argument("--lean-ci", action="store_true", help="Record approval and install the Lean verification workflow")
     actions.add_argument("--no-lean-ci", action="store_true", help="Record a local-checks-only choice")
     actions.add_argument("--publish", action="store_true", help="Publish the committed paper project to its approved GitHub destination")
+    parser.add_argument("--lean-ci-level", choices=["standard", "paranoid"],
+                        help="Lean CI verification tier: standard (default) or paranoid (Challenge/Solution + Comparator / lean4checker / multi-kernel)")
     parser.add_argument("--visibility", choices=["public", "private"])
     pages = parser.add_mutually_exclusive_group()
     pages.add_argument("--pages", action="store_true")
@@ -123,6 +125,8 @@ def main():
     choice = project.get("hosting") or {"decision":"pending"}
     if (args.visibility or args.pages or args.no_pages) and not args.github:
         parser.error("Use the GitHub options with --github")
+    if args.lean_ci_level and (args.github or args.local or args.no_lean_ci or args.publish):
+        parser.error("Use --lean-ci-level with --lean-ci, or alone once Lean CI is enabled")
     if args.publish:
         publish(root, choice)
         return
@@ -143,7 +147,7 @@ def main():
             choice.pop("activity_url", None)
     if args.local:
         choice = {"decision":"local"}
-    if args.lean_ci or args.no_lean_ci:
+    if args.lean_ci or args.no_lean_ci or args.lean_ci_level:
         if not choice.get("repository"):
             parser.error("Choose a GitHub repository first")
         workflow = root / ".github/workflows/verify-lean.yml"
@@ -153,10 +157,21 @@ def main():
                 parser.error("Existing verify-lean.yml differs. Integrate per-claim verification into that workflow and record the decision.")
             workflow.parent.mkdir(parents=True, exist_ok=True)
             atomic(workflow, template.read_bytes())
+            choice["lean_ci"] = "enabled"
+            choice["lean_ci_level"] = args.lean_ci_level or choice.get("lean_ci_level") or "standard"
+        elif args.lean_ci_level:
+            if choice.get("lean_ci") != "enabled":
+                parser.error("Enable GitHub Lean verification with --lean-ci first, or pass --lean-ci --lean-ci-level")
+            if not workflow.exists():
+                workflow.parent.mkdir(parents=True, exist_ok=True)
+                atomic(workflow, template.read_bytes())
+            choice["lean_ci_level"] = args.lean_ci_level
         elif workflow.exists():
             parser.error("An existing verification workflow is installed. Review its triggers before disabling it.")
-        choice["lean_ci"] = "enabled" if args.lean_ci else "declined"
-    if args.github or args.local or args.lean_ci or args.no_lean_ci:
+        else:
+            choice["lean_ci"] = "declined"
+            choice.pop("lean_ci_level", None)
+    if args.github or args.local or args.lean_ci or args.no_lean_ci or args.lean_ci_level:
         project["hosting"] = choice
         atomic(path, (json.dumps(project, indent=2, ensure_ascii=False)+"\n").encode())
     print(json.dumps(choice, indent=2))

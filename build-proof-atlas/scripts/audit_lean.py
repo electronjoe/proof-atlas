@@ -195,6 +195,23 @@ def scan_lean_hygiene(root, lean_paths, statement_files=()):
     return dict(checked=True, statements_checked=bool(stmt_set))
 
 
+_SORRY_KW = re.compile(r"\bsorry\b")
+
+
+def scan_no_sorry(root, lean_paths):
+    """Verify audited Lean files contain no `sorry` tokens outside comments and strings."""
+    findings = []
+    for rel in sorted(lean_paths):
+        cleaned = strip_lean_comments_and_strings((root / rel).read_text(encoding="utf-8-sig"))
+        for m in _SORRY_KW.finditer(cleaned):
+            line = cleaned.count("\n", 0, m.start()) + 1
+            findings.append((rel, line))
+    if findings:
+        details = "; ".join(f"{rel}:{line}: sorry" for rel, line in findings)
+        raise ValueError(f"Disallowed `sorry` in audited Lean sources: {details}")
+    return True
+
+
 def count_lean_loc(root, lean_paths):
     """Count non-empty, non-comment Lean lines of code across audited local .lean files."""
     total = 0
@@ -220,13 +237,33 @@ def _pure_external_prelude(lake, root, env):
     return True
 
 
+def _resolve_routine_paths(root, routine_paths):
+    """Resolve Routine/ directories, file paths, or module names (e.g. `Routine.Glue`) to package-relative paths."""
+    resolved = []
+    for name in routine_paths:
+        if (root / name).exists():
+            resolved.append(name)
+            continue
+        if re.fullmatch(r"[A-Za-z_][\w']*(?:\.[A-Za-z_][\w']*)*", name):
+            mod_rel = "/".join(name.split(".")) + ".lean"
+            if (root / mod_rel).is_file():
+                resolved.append(mod_rel)
+                continue
+        resolved.append(name)
+    return resolved
+
+
 def check_routine(lake, root, env, routine_paths=(), checked_files=()):
     """Keep Routine/ glue disjoint from Statements/, Proofs/, and other local libraries.
 
     Routine modules may import external libraries (e.g. Mathlib), a pure-external
     Prelude.lean, and other Routine modules—never Statements/ or Proofs/.
+    Also enforces Prelude.lean pure-external isolation whenever Prelude.lean is checked.
     """
-    files = statement_paths(root, routine_paths) if routine_paths else set()
+    prelude_ok = None
+    if "Prelude.lean" in checked_files:
+        prelude_ok = _pure_external_prelude(lake, root, env)
+    files = statement_paths(root, _resolve_routine_paths(root, routine_paths)) if routine_paths else set()
     for rel in checked_files:
         if rel == "Routine.lean" or rel.startswith("Routine/"):
             files.add(rel)
@@ -237,7 +274,6 @@ def check_routine(lake, root, env, routine_paths=(), checked_files=()):
     rows = lake_json(lake, ["env", "lean", "--deps-json", "--stdin"], root, env, ("\n".join(ordered) + "\n").encode())
     if len(rows) != 1 or len(rows[0]["imports"]) != len(ordered):
         raise ValueError("Incomplete Lean import headers for the routine modules")
-    prelude_ok = None
     for path, item in zip(ordered, rows[0]["imports"]):
         if item["errors"]:
             raise ValueError(f"Lean could not read the imports of {path}")
