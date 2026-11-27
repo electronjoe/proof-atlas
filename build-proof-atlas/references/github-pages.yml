@@ -40,23 +40,26 @@ jobs:
             fi
           fi
           python3 tools/proof-atlas/scripts/atlas.py build . "${args[@]}"
+          python3 tools/proof-atlas/scripts/atlas.py manifest . "${args[@]}"
       - name: Check publication files and evidence links
         run: |
           python3 - <<'PY'
           import json
+          import re
           from hashlib import sha256
+          from html import escape
           from pathlib import Path
           root = Path("dist")
-          for name in ("index.html", "proofs/index.html", "progress.html", "manuscript.pdf", "graph.js", "dagre/dagre.min.js"):
+          for name in ("index.html", "VERIFICATION.md", "proofs/index.html", "progress.html", "manuscript.pdf", "graph.js", "dagre/dagre.min.js"):
               assert (root / name).stat().st_size, name
-          from html import escape
           project = json.loads(Path("project.json").read_text())
           for name in ("index.html", "proofs/index.html", "progress.html"):
               html = (root / name).read_text(encoding="utf-8")
               caption = html.split("</h1>", 1)[1].split("</p>", 1)[0]
-              assert '<a href="manuscript.pdf">' in caption, f"{name}: missing header PDF link"
+              assert re.search(r'<a\b[^>]*\bhref="manuscript\.pdf"', caption), f"{name}: missing header PDF link"
               if publication := project.get("publication"):
-                  assert f'<a href="{escape(publication, quote=True)}">' in caption, f"{name}: missing publication link"
+                  pub_esc = re.escape(escape(publication, quote=True))
+                  assert re.search(r'<a\b[^>]*\bhref="' + pub_esc + r'"', caption), f"{name}: missing publication link"
           for item in project.get("work", {}).values():
               if log := item.get("run_log"):
                   body = Path(log).read_bytes()

@@ -94,6 +94,12 @@ def supports_lake_paranoid(toolchain):
     return ver is not None and ver >= (4, 35, 0)
 
 
+def supports_builtin_leanchecker(toolchain):
+    """Return True if the pinned Lean toolchain ships built-in `leanchecker` (>= v4.28.0)."""
+    ver = parse_lean_version(toolchain)
+    return ver is not None and ver >= (4, 28, 0)
+
+
 def _dedup_ordered(items):
     out = []
     for item in items:
@@ -312,9 +318,25 @@ def run_comparator(package, pkg_harness, env, lake):
     return ["comparator"]
 
 
+def _find_builtin_leanchecker(package, env, lake):
+    """Locate the built-in `leanchecker` binary inside the pinned Lean >= v4.28.0 sysroot."""
+    res = subprocess.run(
+        [*lake, "env", "lean", "--print-prefix"],
+        cwd=package, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if res.returncode != 0:
+        return None
+    prefix = res.stdout.strip()
+    if not prefix:
+        return None
+    candidate = Path(prefix) / "bin" / "leanchecker"
+    return str(candidate) if candidate.is_file() else None
+
+
 def run_lean4checker(package, modules, env, lake):
-    """Run `lean4checker --fresh` against built proof/Solution modules if installed."""
+    """Run `lean4checker --fresh` or built-in `leanchecker --fresh` against built proof/Solution modules."""
     explicit = os.environ.get("LEAN4CHECKER_BIN")
+    label = "lean4checker"
     if explicit:
         cmd = [*lake, "env", explicit, "--fresh", *modules]
     elif shutil.which("lean4checker"):
@@ -322,12 +344,16 @@ def run_lean4checker(package, modules, env, lake):
     elif _manifest_has_package(package, "lean4checker"):
         cmd = [*lake, "exe", "lean4checker", "--fresh", *modules]
     else:
-        return None
+        builtin = _find_builtin_leanchecker(package, env, lake)
+        if not builtin:
+            return None
+        cmd = [*lake, "env", builtin, "--fresh", *modules]
+        label = "leanchecker"
     res = subprocess.run(cmd, cwd=package, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if res.returncode:
         out = res.stdout.decode("utf-8-sig", errors="replace")
-        raise ValueError(f"lean4checker --fresh failed (exit {res.returncode}):\n{out}")
-    return ["lean4checker"]
+        raise ValueError(f"{label} --fresh failed (exit {res.returncode}):\n{out}")
+    return [label]
 
 
 def run_lake_paranoid(package, targets, toolchain, env, lake):
@@ -519,6 +545,9 @@ def install_paranoid_tools(root, bin_dir):
     for pin in toolchains:
         if supports_lake_paranoid(pin):
             print(f"Toolchain {pin} supports built-in `lake check --paranoid`.", flush=True)
+            continue
+        if supports_builtin_leanchecker(pin):
+            print(f"Toolchain {pin} ships built-in `leanchecker` (>= v4.28.0); skipping archived lean4checker build.", flush=True)
             continue
         m = re.search(r"(v\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)$", pin)
         if not m:

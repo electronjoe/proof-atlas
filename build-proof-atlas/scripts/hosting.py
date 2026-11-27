@@ -175,10 +175,24 @@ def main():
         project["hosting"] = choice
         atomic(path, (json.dumps(project, indent=2, ensure_ascii=False)+"\n").encode())
     print(json.dumps(choice, indent=2))
+    profile = (project.get("proof_work") or {}).get("profile") or "thorough"
     if choice.get("decision") == "pending":
         print("Ask the author where to host this paper's explorer and dashboard. Continue local work while waiting.")
     elif choice.get("repository") and not choice.get("lean_ci"):
-        print("Ask whether GitHub Actions should independently verify the Lean claims and publish per-claim evidence.")
+        if profile != "quick":
+            print(
+                "Ask whether GitHub Actions should independently verify the Lean claims and publish per-claim evidence. "
+                "For thorough formalizations, `--lean-ci --lean-ci-level paranoid` (offline unshare + Challenge/Solution + leanchecker/Comparator) is recommended."
+            )
+        else:
+            print("Ask whether GitHub Actions should independently verify the Lean claims and publish per-claim evidence.")
+    elif (args.lean_ci and not args.lean_ci_level and profile != "quick"
+          and choice.get("lean_ci_level") == "standard"):
+        print(
+            "Tip: this project uses the 'thorough' profile; consider upgrading to paranoid CI with "
+            "`hosting.py <project> --lean-ci-level paranoid` (configure `Challenge`/`Solution` in lakefile.toml, "
+            "run `atlas.py assemble <project> --audit`, then `atlas.py challenge <project>`)."
+        )
 
 
 if __name__ == "__main__":

@@ -625,7 +625,7 @@ def statement_record(lake, root, env, contract, expected, *, local_modules=None)
 # guard must hold too. Each such path becomes `∃ x…, H₁ ∧ … ∧ Hₖ`; paths are joined with ∧.
 # A variable the theorem itself chooses (under ∃) enters only when a hypothesis mentions it.
 # Only the expected definition itself is unfolded, so ¬, ≠ and ⊆ stay conclusions.
-HYPOTHESES_QUERY = r'''
+HYPOTHESES_PREAMBLE = r'''
 def proofAtlasPath (ys chosen : Array Lean.Expr) : Lean.MetaM Lean.Expr := do
   let mut binders := #[]
   let mut facts := #[]
@@ -656,7 +656,9 @@ partial def proofAtlasPaths (e : Lean.Expr) (xs chosen : Array Lean.Expr) : Lean
         return ← Lean.Meta.withLocalDecl n bi t fun x =>
           proofAtlasPaths (b.instantiate1 x) (xs.push x) (chosen.push x)
     return #[]
+'''
 
+HYPOTHESES_QUERY = HYPOTHESES_PREAMBLE + r'''
 #eval show Lean.MetaM Unit from do
   let env ← Lean.getEnv
   let some ci := env.find? (__EXPECTED__ : String).toName | throwError "unknown expected proposition"
@@ -674,6 +676,18 @@ partial def proofAtlasPaths (e : Lean.Expr) (xs chosen : Array Lean.Expr) : Lean
     ("proved", toString (← Lean.Meta.ppExpr (← Lean.instantiateMVars w))),
     ("module", Lean.toJson (mod.map toString)),
     ("lines", Lean.toJson (range.map fun r => #[r.range.pos.line, r.range.endPos.line]))]).compress
+'''
+
+EXPECTED_WITNESS_QUERY = HYPOTHESES_PREAMBLE + r'''
+#eval show Lean.MetaM Unit from do
+  let env ← Lean.getEnv
+  let some ci := env.find? (__EXPECTED__ : String).toName | throwError "unknown expected proposition"
+  let some v := ci.value? | return ()
+  let us ← ci.levelParams.mapM fun _ => Lean.Meta.mkFreshLevelMVar
+  let paths ← proofAtlasPaths (v.instantiateLevelParams ci.levelParams us) #[] #[]
+  let goal := paths.pop.foldr Lean.mkAnd (paths.back?.getD (Lean.mkConst ``True))
+  IO.println <| "PROOF-ATLAS-EXPECTED-WITNESS " ++ (Lean.Json.mkObj [
+    ("needed", toString (← Lean.Meta.ppExpr (← Lean.instantiateMVars goal)))]).compress
 '''
 
 
@@ -1323,6 +1337,48 @@ def axiom_report(output, declaration):
     return axioms
 
 
+def expected_witness_proposition(lake, root, env, contract, expected):
+    """Derive and pretty-print the exact Lean proposition required for `--witness` on `expected`."""
+    program = ("import Lean\n" + (root / contract).read_text(encoding="utf-8-sig") + "\n" +
+               EXPECTED_WITNESS_QUERY.replace("__EXPECTED__", json.dumps(expected)))
+    result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
+                            cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = result.stdout.decode("utf-8-sig", errors="replace")
+    rows = [json.loads(line.split(" ", 1)[1]) for line in output.splitlines()
+            if line.startswith("PROOF-ATLAS-EXPECTED-WITNESS ")]
+    if result.returncode or len(rows) != 1:
+        raise ValueError("Could not derive the expected witness proposition:\n" + output)
+    return rows[0]["needed"]
+
+
+def print_witness_type(package, contract, expected, *, targets=(), lake=None, env=None):
+    """Build contract dependencies if needed and return the derived `--witness` Lean proposition."""
+    root = Path(package).resolve(strict=True)
+    contract_file = (root / contract).resolve(strict=True)
+    if not contract_file.is_relative_to(root) or contract_file.suffix != ".lean":
+        raise ValueError("Keep the contract in the Lean package")
+    if not re.fullmatch(r"[A-Za-z_][\w']*(?:\.[A-Za-z_][\w']*)*", expected):
+        raise ValueError("Expected a fully qualified Lean identifier")
+    pin = (root / "lean-toolchain").read_text(encoding="utf-8-sig").strip()
+    run_env = os.environ.copy() if env is None else dict(env)
+    run_env.update(ELAN_TOOLCHAIN=pin, GIT_ALLOW_PROTOCOL="file", MATHLIB_NO_CACHE_ON_UPDATE="1")
+    if lake is None:
+        lake = select_lake(root, pin, run_env, sys.stderr, offline=True)
+    contract_rel = contract_file.relative_to(root).as_posix()
+    build_targets = list(targets)
+    try:
+        _, contract_targets = module_inputs(lake, root, run_env, build_targets, contract_rel)
+        extra = [t for t in contract_targets if t[1:] not in build_targets]
+        build_targets = [*build_targets, *extra]
+    except (ImportError, KeyError, OSError, TypeError, ValueError):
+        pass
+    if build_targets:
+        run([*lake, "--no-cache", "build", *build_targets], root, run_env, sys.stderr)
+    else:
+        run([*lake, "--no-cache", "build"], root, run_env, sys.stderr)
+    return expected_witness_proposition(lake, root, run_env, contract_rel, expected)
+
+
 def hypotheses_record(lake, root, env, contract, expected, witness, *, local_modules=None):
     """Check that `witness` proves the hypotheses of `expected` can all hold, using standard axioms."""
     modules = _local_lean_modules(root) if local_modules is None else local_modules
@@ -1570,15 +1626,21 @@ def audit_batch(package, specs, *, lake=None, env=None):
         initial = item["initial"]
 
         theorem_info = False
+        expected_witness_prop = None
         if statement_only:
-            program = (contract.read_text(encoding="utf-8-sig") + "\n" +
-                       f"example : Prop := {expected}\n#print axioms {expected}\n")
+            program = ("import Lean\n" + contract.read_text(encoding="utf-8-sig") + "\n" +
+                       f"example : Prop := {expected}\n#print axioms {expected}\n" +
+                       EXPECTED_WITNESS_QUERY.replace("__EXPECTED__", json.dumps(expected)))
             result = subprocess.run([*lake, "env", "lean", "--stdin"], input=program.encode(),
                                     cwd=root, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             output = result.stdout.decode("utf-8-sig", errors="replace")
             if result.returncode or re.search(r"\bwarning:", output, re.I):
                 raise ValueError("Lean statement check did not pass cleanly:\n" + output)
             axioms = axiom_report(output, expected)
+            ew_rows = [json.loads(line.split(" ", 1)[1]) for line in output.splitlines()
+                       if line.startswith("PROOF-ATLAS-EXPECTED-WITNESS ")]
+            if ew_rows:
+                expected_witness_prop = ew_rows[-1]["needed"]
         else:
             claim_type = expected_claim_type(expected, assumes)
             program = ("import Lean\n" + contract.read_text(encoding="utf-8-sig") + "\n" +
@@ -1631,6 +1693,7 @@ def audit_batch(package, specs, *, lake=None, env=None):
             axioms=axioms,
             theorem_info=theorem_info,
             output=output,
+            expected_witness_proposition=expected_witness_prop,
             hypotheses=hypotheses,
             statement=statement,
             defaults=defaults,
@@ -1679,6 +1742,8 @@ def audit_batch(package, specs, *, lake=None, env=None):
                 statements=list(item["statements"]), hygiene=dict(item["hygiene"]),
                 lean_output=chk["output"].strip(),
                 statement=statement, defaults=defaults,
+                **({"expected_witness_proposition": chk["expected_witness_proposition"]}
+                   if chk.get("expected_witness_proposition") else {}),
                 **({"reachable_local_defs": len(statement["constants"])} if statement else {}),
                 **({"routine": routine_modules} if routine_modules else {}),
                 **({"hypotheses": hypotheses} if hypotheses else {}),
@@ -1707,14 +1772,70 @@ def audit(args):
     return audit_batch(args.package, [args])[0]
 
 
+def run_batch_cli(args):
+    """Execute `--batch SPEC.json` via `audit_batch` and write per-claim receipts."""
+    raw = json.loads(args.batch.read_text(encoding="utf-8-sig"))
+    if isinstance(raw, list):
+        defaults, items = {}, raw
+    elif isinstance(raw, dict) and isinstance(raw.get("claims"), list):
+        defaults, items = dict(raw.get("defaults") or {}), raw["claims"]
+    else:
+        raise ValueError("--batch JSON must be a list of claim specs or an object with a 'claims' list")
+    if not items:
+        return []
+    specs = []
+    outputs = []
+    seen_outputs = set()
+    for idx, entry in enumerate(items):
+        if not isinstance(entry, dict):
+            raise ValueError(f"--batch entry #{idx + 1} must be a JSON object")
+        merged = {**defaults, **entry}
+        if args.statement_only:
+            merged["statement_only"] = True
+        if args.statements and not merged.get("statements"):
+            merged["statements"] = list(args.statements)
+        if args.routine and not merged.get("routine"):
+            merged["routine"] = list(args.routine)
+        if args.target and not merged.get("target"):
+            merged["target"] = list(args.target)
+        out_raw = merged.pop("output", None)
+        out_path = Path(out_raw) if out_raw else None
+        if out_path is not None:
+            resolved_out = out_path.resolve()
+            if out_path.exists():
+                raise FileExistsError(f"Refusing to overwrite existing evidence file: {out_path}")
+            if resolved_out in seen_outputs:
+                raise ValueError(f"Duplicate --batch output path: {out_path}")
+            seen_outputs.add(resolved_out)
+        outputs.append(out_path)
+        specs.append(merged)
+    receipts = audit_batch(args.package, specs)
+    if any(p is not None for p in outputs):
+        written = []
+        for out_path, rec in zip(outputs, receipts):
+            if out_path is not None:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with out_path.open("x", encoding="utf-8") as handle:
+                    handle.write(json.dumps(rec, indent=2) + "\n")
+                written.append({"expected": rec["expected"], "output": str(out_path)})
+            else:
+                written.append(rec)
+        return written
+    return receipts
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package", type=Path)
-    parser.add_argument("contract", help="File importing the target and defining the expected proposition")
-    parser.add_argument("expected", help="Name of the independent proposition")
+    parser.add_argument("contract", nargs="?", help="File importing the target and defining the expected proposition")
+    parser.add_argument("expected", nargs="?", help="Name of the independent proposition")
     parser.add_argument("declaration", nargs="?", help="Name of the proof to check (omit with --statement-only)")
     parser.add_argument("--statement-only", action="store_true",
                         help="Audit only the expected proposition, definitions, defaults and optional --witness without checking a proof")
+    parser.add_argument("--print-witness-type", action="store_true",
+                        help="Print the exact derived Lean proposition required by --witness for the expected statement")
+    parser.add_argument("--batch", type=Path,
+                        help="JSON file listing multiple claim audit specs to run in a single batched Lake invocation")
     parser.add_argument("--target", action="append", default=[], help="Build this proof module before checking its independent contract")
     parser.add_argument("--statements", action="append", default=[],
                         help="Directory or file holding the paper's statements and definitions; they may not import proof modules")
@@ -1728,14 +1849,27 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, help="New evidence file to create on success")
     args = parser.parse_args()
     try:
-        if args.output and args.output.exists():
-            raise FileExistsError(f"Refusing to overwrite existing evidence file: {args.output}")
-        data = json.dumps(audit(args), indent=2)+"\n"
-        if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            with args.output.open("x", encoding="utf-8") as out:
-                out.write(data)
+        if args.batch:
+            if args.print_witness_type:
+                raise ValueError("--batch cannot be combined with --print-witness-type")
+            result = run_batch_cli(args)
+            print(json.dumps(result, indent=2))
+        elif args.print_witness_type:
+            if not args.contract or not args.expected:
+                raise ValueError("--print-witness-type requires contract and expected proposition")
+            prop = print_witness_type(args.package, args.contract, args.expected, targets=args.target)
+            print(prop)
         else:
-            print(data, end="")
+            if not args.contract or not args.expected:
+                raise ValueError("Supply contract and expected proposition, or pass --batch SPEC.json")
+            if args.output and args.output.exists():
+                raise FileExistsError(f"Refusing to overwrite existing evidence file: {args.output}")
+            data = json.dumps(audit(args), indent=2)+"\n"
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                with args.output.open("x", encoding="utf-8") as out:
+                    out.write(data)
+            else:
+                print(data, end="")
     except (OSError, RuntimeError, ValueError) as exc:
         sys.exit(str(exc))

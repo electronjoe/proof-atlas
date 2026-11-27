@@ -112,6 +112,73 @@ def ordered_sources(files, main):
     return order, texts, includes
 
 
+def _read_braced(text, pos):
+    """Read one balanced `{...}` group starting at `pos` (after skipping whitespace)."""
+    n = len(text)
+    while pos < n and text[pos].isspace():
+        pos += 1
+    if pos >= n or text[pos] != "{":
+        return None, pos
+    depth = 0
+    start = pos + 1
+    i = pos
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i], i + 1
+        i += 1
+    return None, pos
+
+
+def _strip_tex_formatting(title):
+    """Unwrap simple LaTeX formatting wrappers like `\\textbf{Theorem}` into plain text."""
+    text = title.strip()
+    wrapper = re.compile(
+        r"\\(?:textbf|textit|textnormal|textrm|textsc|textsf|texttt|emph|mathbf|mathrm)\s*\{"
+    )
+    for _ in range(8):
+        m = wrapper.search(text)
+        if not m:
+            break
+        inner, end = _read_braced(text, m.end() - 1)
+        if inner is None:
+            break
+        text = text[:m.start()] + inner + text[end:]
+    text = re.sub(r"\\(?:bfseries|itshape|rmfamily|scshape|sffamily|ttfamily|normalfont)\b\s*", "", text)
+    text = text.replace("{", "").replace("}", "")
+    return " ".join(text.split())
+
+
+def parse_newtheorems(text):
+    """Extract `(env_name, printed_title, canonical_kind)` tuples from `\\newtheorem` declarations."""
+    results = []
+    for match in re.finditer(r"\\newtheorem\*?", text):
+        pos = match.end()
+        env, pos = _read_braced(text, pos)
+        if not env or not re.fullmatch(r"[\w*-]+", env.strip()):
+            continue
+        env = env.strip()
+        # Optional [numbered_like] argument before the printed title.
+        opt = re.match(r"\s*\[[^\]]*\]", text[pos:])
+        if opt:
+            pos += opt.end()
+        raw_title, pos = _read_braced(text, pos)
+        if raw_title is None:
+            continue
+        printed = _strip_tex_formatting(raw_title)
+        canonical = printed.lower()
+        if canonical in KINDS:
+            results.append((env, printed, canonical))
+    return results
+
+
 def pdf_pages(path):
     tool = shutil.which("pdftotext")
     if tool:
@@ -121,6 +188,12 @@ def pdf_pages(path):
     try:
         import fitz
     except ImportError:
+        print(
+            "Warning: neither 'pdftotext' (poppler-utils) nor PyMuPDF ('fitz') is installed; "
+            "skipping automatic PDF page matching. Install poppler-utils or python3-fitz "
+            "(and python3-pil for Folio figure cropping).",
+            file=sys.stderr,
+        )
         return []
     with fitz.open(path) as doc:
         return [page.get_text() for page in doc]
@@ -179,7 +252,7 @@ def prepare(args, root):
         raise ValueError("Cannot read title; supply --title")
     edition = paper + version
     dest = root / "manuscript"
-    dest.mkdir()
+    dest.mkdir(exist_ok=True)
     def record_file(name, data):
         path = dest / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,10 +267,12 @@ def prepare(args, root):
     files = source_files(archive)
     order, texts, includes = ordered_sources(files, args.main)
     names = {k: k.title() for k in KINDS}
+    env_kinds = {}
     for name in order:
-        for env, printed in re.findall(r"\\newtheorem\*?\{([\w*-]+)\}(?:\[[^\]]+\])?\{([^{}]+)\}", texts[name]):
-            if printed.strip().lower() in KINDS:
-                names[env] = printed.strip()
+        for env, printed, canonical in parse_newtheorems(texts[name]):
+            names[env] = printed
+            if env.casefold() != canonical:
+                env_kinds[env] = canonical
     per_file, sources = {}, []
     for name in order:
         info = record_file("tex/" + name, files[name])
@@ -220,11 +295,14 @@ def prepare(args, root):
     save(root/"import-review.json", dict(candidate_dependencies=candidates,
          unmatched_pages=[c["id"] for c in claims if c["id"] not in notes],
          source_order_to_review=order, unvisited_tex=sorted(set(files)-set(order))))
-    save(root/"project.json", dict(schema_version=1, title=" ".join(title.split()),
+    project_doc = dict(schema_version=1, title=" ".join(title.split()),
          authors=args.author or parser.authors, citation_details=args.citation_details or parser.year,
          edition="arXiv:"+edition, revision=edition, publication="https://arxiv.org/abs/"+edition,
          tex=sources, pdf=pdf_info, source_archive=archive_info, environments=sorted(names),
-         claim_order=[c["id"] for c in claims], hosting={"decision":"pending"}, reader="reader.json", work={}))
+         claim_order=[c["id"] for c in claims], hosting={"decision":"pending"}, reader="reader.json", work={})
+    if env_kinds:
+        project_doc["environment_kinds"] = env_kinds
+    save(root/"project.json", project_doc)
     build(root)
     print(f"{len(notes)}/{len(claims)} unique PDF headings; {len(candidates)} dependency candidates.")
 
@@ -239,16 +317,24 @@ def main():
     parser.add_argument("--citation-details", help="Publication details following the edition, such as its date")
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--pdf", type=Path)
+    parser.add_argument("--init-existing", action="store_true",
+                        help="Initialize Proof Atlas inside an existing directory (fails if project.json already exists)")
     args = parser.parse_args()
     target = args.project.resolve()
-    if target.exists():
-        parser.error("Choose a new directory; resume existing projects with preview.py")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
-        stage = Path(tmp)/"project"
-        stage.mkdir()
-        prepare(args, stage)
-        stage.rename(target)
+    if args.init_existing:
+        if (target / "project.json").exists():
+            parser.error("project.json already exists; resume existing projects with preview.py")
+        target.mkdir(parents=True, exist_ok=True)
+        prepare(args, target)
+    else:
+        if target.exists():
+            parser.error("Choose a new directory (or pass --init-existing); resume existing projects with preview.py")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
+            stage = Path(tmp)/"project"
+            stage.mkdir()
+            prepare(args, stage)
+            stage.rename(target)
     print(f"Explorer: {target/'dist/proofs/index.html'}\nDashboard: {target/'dist/progress.html'}")
     print("Hosting decision pending. Ask the author where to host this paper's explorer and dashboard.")
 

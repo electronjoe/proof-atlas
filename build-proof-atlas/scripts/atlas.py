@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 NO_EXAMPLE = "No checked example shows the hypotheses can hold"
-HEADLINE_KINDS = frozenset({"theorem", "corollary", "proposition"})
+HEADLINE_KINDS = frozenset({"theorem", "thm", "corollary", "cor", "coro", "proposition", "prop", "main"})
 MANIFEST_EDIT_KEY = "manifest-verification-scope"
 PROOF_BASES = frozenset({"paper", "lean", "aligned", "supplied"})
 LEAN_CI_LEVELS = frozenset({"standard", "paranoid"})
@@ -65,9 +65,24 @@ def paper_citation(project):
     return ". ".join(filter(None, (authors, title, edition))) + "."
 
 
+def _default_file_mode():
+    """Return `0o666 & ~umask` without mutating process umask when `/proc/self/status` is readable."""
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="ascii").splitlines():
+            if line.startswith("Umask:"):
+                return 0o666 & ~int(line.split(":", 1)[1].strip(), 8)
+    except (OSError, ValueError):
+        pass
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
 def atomic(path, data):
+    mode = _default_file_mode()
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temp:
         temp.write(data)
+    os.chmod(temp.name, mode)
     os.replace(temp.name, path)
 
 
@@ -104,6 +119,18 @@ def inventory(text, filename, envs):
         proof = re.match(r"\s*\\begin\{proof\}.*?\\end\{proof\}", clean[stop:], re.S)
         if proof:
             stop += proof.end()
+        else:
+            # Allow a brief intervening commentary paragraph when the following proof explicitly cites this label.
+            tail = clean[stop:]
+            next_proof = re.search(r"\\begin\{proof\}(.*?)\\end\{proof\}", tail, re.S)
+            if next_proof and next_proof.start() <= 1200:
+                between = tail[:next_proof.start()]
+                env_guard = re.search(r"\\(?:section|subsection|subsubsection|chapter|appendix)\b|\\begin\{(?:" + names + r")\}", between)
+                ref_pat = re.compile(r"\\(?:ref|cref|Cref|autoref)\{\s*" + re.escape(bind[1]) + r"\s*\}")
+                proof_head = next_proof.group(1)[:200]
+                if not env_guard and ref_pat.search(proof_head):
+                    proof = next_proof
+                    stop += next_proof.end()
         title = re.sub(r"\s*\\cite\{[^}]+\}", "", title or bind[1])
         yield dict(id=bind[1], kind=kind, title=title, file=filename, line=line,
                    excerpt=text[start.start():stop], adjacent_proof=bool(proof))
@@ -351,9 +378,10 @@ def witness_plan(project, work, witness):
     return plan
 
 
-def claim_tier(claim, note=None, work=None):
+def claim_tier(claim, note=None, work=None, env_kinds=None):
     """Classify a manuscript claim as headline, supporting, or conjecture."""
-    if claim["kind"].casefold() == "conjecture":
+    canonical = (env_kinds or {}).get(claim["kind"], claim["kind"]).casefold()
+    if canonical == "conjecture":
         return "conjecture"
     explicit = None
     if isinstance(work, dict) and "headline" in work:
@@ -364,13 +392,40 @@ def claim_tier(claim, note=None, work=None):
         if type(explicit) is not bool:
             raise ValueError(f"{claim['id']}: headline must be a boolean")
         return "headline" if explicit else "supporting"
-    return "headline" if claim["kind"].casefold() in HEADLINE_KINDS else "supporting"
+    return "headline" if canonical in HEADLINE_KINDS else "supporting"
+
+
+def resolve_detached_proof(root, note):
+    """Resolve optional detached/companion proof location and excerpt from a reader.json claim note."""
+    if not isinstance(note, dict):
+        return None, None
+    loc = note.get("proof_location") or note.get("proof_origin") or None
+    excerpt = note.get("proof_excerpt")
+    src = note.get("proof_source")
+    if not excerpt and isinstance(src, dict) and src.get("path"):
+        path = local(root, src["path"])
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        line_range = src.get("lines")
+        if isinstance(line_range, list) and len(line_range) == 2:
+            start, stop = int(line_range[0]), int(line_range[1])
+            if start < 1 or stop < start or stop > len(lines):
+                raise ValueError(f"{src['path']}: invalid proof_source line range {line_range}")
+            excerpt = "\n".join(lines[start - 1:stop])
+            if not loc:
+                loc = f"{src['path']} L{start}–{stop}"
+        else:
+            excerpt = "\n".join(lines)
+            if not loc:
+                loc = src["path"]
+    return loc, excerpt
 
 
 def claim_resolution(checked, is_conditional, disputed, has_parts):
     """Return the multi-resolution verification state of a claim."""
     if checked and not disputed:
         return "unconditionally_closed"
+    if checked and disputed:
+        return "closed_with_difference"
     if is_conditional and not disputed:
         return "conditional"
     if has_parts:
@@ -1005,6 +1060,7 @@ def _empty_bucket():
     return dict(
         total=0,
         unconditionally_closed=0,
+        closed_with_difference=0,
         conditional=0,
         subproofs_checked=0,
         open=0,
@@ -1203,14 +1259,17 @@ def build_refinement_backlog(project, records):
 def render_summary_table(summary, *, compact=False):
     """Render the headline vs. supporting vs. conjectures multi-resolution table."""
     show_supplied = any(b["supplied_proof"] for b in summary.values())
+    show_closed_diff = any(b["closed_with_difference"] for b in summary.values())
 
     def row(label, b, extra_cls=""):
         cls = f' class="{extra_cls}"' if extra_cls else ""
+        closed_diff_td = f"<td>{b['closed_with_difference']}</td>" if show_closed_diff else ""
         supplied_td = f"<td>{b['supplied_proof']}</td>" if show_supplied else ""
         return (
             f"<tr{cls}><th scope=\"row\">{esc(label)}</th>"
             f"<td>{b['total']}</td>"
             f"<td>{b['unconditionally_closed']}</td>"
+            f"{closed_diff_td}"
             f"{supplied_td}"
             f"<td>{b['conditional']}</td>"
             f"<td>{b['subproofs_checked']}</td>"
@@ -1230,12 +1289,13 @@ def render_summary_table(summary, *, compact=False):
         rows.append(row("Conjectures (separate)", summary["conjectures"], "summary-conjecture"))
     caption = ("Verification breakdown by claim tier" if not compact
                else "Headline vs. supporting verification summary")
+    closed_diff_th = "<th>Closed (with difference)</th>" if show_closed_diff else ""
     supplied_th = "<th>Supplied proof</th>" if show_supplied else ""
     return (
         '<div class="summary-table">'
         f'<table><caption>{esc(caption)}</caption>'
         '<thead><tr><th>Category</th><th>Total</th><th>Unconditionally closed</th>'
-        f'{supplied_th}<th>Conditional</th><th>Subproofs checked</th><th>Open</th>'
+        f'{closed_diff_th}{supplied_th}<th>Conditional</th><th>Subproofs checked</th><th>Open</th>'
         '<th>Witness</th><th>Needs confirmation</th><th>CI verified</th><th>Author reviewed</th></tr></thead>'
         '<tbody>' + "".join(rows) + '</tbody></table></div>'
     )
@@ -1334,9 +1394,14 @@ def _collect_claim_states(root, project, claims, *, ci=None):
         cid = c["id"]
         w = work.get(cid, {})
         m = notes.get(cid, {})
-        tier = claim_tier(c, m, w)
+        tier = claim_tier(c, m, w, env_kinds=project.get("environment_kinds"))
         basis = claim_basis(cid, m, w)
         entry = {**c, **m, **w}
+        proof_loc, proof_exc = resolve_detached_proof(root, m)
+        if proof_loc:
+            entry["proof_location"] = proof_loc
+        if proof_exc:
+            entry["proof_excerpt"] = proof_exc
         entry.setdefault("reference", c["kind"].title())
         entry["tier"] = tier
         entry["headline"] = tier == "headline"
@@ -1491,6 +1556,9 @@ def _latex_escape(text):
         "≤": r"$\le$",
         "≥": r"$\ge$",
         "≠": r"$\neq$",
+        "≈": r"$\approx$",
+        "≜": r"$\triangleq$",
+        "±": r"$\pm$",
         "→": r"$\to$",
         "←": r"$\leftarrow$",
         "↔": r"$\leftrightarrow$",
@@ -1502,13 +1570,31 @@ def _latex_escape(text):
         "∈": r"$\in$",
         "∉": r"$\notin$",
         "⊆": r"$\subseteq$",
+        "∅": r"$\emptyset$",
         "×": r"$\times$",
         "·": r"$\cdot$",
         "∞": r"$\infty$",
+        "∑": r"$\sum$",
+        "∫": r"$\int$",
+        "‖": r"$\|$",
+        "⟨": r"$\langle$",
+        "⟩": r"$\rangle$",
+        "′": "'",
         "ℝ": r"$\mathbb{R}$",
         "ℕ": r"$\mathbb{N}$",
         "ℤ": r"$\mathbb{Z}$",
         "ℚ": r"$\mathbb{Q}$",
+        "α": r"$\alpha$", "β": r"$\beta$", "γ": r"$\gamma$", "δ": r"$\delta$",
+        "ε": r"$\varepsilon$", "ϵ": r"$\epsilon$", "ζ": r"$\zeta$", "η": r"$\eta$",
+        "θ": r"$\theta$", "ϑ": r"$\vartheta$", "ι": r"$\iota$", "κ": r"$\kappa$",
+        "λ": r"$\lambda$", "μ": r"$\mu$", "ν": r"$\nu$", "ξ": r"$\xi$",
+        "π": r"$\pi$", "ϖ": r"$\varpi$", "ρ": r"$\rho$", "ϱ": r"$\varrho$",
+        "σ": r"$\sigma$", "ς": r"$\varsigma$", "τ": r"$\tau$", "υ": r"$\upsilon$",
+        "φ": r"$\varphi$", "ϕ": r"$\phi$", "χ": r"$\chi$", "ψ": r"$\psi$",
+        "ω": r"$\omega$",
+        "Γ": r"$\Gamma$", "Δ": r"$\Delta$", "Θ": r"$\Theta$", "Λ": r"$\Lambda$",
+        "Ξ": r"$\Xi$", "Π": r"$\Pi$", "Σ": r"$\Sigma$", "Υ": r"$\Upsilon$",
+        "Φ": r"$\Phi$", "Ψ": r"$\Psi$", "Ω": r"$\Omega$",
         "−": "-",
         "–": "--",
         "—": "---",
@@ -1688,12 +1774,20 @@ def _collect_scope_caveats(records):
                 assumes=rec["assumed_items"],
             ))
         if rd.get("noncomputable_constants"):
+            algo_re = re.compile(r"\b(?:algorithm|algorithmic|computab\w*|runtime|complexity|explicit construction|polynomial[- ]time|decidable)\b", re.I)
+            has_algo_conflict = any(
+                row.get("kind") == "weaker conclusion"
+                or (row.get("kind") not in (None, "agrees")
+                    and algo_re.search(" ".join(str(row.get(k, "")) for k in ("case", "paper", "lean", "why"))))
+                for row in analysis.get("cases", [])
+            )
             caveats.append(dict(
                 claim=cid,
                 reference=ref,
                 tier=tier,
                 kind="noncomputable",
                 constants=list(rd["noncomputable_constants"]),
+                has_algorithmic_conflict=has_algo_conflict,
             ))
         if rd.get("author_scope"):
             caveats.append(dict(
@@ -1724,6 +1818,8 @@ def _render_manifest_latex(project, summary, caveats, backlog, pinned):
 
     def state_phrase(b, noun):
         parts = [f"{b['unconditionally_closed']}/{b['total']} {noun} unconditionally closed"]
+        if b["closed_with_difference"]:
+            parts.append(f"{b['closed_with_difference']} closed with recorded difference")
         if b["conditional"]:
             parts.append(f"{b['conditional']} conditional")
         if b["subproofs_checked"]:
@@ -1807,8 +1903,14 @@ def _render_manifest_latex(project, summary, caveats, backlog, pinned):
             deps = ", ".join(_latex_escape(d["reference"]) for d in cav["assumes"])
             caveat_bits.append(f"{ref} (conditional on {deps})")
         elif kind == "noncomputable":
-            names = ", ".join(f"\\texttt{{{_latex_escape(n)}}}" for n in cav["constants"])
-            caveat_bits.append(f"{ref} (noncomputable: {names})")
+            if cav.get("has_algorithmic_conflict"):
+                names = ", ".join(f"\\texttt{{{_latex_escape(n)}}}" for n in cav["constants"])
+                caveat_bits.append(f"{ref} (noncomputable: {names})")
+            else:
+                n = len(cav["constants"])
+                caveat_bits.append(
+                    f"{ref} (uses classical real/measure definitions: {n} noncomputable constant{'s' if n != 1 else ''})"
+                )
         elif kind == "author_scope":
             caveat_bits.append(f"{ref} (author scope note: {_latex_escape(cav['note'])})")
         elif kind == "stronger_result":
@@ -1906,19 +2008,23 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
         )
 
     show_supplied = any(b["supplied_proof"] for b in summary.values())
+    show_closed_diff = any(b["closed_with_difference"] for b in summary.values())
     lines.extend(["", "## Verification Summary", ""])
+    hdr = ["Category", "Total", "Unconditionally closed"]
+    if show_closed_diff:
+        hdr.append("Closed (with difference)")
+    hdr.extend(["Conditional", "Subproofs checked"])
     if show_supplied:
-        lines.append("| Category | Total | Unconditionally closed | Conditional | Subproofs checked | Lean-supplied proof | Open | With witness | Needs confirmation | Machine verified (CI) | Author reviewed |")
-        lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
-    else:
-        lines.append("| Category | Total | Unconditionally closed | Conditional | Subproofs checked | Open | With witness | Needs confirmation | Machine verified (CI) | Author reviewed |")
-        lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+        hdr.append("Lean-supplied proof")
+    hdr.extend(["Open", "With witness", "Needs confirmation", "Machine verified (CI)", "Author reviewed"])
+    lines.append("| " + " | ".join(hdr) + " |")
+    lines.append("| :--- | " + " | ".join([":---:"] * (len(hdr) - 1)) + " |")
 
     def md_row(label, b):
-        cols = [
-            label, str(b["total"]), str(b["unconditionally_closed"]), str(b["conditional"]),
-            str(b["subproofs_checked"]),
-        ]
+        cols = [label, str(b["total"]), str(b["unconditionally_closed"])]
+        if show_closed_diff:
+            cols.append(str(b["closed_with_difference"]))
+        cols.extend([str(b["conditional"]), str(b["subproofs_checked"])])
         if show_supplied:
             cols.append(str(b["supplied_proof"]))
         cols.extend([
@@ -1945,8 +2051,15 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
                 deps = ", ".join(f"{a['reference']} (`{a['expected']}`)" for a in cav["assumes"])
                 lines.append(f"- {ref} — **Conditional**: assumes unproved prerequisite(s): {deps}.")
             elif kind == "noncomputable":
-                names = ", ".join(f"`{n}`" for n in cav["constants"])
-                lines.append(f"- {ref} — **`noncomputable` statement definitions**: {names}. Verify whether any explicit/algorithmic claim is affected.")
+                if cav.get("has_algorithmic_conflict") or len(cav["constants"]) <= 3:
+                    names = ", ".join(f"`{n}`" for n in cav["constants"])
+                    lines.append(f"- {ref} — **`noncomputable` statement definitions**: {names}. Verify whether any explicit/algorithmic claim is affected.")
+                else:
+                    preview = ", ".join(f"`{n}`" for n in cav["constants"][:3])
+                    lines.append(
+                        f"- {ref} — **Classical `noncomputable` definitions** ({len(cav['constants'])} constants, incl. {preview}, …; "
+                        "no algorithmic/computability conflict flagged)."
+                    )
             elif kind == "author_scope":
                 lines.append(f"- {ref} — **Author scope note**: {cav['note']}")
             elif kind == "stronger_result":
@@ -2032,6 +2145,7 @@ def _render_manifest_markdown(project, records, summary, caveats, backlog, pinne
     ])
     state_labels = {
         "unconditionally_closed": "Unconditionally closed",
+        "closed_with_difference": "Closed (with difference)",
         "conditional": "Conditional",
         "subproofs_checked": "Subproofs checked",
         "open": "Open",
@@ -2307,6 +2421,15 @@ def review_work(root, labels=(), *, require_ci=False, ci_receipt=None):
             report["agent_tasks"].append(dict(claim=item["claim"], edit=key, next="Prepare the requested manuscript draft."))
     report["summary"] = summarize_records(selected_records)
     report["refinement_backlog"] = build_refinement_backlog(project, selected_records)
+    materials = json.loads(local(root, project["reader"]).read_text(encoding="utf-8-sig")) if project.get("reader") else {}
+    reader_warnings = _lint_reader_prose(
+        [rec["claim"] for rec in selected_records],
+        materials.get("claims", {}),
+        work=project.get("work", {}),
+        env_kinds=project.get("environment_kinds"),
+    )
+    if reader_warnings:
+        report["reader_warnings"] = reader_warnings
     return report
 
 
@@ -2588,6 +2711,7 @@ def assemble(root, *, package=None, run_audit=False):
             atomic(pkg_root / contract_rel, contract_text.encode("utf-8"))
             ev_dir = root / "evidence"
             ev_dir.mkdir(exist_ok=True)
+            batch_specs = []
             for item in claim_reports:
                 cid = item["claim"]
                 spec = specs[cid]
@@ -2608,7 +2732,7 @@ def assemble(root, *, package=None, run_audit=False):
                             for s in resolved_sm["steps"]
                         ],
                     )
-                audit_data = audit_lean.audit(SimpleNamespace(
+                batch_specs.append(SimpleNamespace(
                     package=pkg_root,
                     contract=contract_rel,
                     expected=item["expected"],
@@ -2621,6 +2745,9 @@ def assemble(root, *, package=None, run_audit=False):
                     step_map=step_map_arg,
                     statement_only=False,
                 ))
+            batch_results = audit_lean.audit_batch(pkg_root, batch_specs)
+            for item, audit_data in zip(claim_reports, batch_results):
+                cid = item["claim"]
                 ev_rel = f"evidence/assembly-{ident_by_cid[cid]}.json"
                 atomic(root / ev_rel, (json.dumps(audit_data, indent=2) + "\n").encode("utf-8"))
                 w = p.setdefault("work", {}).setdefault(cid, {})
@@ -2676,6 +2803,54 @@ def _parse_local_imports_from_source(pkg_root, rel_path):
     return mods
 
 
+def _lint_reader_prose(claims, notes, work=None, env_kinds=None):
+    """Return non-fatal reader prose warnings: missing `sketch` on headline claims and raw ASCII math."""
+    warnings = []
+    work = work or {}
+    # Strip KaTeX math ($...$, $$...$$) and inline code (`...`) before scanning for raw ASCII math.
+    strip_re = re.compile(r"\$\$[\s\S]+?\$\$|\$[^$\n]+?\$|`[^`\n]+?`")
+    ascii_math_re = re.compile(r"(?:\b[A-Za-z][A-Za-z0-9]*_(?:[A-Za-z0-9]+|\{[^}]+\})(?:\^(?:[A-Za-z0-9*]+|\{[^}]+\}))?|\b[A-Za-z][A-Za-z0-9]*\^(?:\{[^}]+\}|[A-Za-z0-9*]+))")
+    for c in claims:
+        cid = c["id"]
+        note = notes.get(cid) or {}
+        w = work.get(cid) or {}
+        tier = claim_tier(c, note, w, env_kinds=env_kinds)
+        summary = (note.get("summary") or "").strip()
+        sketch = (note.get("sketch") or "").strip()
+        if tier == "headline" and summary and not sketch:
+            warnings.append(dict(
+                claim=cid,
+                kind="missing_sketch",
+                message=f"{cid}: headline claim has a 'summary' in reader.json but no 'sketch' (Plain English view will show placeholder text).",
+            ))
+        for field_name, text in (("summary", summary), ("sketch", sketch)):
+            if not text:
+                continue
+            plain = strip_re.sub(" ", text)
+            tokens = []
+            for m in ascii_math_re.finditer(plain):
+                tok = m.group(0)
+                # Ignore URLs and ordinary snake_case words longer than typical math symbols if no superscript/braces.
+                if "://" in plain[max(0, m.start() - 10):m.end()]:
+                    continue
+                if "_" in tok and "^" not in tok and "{" not in tok:
+                    left, right = tok.split("_", 1)
+                    if len(left) > 6 and len(right) > 3 and right.islower() and left.islower():
+                        continue
+                if tok not in tokens:
+                    tokens.append(tok)
+            if tokens:
+                preview = ", ".join(tokens[:4])
+                warnings.append(dict(
+                    claim=cid,
+                    kind="raw_ascii_math",
+                    field=field_name,
+                    tokens=tokens[:8],
+                    message=f"{cid}: reader.json '{field_name}' contains unescaped ASCII math ({preview}); wrap math in KaTeX $...$ delimiters.",
+                ))
+    return warnings
+
+
 def _lakefile_has_libs(pkg_root, names):
     """Return True if lakefile.toml declares every named [[lean_lib]]."""
     toml_path = pkg_root / "lakefile.toml"
@@ -2690,7 +2865,25 @@ def _lakefile_has_libs(pkg_root, names):
     return set(names) <= declared
 
 
-def generate_challenge_harness(root, *, package=None, write=True, check_only=False):
+def _configure_challenge_lakefile(pkg_root, names=("Challenge", "Solution")):
+    """Append missing [[lean_lib]] stanzas for Challenge/Solution to lakefile.toml. Returns added names."""
+    toml_path = pkg_root / "lakefile.toml"
+    if not toml_path.is_file():
+        raise ValueError(f"{pkg_root.name}: --configure-lakefile requires lakefile.toml")
+    import tomllib
+    raw = toml_path.read_text(encoding="utf-8-sig")
+    config = tomllib.loads(raw)
+    declared = {lib.get("name") for lib in config.get("lean_lib", []) if isinstance(lib, dict)}
+    missing = [name for name in names if name not in declared]
+    if not missing:
+        return []
+    blocks = "".join(f'\n[[lean_lib]]\nname = "{name}"\n' for name in missing)
+    updated = raw.rstrip("\n") + "\n" + blocks
+    atomic(toml_path, updated.encode("utf-8"))
+    return missing
+
+
+def generate_challenge_harness(root, *, package=None, write=True, check_only=False, configure_lakefile=False):
     """Mechanically generate hash-locked Challenge.lean and Solution.lean for closed claims.
 
     Challenge.lean imports ONLY isolated Statements/ modules (verified free of `sorry` and
@@ -2875,6 +3068,24 @@ def generate_challenge_harness(root, *, package=None, write=True, check_only=Fal
             atomic(challenge_path, challenge_bytes)
             atomic(solution_path, solution_bytes)
 
+        added_libs = []
+        if configure_lakefile and not check_only:
+            added_libs = _configure_challenge_lakefile(pkg_root)
+            if added_libs:
+                print(
+                    f"Added [[lean_lib]] {', '.join(added_libs)} to {(Path(pkg) / 'lakefile.toml').as_posix()}. "
+                    "Re-run `atlas.py assemble <project> --audit` so checked_inputs hashes reflect the updated lakefile.toml.",
+                    file=sys.stderr,
+                )
+        lakefile_ok = _lakefile_has_libs(pkg_root, ("Challenge", "Solution"))
+        if not lakefile_ok and not check_only:
+            print(
+                f"Warning: {(Path(pkg) / 'lakefile.toml').as_posix()} is missing [[lean_lib]] declarations for "
+                "Challenge and/or Solution; paranoid CI will downgrade to standalone elaboration without cross-environment "
+                ".olean comparison. Pass `--configure-lakefile` (then re-run `atlas.py assemble <project> --audit`) to add them.",
+                file=sys.stderr,
+            )
+
         report["packages"][pkg] = dict(
             challenge_file=(Path(pkg) / "Challenge.lean").as_posix(),
             solution_file=(Path(pkg) / "Solution.lean").as_posix(),
@@ -2886,13 +3097,320 @@ def generate_challenge_harness(root, *, package=None, write=True, check_only=Fal
             challenge_imports=sorted(challenge_imports),
             solution_imports=sorted(solution_imports),
             namespace="ProofAtlasChallenge",
-            lakefile_configured=_lakefile_has_libs(pkg_root, ("Challenge", "Solution")),
+            lakefile_configured=lakefile_ok,
+            **({"lakefile_libs_added": added_libs} if added_libs else {}),
             targets=targets_meta,
             _challenge_bytes=challenge_bytes,
             _solution_bytes=solution_bytes,
         )
 
     return report
+
+
+def init_project(root, *, tex_paths, pdf_path, title, edition="", publication="",
+                 authors=(), citation_details="", environments=(), force=False):
+    """Bootstrap project.json, reader.json, and import-review.json in place inside an existing repo."""
+    import import_arxiv
+
+    root = Path(root).resolve()
+    if not root.is_dir():
+        raise ValueError(f"Project directory does not exist: {root}")
+    project_file = root / "project.json"
+    if project_file.exists() and not force:
+        raise ValueError("project.json already exists; pass --force to overwrite or resume with preview.py")
+    if not tex_paths:
+        raise ValueError("Supply at least one --tex source path relative to the project")
+    if not pdf_path:
+        raise ValueError("Supply a --pdf path relative to the project")
+    if not title or not title.strip():
+        raise ValueError("Supply --title for the manuscript")
+
+    pdf_abs = local(root, pdf_path)
+    if not pdf_abs.is_file():
+        raise ValueError(f"PDF file not found: {pdf_path}")
+    pdf_bytes = pdf_abs.read_bytes()
+    if not pdf_bytes.startswith(b"%PDF-"):
+        raise ValueError(f"File is not a valid PDF: {pdf_path}")
+    pdf_info = dict(path=pdf_abs.relative_to(root).as_posix(), sha256=hashlib.sha256(pdf_bytes).hexdigest())
+
+    sources = []
+    texts = {}
+    names = {k: k.title() for k in import_arxiv.KINDS}
+    env_kinds = {}
+    for raw_tex in tex_paths:
+        tex_abs = local(root, raw_tex)
+        if not tex_abs.is_file():
+            raise ValueError(f"TeX file not found: {raw_tex}")
+        raw_bytes = tex_abs.read_bytes()
+        rel = tex_abs.relative_to(root).as_posix()
+        sources.append(dict(path=rel, sha256=hashlib.sha256(raw_bytes).hexdigest()))
+        decoded = raw_bytes.decode("utf-8-sig")
+        texts[rel] = decoded
+        for env, printed, canonical in import_arxiv.parse_newtheorems(import_arxiv.active(decoded)):
+            names[env] = printed
+            if env.casefold() != canonical:
+                env_kinds[env] = canonical
+    for extra_env in environments:
+        if extra_env and extra_env not in names:
+            names[extra_env] = extra_env.title()
+
+    claims = []
+    for src in sources:
+        claims.extend(inventory(texts[src["path"]], src["path"], sorted(names)))
+    if not claims:
+        raise ValueError("No labeled theorem-like environments found; supply custom --env names or check \\label{...} tags")
+
+    pages = import_arxiv.pdf_pages(pdf_abs)
+    notes, candidates = import_arxiv.identify(claims, pages, names)
+    reader_doc = dict(schema_version=1, claims=notes, dependencies=[])
+    import_review = dict(
+        candidate_dependencies=candidates,
+        unmatched_pages=[c["id"] for c in claims if c["id"] not in notes],
+        source_order_to_review=[s["path"] for s in sources],
+        unvisited_tex=[],
+    )
+    project_doc = dict(
+        schema_version=1,
+        title=" ".join(title.split()),
+        authors=list(authors),
+        citation_details=citation_details or "",
+        edition=edition or "Local manuscript",
+        revision=pdf_info["sha256"][:12],
+        tex=sources,
+        pdf=pdf_info,
+        environments=sorted(names),
+        claim_order=[c["id"] for c in claims],
+        hosting={"decision": "pending"},
+        reader="reader.json",
+        work={},
+    )
+    if publication:
+        project_doc["publication"] = publication
+    if env_kinds:
+        project_doc["environment_kinds"] = env_kinds
+
+    atomic(root / "reader.json", (json.dumps(reader_doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    atomic(root / "import-review.json", (json.dumps(import_review, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    atomic(project_file, (json.dumps(project_doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    build(root)
+    return dict(
+        project=str(project_file),
+        claims=len(claims),
+        matched_pages=len(notes),
+        candidate_dependencies=len(candidates),
+        environments=sorted(names),
+        environment_kinds=env_kinds,
+    )
+
+
+def generate_handoff(root, *, write=False):
+    """Deterministically build a context-budget handoff brief and copy-paste `/clear` resume prompt."""
+    import subprocess
+
+    root = Path(root).resolve()
+    project = json.loads((root / "project.json").read_text(encoding="utf-8-sig"))
+    rw = review_work(root)
+    summary = rw["summary"]
+    all_res = summary["all_results"]
+    head_res = summary["headline"]
+    profile = rw["profile"]
+    ci_lvl = rw["lean_ci_level"]
+    hosting = project.get("hosting") or {}
+    claims = manuscript_claims(root, project)
+    by_id = {c["id"]: c for c in claims}
+    order = project.get("claim_order") or [c["id"] for c in claims]
+    materials = json.loads(local(root, project["reader"]).read_text(encoding="utf-8-sig")) if project.get("reader") else {}
+    notes = materials.get("claims", {})
+    work = project.get("work", {})
+
+    recent_commits = []
+    try:
+        log_out = subprocess.check_output(
+            ["git", "-c", "safe.directory=" + root.as_posix(), "log", "-n", "8", "--oneline"],
+            cwd=root, stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        if log_out:
+            recent_commits = log_out.splitlines()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    stmt_digests = {}
+    for cid in order:
+        w = work.get(cid, {})
+        for holder in (w.get("closure"), w.get("statement_check")):
+            if holder and holder.get("audit"):
+                try:
+                    rec = json.loads(local(root, holder["audit"]).read_bytes())
+                    sha = (rec.get("statement") or {}).get("sha256")
+                    if sha:
+                        stmt_digests[cid] = sha[:12]
+                        break
+                except (OSError, ValueError):
+                    pass
+
+    next_targets = []
+    for task in rw.get("agent_tasks", []):
+        next_targets.append(f"{task.get('claim', '?')}: {task.get('next', '')}")
+    for cid in order:
+        w = work.get(cid, {})
+        st = w.get("status", "open")
+        if st not in ("closed",):
+            ref = _claim_ref_label(cid, by_id, notes)
+            step = w.get("next") or w.get("step") or f"Continue {st} claim"
+            entry = f"{ref} (`{cid}`, status=`{st}`): {step}"
+            if entry not in next_targets:
+                next_targets.append(entry)
+
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    status_line = (
+        f"Headline {head_res['unconditionally_closed']}/{head_res['total']} unconditionally closed"
+        + (f", {head_res['closed_with_difference']} closed with difference" if head_res["closed_with_difference"] else "")
+        + (f", {head_res['conditional']} conditional" if head_res["conditional"] else "")
+        + (f", {head_res['open']} open" if head_res["open"] else "")
+        + f" · All results {all_res['unconditionally_closed'] + all_res['closed_with_difference']}/{all_res['total']} proved"
+        + f" · Witnesses {all_res['with_witness']}/{all_res['total']}"
+        + f" · Profile `{profile}` · CI `{ci_lvl}`"
+    )
+
+    md_lines = [
+        f"# Handoff — {project['title']}",
+        "",
+        f"**Updated:** {now_utc}  ",
+        f"**Status:** {status_line}",
+        "",
+        "## Claim Status",
+        "",
+    ]
+    for cid in order:
+        w = work.get(cid, {})
+        ref = _claim_ref_label(cid, by_id, notes)
+        st = w.get("status", "open")
+        sha_bit = f" · `stmt:{stmt_digests[cid]}`" if cid in stmt_digests else ""
+        assumes_bit = f" · assumes `{', '.join(w['assumes'])}`" if w.get("assumes") else ""
+        dist_bit = " · distilled" if w.get("distilled") is True else ""
+        md_lines.append(f"- **{ref}** (`{cid}`): `{st}`{sha_bit}{assumes_bit}{dist_bit}")
+
+    if rw.get("author_questions"):
+        md_lines.extend(["", "## Author Questions (Non-Blocking unless Held)", ""])
+        for q in rw["author_questions"]:
+            md_lines.append(f"- `{q['claim']}`: {q.get('issue', '')} — *Next:* {q.get('next', '')}")
+
+    if next_targets:
+        md_lines.extend(["", "## Next Actions", ""])
+        for item in next_targets[:10]:
+            md_lines.append(f"- {item}")
+
+    if recent_commits:
+        md_lines.extend(["", "## Recent Commits", ""])
+        for ln in recent_commits:
+            md_lines.append(f"- `{ln}`")
+
+    scope_desc = proof_work_description(project, claims)
+    focus_label = project.get("focus") or (next_targets[0].split(":")[0] if next_targets else "final verification & release")
+    resume_prompt = (
+        f"Resume Proof Atlas formalization in `{root}` for *{project['title']}* ({project.get('edition', 'local')}). "
+        f"Read `HANDOFF.md`, `project.json`, and run `atlas.py review-work .` first. "
+        f"Authorized scope: {scope_desc} (profile: `{profile}`, lean_ci_level: `{ci_lvl}`). "
+        f"Current state: {status_line}. "
+        f"Standing invariants: DO NOT edit `Statements/` (preserve Gate-1 `statement.sha256` fingerprints); "
+        f"keep `Prelude.lean` narrow and `Routine/` isolated; commit atomically at each audited milestone; "
+        f"halt cleanly near ~40% context with refreshed `atlas.py build`, `atlas.py manifest`, and `atlas.py handoff . --write`. "
+        f"Immediate focus: {focus_label}."
+    )
+    md_lines.extend([
+        "",
+        "## Copy-Paste Resume Prompt (for `/clear` or Fresh Session)",
+        "",
+        "```text",
+        resume_prompt,
+        "```",
+        "",
+    ])
+    markdown = "\n".join(md_lines)
+    handoff_path = root / "HANDOFF.md"
+    if write:
+        atomic(handoff_path, markdown.encode("utf-8"))
+    return dict(
+        handoff_path=str(handoff_path),
+        written=bool(write),
+        status=status_line,
+        recent_commits=recent_commits,
+        next_actions=next_targets[:10],
+        resume_prompt=resume_prompt,
+        markdown=markdown,
+    )
+
+
+def release_check(root):
+    """Inspect repository front-door & archival release hygiene (README, LICENSE, CITATION.cff, VERIFICATION.md, tag)."""
+    import subprocess
+
+    root = Path(root).resolve()
+    project = json.loads((root / "project.json").read_text(encoding="utf-8-sig"))
+    hosting = project.get("hosting") or {}
+    checks = []
+
+    def add(key, ok, detail, *, required=True):
+        checks.append(dict(check=key, ok=bool(ok), required=bool(required), detail=detail))
+
+    readme_path = root / "README.md"
+    readme_text = readme_path.read_text(encoding="utf-8-sig") if readme_path.is_file() else ""
+    add("readme_exists", readme_path.is_file() and len(readme_text.strip()) > 0,
+        "Root README.md present" if readme_path.is_file() else "Missing root README.md")
+
+    site_url = hosting.get("site", "")
+    if site_url:
+        add("readme_atlas_url", site_url.rstrip("/") in readme_text,
+            f"README links live Proof Atlas URL ({site_url})" if site_url.rstrip("/") in readme_text
+            else f"README does not mention live Proof Atlas URL ({site_url})")
+
+    has_repro = bool(re.search(r"\blake\s+build\b", readme_text))
+    add("readme_repro_steps", has_repro,
+        "README documents `lake build` reproduction command" if has_repro
+        else "README missing exact `lake build` reproduction instructions")
+
+    has_ai_disclosure = bool(re.search(r"\b(ai[- ]assisted|ai use|ai disclosure|llm|language model|codex|claude|gemini|aristotle|copilot)\b", readme_text, re.I))
+    add("readme_ai_disclosure", has_ai_disclosure,
+        "README includes AI-use / model provenance disclosure" if has_ai_disclosure
+        else "README missing explicit AI-use / model provenance disclosure")
+
+    if hosting.get("lean_ci") == "enabled":
+        has_ci_badge = bool(re.search(r"verify-lean\.yml|actions/workflows|badge\.svg", readme_text, re.I))
+        add("readme_ci_badge", has_ci_badge,
+            "README references Lean CI workflow/badge" if has_ci_badge
+            else "README missing GitHub Actions Lean CI badge/link")
+
+    lic_ok = any((root / name).is_file() for name in ("LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING"))
+    add("license_file", lic_ok, "LICENSE file present" if lic_ok else "Missing root LICENSE file")
+
+    cit_ok = (root / "CITATION.cff").is_file()
+    add("citation_cff", cit_ok, "CITATION.cff present" if cit_ok else "Missing root CITATION.cff")
+
+    ver_ok = (root / "dist" / "VERIFICATION.md").is_file()
+    add("verification_manifest", ver_ok,
+        "dist/VERIFICATION.md present" if ver_ok else "Missing dist/VERIFICATION.md (run `atlas.py manifest .`)")
+
+    tags = []
+    if (root / ".git").exists():
+        try:
+            out = subprocess.check_output(
+                ["git", "-c", "safe.directory=" + root.as_posix(), "tag", "--points-at", "HEAD"],
+                cwd=root, stderr=subprocess.DEVNULL, text=True,
+            ).strip()
+            tags = [t for t in out.splitlines() if t]
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    add("release_tag", bool(tags),
+        f"HEAD tagged ({', '.join(tags)})" if tags else "No Git release tag on HEAD (e.g., v1.0.0)",
+        required=False)
+
+    missing_required = [c["check"] for c in checks if c["required"] and not c["ok"]]
+    return dict(
+        ready=not missing_required,
+        missing_required=missing_required,
+        tags_on_head=tags,
+        checks=checks,
+    )
 
 
 def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
@@ -2943,12 +3461,17 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
         cid = c["id"]
         w = work.get(cid, {})
         m = notes.get(cid, {})
-        tier = claim_tier(c, m, w)
+        tier = claim_tier(c, m, w, env_kinds=p.get("environment_kinds"))
         basis = claim_basis(cid, m, w)
         status = w.get("status", "open")
         if status not in {"open", "drafted", "blocked", "attempted", "conditional", "closed"}:
             raise ValueError(f"{cid}: unsupported checkpoint status {status}")
         entry = {**c, **m, **w}
+        proof_loc, proof_exc = resolve_detached_proof(root, m)
+        if proof_loc:
+            entry["proof_location"] = proof_loc
+        if proof_exc:
+            entry["proof_excerpt"] = proof_exc
         entry["tier"] = tier
         entry["headline"] = tier == "headline"
         if basis is not None:
@@ -3381,6 +3904,9 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
     if no_example:
         print(f"Warning: {NO_EXAMPLE.lower()} for these closures: {', '.join(no_example)}. "
               "See 'Show the hypotheses can hold' in SKILL.md.")
+    prose_warnings = _lint_reader_prose(claims, notes, work=work, env_kinds=p.get("environment_kinds"))
+    for w_item in prose_warnings:
+        print(f"Warning: {w_item['message']}")
     hosting = p.get("hosting") or {}
     if not hosting.get("repository") and hosting.get("decision") != "local":
         print("Hosting decision pending. Ask where the author wants this paper's explorer and dashboard hosted.")
@@ -3388,12 +3914,23 @@ def build(root, *, ci_receipt=None, commit=None, artifact_id=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["build", "assemble", "challenge", "manifest", "approve", "review", "review-inputs","compare","review-work"])
+    parser.add_argument("operation", choices=["init", "build", "assemble", "challenge", "manifest", "handoff", "release-check", "approve", "review", "review-inputs", "compare", "review-work"])
     parser.add_argument("project", type=Path)
     parser.add_argument("claims", nargs="*", help="approve: claim labels (default: every closed claim awaiting approval)")
     parser.add_argument("--by", help="approve: the author approving the statements. Only the author runs approve")
+    parser.add_argument("--tex", action="append", default=[], help="init: project-relative TeX file path (repeatable in manuscript order)")
+    parser.add_argument("--pdf", help="init: project-relative PDF file path")
+    parser.add_argument("--title", help="init: manuscript title")
+    parser.add_argument("--edition", default="", help="init: human-readable citation/edition string")
+    parser.add_argument("--publication", default="", help="init: canonical HTTP(S) publication URL")
+    parser.add_argument("--author", action="append", default=[], help="init: author name in citation order (repeatable)")
+    parser.add_argument("--citation-details", default="", help="init: publication date or venue details")
+    parser.add_argument("--env", action="append", default=[], help="init: additional LaTeX theorem environment name (repeatable)")
+    parser.add_argument("--force", action="store_true", help="init: overwrite an existing project.json")
     parser.add_argument("--package", help="assemble/challenge: limit generation to one project-relative Lean package")
     parser.add_argument("--audit", action="store_true", help="assemble: audit each assembled claim and update project.json")
+    parser.add_argument("--configure-lakefile", action="store_true", help="challenge: append missing Challenge/Solution [[lean_lib]] entries to lakefile.toml")
+    parser.add_argument("--write", action="store_true", help="handoff: write/update HANDOFF.md in the project root")
     parser.add_argument("--ci-receipt", type=Path, help="Evidence downloaded from the trusted Lean workflow")
     parser.add_argument("--commit", help="Git revision being rendered")
     parser.add_argument("--artifact-id", type=int, help="ID of the GitHub artifact containing the supplied CI receipt")
@@ -3401,9 +3938,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--side",choices=["paper","lean"],help="Limit the independent reader to one source")
     parser.add_argument("--readings",type=Path,help="Agent comparison record for one claim")
-    parser.add_argument("--check",action="store_true",help="review-work/challenge: exit nonzero for pending work or mismatched Challenge/Solution files")
+    parser.add_argument("--check",action="store_true",help="review-work/challenge/release-check: exit nonzero when required checks fail")
     parser.add_argument("--require-ci",action="store_true",help="review-work: verify receipt coverage for the current checkout commit")
-    parser.add_argument("--format",choices=["text","markdown","latex","json"],default="text",help="manifest: output format printed to stdout")
+    parser.add_argument("--format",choices=["text","markdown","latex","json"],default="text",help="manifest/handoff: output format printed to stdout")
     parser.add_argument("--propose-edit",action="store_true",help="manifest: propose a synchronized manuscript-edits.json entry with the LaTeX scope snippet")
     parser.add_argument("--edit-location",default="",help="manifest --propose-edit: manuscript section/location for the proposed scope edit")
     parser.add_argument("--edit-original",default="",help="manifest --propose-edit: quoted manuscript text being clarified or replaced")
@@ -3411,13 +3948,28 @@ if __name__ == "__main__":
     parser.add_argument("--edit-claim",default="manuscript",help="manifest --propose-edit: claim label or 'manuscript' for paper-wide scope")
     args = parser.parse_args()
     try:
-        if args.operation == "assemble":
+        if args.operation == "init":
+            result = init_project(
+                args.project.resolve(),
+                tex_paths=args.tex,
+                pdf_path=args.pdf,
+                title=args.title,
+                edition=args.edition,
+                publication=args.publication,
+                authors=args.author,
+                citation_details=args.citation_details,
+                environments=args.env,
+                force=args.force,
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif args.operation == "assemble":
             report = assemble(args.project.resolve(), package=args.package, run_audit=args.audit)
             print(json.dumps(report, ensure_ascii=False, indent=2))
         elif args.operation == "challenge":
             report = generate_challenge_harness(
                 args.project.resolve(), package=args.package,
                 write=not args.check, check_only=args.check,
+                configure_lakefile=args.configure_lakefile,
             )
             cleaned = {
                 "packages": {
@@ -3426,6 +3978,21 @@ if __name__ == "__main__":
                 }
             }
             print(json.dumps(cleaned, ensure_ascii=False, indent=2))
+        elif args.operation == "handoff":
+            result = generate_handoff(args.project.resolve(), write=args.write)
+            if args.format == "json":
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            elif args.format == "markdown":
+                print(result["markdown"], end="")
+            else:
+                if result["written"]:
+                    print(f"Wrote {result['handoff_path']}")
+                print(result["markdown"], end="")
+        elif args.operation == "release-check":
+            result = release_check(args.project.resolve())
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            if args.check and not result["ready"]:
+                sys.exit(1)
         elif args.operation == "manifest":
             result = manifest(
                 args.project.resolve(),
@@ -3463,10 +4030,17 @@ if __name__ == "__main__":
         elif args.operation == "review-inputs":
             if len(args.claims) != 1:
                 raise ValueError("Choose one claim for independent readings")
-            data = reviews.get_packet(args.project.resolve(),args.claims[0])
+            root_path = args.project.resolve()
+            data = reviews.get_packet(root_path, args.claims[0])
             packet = {"bindings":data["view"]["bindings"]}
             if args.side != "lean":
                 packet["paper"] = data["view"]["excerpt"]
+                proj = reviews.read(root_path / "project.json", {})
+                if proj.get("reader"):
+                    rmat = reviews.read(local(root_path, proj["reader"]), {})
+                    ploc, pexc = resolve_detached_proof(root_path, (rmat.get("claims") or {}).get(args.claims[0]))
+                    if ploc or pexc:
+                        packet["detached_proof"] = {k: v for k, v in (("location", ploc), ("excerpt", pexc)) if v}
             if args.side != "paper":
                 packet["lean"] = data["sources"]
                 packet["defaults"] = data["defaults"]

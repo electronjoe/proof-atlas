@@ -224,7 +224,7 @@ class DashboardCompletion(unittest.TestCase):
                     rec["assumes"] = list(args.assumes)
                 return rec
 
-            with patch.object(audit_lean, "audit", side_effect=fake_audit), redirect_stdout(io.StringIO()):
+            with patch.object(audit_lean, "audit_batch", side_effect=lambda pkg, specs: [fake_audit(s) for s in specs]), redirect_stdout(io.StringIO()):
                 atlas.assemble(root, run_audit=True)
 
             updated = json.loads((root / "project.json").read_text(encoding="utf-8"))
@@ -273,7 +273,7 @@ class DashboardCompletion(unittest.TestCase):
                 "expected": "Statements.B", "assumes": [], "statement_modules": ["Statements.All"],
             }
             (root / "project.json").write_text(json.dumps(updated), encoding="utf-8")
-            with patch.object(audit_lean, "audit", side_effect=fake_audit), redirect_stdout(io.StringIO()):
+            with patch.object(audit_lean, "audit_batch", side_effect=lambda pkg, specs: [fake_audit(s) for s in specs]), redirect_stdout(io.StringIO()):
                 atlas.assemble(root, run_audit=True)
 
             final_proj = json.loads((root / "project.json").read_text(encoding="utf-8"))

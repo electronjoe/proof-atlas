@@ -156,6 +156,14 @@ function proofView(c,view) {
     if(c.page){const frame=el("iframe");frame.title="Paper passage, page "+c.page;frame.src=url;pane.append(frame);}
     const details=el("details");details.open=!c.page;
     details.append(el("summary","Verbatim TeX · "+c.file+", line "+c.line),el("pre",c.excerpt));pane.append(details);
+    if(c.proof_location || c.proof_excerpt){
+      const pdet=el("details");
+      const plabel="Detached / companion proof"+(c.proof_location?" · "+c.proof_location:"");
+      pdet.append(el("summary",plabel));
+      if(c.proof_excerpt) pdet.append(el("pre",c.proof_excerpt));
+      else pdet.append(el("p",c.proof_location,"muted"));
+      pane.append(pdet);
+    }
     if(c.differences!==undefined){
       // From the comparison the author reviews: each case that does not simply agree with the paper.
       pane.append(el("h3","Differences from the paper"));
